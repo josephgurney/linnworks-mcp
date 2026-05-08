@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime, timezone
 from typing import Optional
 
 import re
@@ -44,6 +45,19 @@ if not all([APPLICATION_ID, APPLICATION_SECRET, INSTALLATION_TOKEN]):
     )
     sys.exit(1)
 
+
+# Open-order status labels. Codes 1 and 4 confirmed from live tenant data;
+# others sourced from Linnworks API docs — verify if unexpected values appear.
+_ORDER_STATUS_LABELS: dict[int, str] = {
+    0: "Draft",
+    1: "Pending Dispatch",
+    2: "Paid",
+    3: "Return",
+    4: "Awaiting Payment",
+    5: "Resolution Required",
+    6: "Deleted",
+    7: "Cancelled",
+}
 
 # Matches GUID-style pkOrderID values returned by Linnworks order endpoints.
 _UUID_RE = re.compile(
@@ -212,53 +226,75 @@ mcp = FastMCP("linnworks")
 def get_open_orders(
     location_id: str = DEFAULT_LOCATION_ID,
     limit: int = 50,
+    overdue_only: bool = False,
 ) -> dict:
     """
     List currently open (unprocessed) orders from Linnworks.
 
-    Returns a summary of each order including its IDs, status, dispatch deadline,
-    and the SKUs it contains. Useful for answering questions like "how many open
-    orders do I have right now", "which orders are overdue", or "what SKUs are
-    in today's orders".
+    Returns a summary of each order including its IDs, status (decoded),
+    dispatch deadline, overdue flag, and the SKUs it contains.
+
+    Useful for answering questions like "how many open orders do I have right
+    now?", "which orders are overdue?", or "what SKUs are in today's queue?".
 
     Args:
         location_id: The Linnworks location to query. Defaults to the "Default"
             location, which represents combined stock for most setups.
         limit: Maximum number of orders to return in detail. Defaults to 50.
-            The total open-order count is always returned regardless of limit.
+            The total count and overdue_count are always returned regardless.
+        overdue_only: If True, only return orders whose DispatchBy deadline
+            has already passed. Defaults to False (return all open orders).
 
     Returns:
         A dict with:
-          - count:        total number of open orders at the location
-          - returned:     how many are detailed in the `orders` list
-          - location_id:  the location queried
-          - orders:       list of order summaries
+          - count:          total number of open orders at the location
+          - overdue_count:  number whose DispatchBy has already passed
+          - returned:       how many are detailed in the `orders` list
+          - location_id:    the location queried
+          - orders:         list of order summaries, each with is_overdue flag
     """
-    # Open Orders endpoints REQUIRE the {"request": {...}} wrapper —
-    # sending the inner object directly returns "'request' parameter is missing."
     payload = {"request": {"LocationId": location_id}}
     response = call_linnworks("OpenOrders/GetOrdersLowFidelity", payload)
 
     raw_orders = response.get("Orders") or []
+    now = datetime.now(timezone.utc)
+
+    def _is_overdue(dispatch_by: str | None) -> bool:
+        if not dispatch_by:
+            return False
+        try:
+            dt = datetime.fromisoformat(dispatch_by.replace("Z", "+00:00"))
+            return dt < now
+        except ValueError:
+            return False
+
+    overdue_count = sum(1 for o in raw_orders if _is_overdue(o.get("DispatchBy")))
+
+    candidates = [o for o in raw_orders if not overdue_only or _is_overdue(o.get("DispatchBy"))]
 
     summarized = []
-    for o in raw_orders[:limit]:
+    for o in candidates[:limit]:
         items = o.get("Items") or []
+        status_code = o.get("Status")
+        dispatch_by = o.get("DispatchBy")
         summarized.append({
             "pkOrderID": o.get("pkOrderID"),
             "OrderId": o.get("OrderId"),
             "ReferenceNum": o.get("ReferenceNum"),
             "ExternalReference": o.get("ExternalReference"),
-            "Status": o.get("Status"),
+            "Status": status_code,
+            "StatusLabel": _ORDER_STATUS_LABELS.get(status_code, f"Unknown({status_code})"),
             "PostalTrackingNumber": o.get("PostalTrackingNumber"),
             "OrderDate": o.get("OrderDate"),
-            "DispatchBy": o.get("DispatchBy"),
+            "DispatchBy": dispatch_by,
+            "IsOverdue": _is_overdue(dispatch_by),
             "ItemCount": len(items),
             "SKUs": [i.get("SKU") for i in items],
         })
 
     return {
         "count": len(raw_orders),
+        "overdue_count": overdue_count,
         "returned": len(summarized),
         "location_id": location_id,
         "orders": summarized,
@@ -271,22 +307,28 @@ def find_inventory_item(
     limit: int = 10,
 ) -> dict:
     """
-    Search for inventory items in Linnworks by SKU or title keyword.
+    Look up a single inventory item in Linnworks by its exact SKU.
 
-    Returns matching items with their stock item ID, SKU, title, category,
-    and barcode. Use this to look up the internal StockItemId for a product
-    before calling stock-level or write tools that require a GUID.
+    Returns the item's stock item ID, SKU, title, barcode, retail price, and
+    purchase price. Use this to resolve a known SKU to a StockItemId before
+    calling stock-level or write tools that require a GUID.
+
+    NOTE: The underlying Linnworks endpoint (GetInventoryItem) only supports
+    exact SKU lookup — it does not search by title or accept partial SKUs.
+    If you need to search by keyword or browse the catalogue, that capability
+    is not available via this API in the current tenant.
 
     Args:
-        sku_or_title: A SKU (exact or partial) or a keyword from the item title.
-            Linnworks searches across both fields.
-        limit: Maximum number of matching items to return. Defaults to 10.
+        sku_or_title: The exact SKU / item number to look up (case-insensitive).
+            Title keywords and partial SKUs will not match.
+        limit: Unused — kept for interface compatibility. Only one item is ever
+            returned by an exact SKU lookup.
 
     Returns:
         A dict with:
           - query:    the search string used
-          - count:    number of results returned
-          - items:    list of matching inventory item summaries
+          - count:    1 if found, 0 if not
+          - items:    list containing the matched item (empty if not found)
     """
     # Inventory/GetInventoryItem: unwrapped, accepts {"sku": "..."} for exact SKU lookup.
     # Confirmed working in tenant testing — does not support fuzzy/title search.
@@ -366,14 +408,13 @@ def get_order(order_id: str) -> dict:
 def get_stock_level(
     sku: str,
     location_id: str = DEFAULT_LOCATION_ID,
+    include_empty_locations: bool = False,
 ) -> dict:
     """
     Return the current stock level for a SKU, optionally at a specific location.
 
     Performs a two-step lookup: resolves the SKU to a StockItemId, then fetches
-    stock levels across all locations. If location_id is the default "all
-    locations" GUID, all location rows are returned. Otherwise only the matching
-    location row is returned.
+    stock levels across all locations.
 
     Useful for questions like "how much stock do we have of SKU ABC-123?" or
     "what's the available quantity at our main warehouse?".
@@ -382,16 +423,24 @@ def get_stock_level(
     allocations), InOrderBook, and Due. For FIFO purposes use StockLevel,
     not Available — see tenant learnings.
 
+    Many locations in this tenant are virtual dropship supplier locations rather
+    than physical warehouses. When multiple non-Default locations show the same
+    non-zero stock_level, that value likely represents the supplier's available
+    quantity (not additional owned stock). The "Default" location is the
+    authoritative owned-stock figure.
+
     Args:
         sku: The exact SKU / item number to look up (case-insensitive).
         location_id: The Linnworks StockLocationId to filter to. Defaults to
             the "Default" location (all-locations aggregate). Pass a specific
             location GUID to see a single warehouse row.
+        include_empty_locations: If True, return all 27 location rows including
+            those with zero stock. Defaults to False (only non-zero rows).
 
     Returns:
-        A dict with the item identity and a list of stock level rows per location.
+        A dict with the item identity and a list of stock level rows per location,
+        plus a notes field when potential duplicate supplier counts are detected.
     """
-    # Step 1: resolve SKU → StockItemId via Inventory/GetInventoryItem (exact SKU, unwrapped)
     try:
         item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
     except RuntimeError:
@@ -401,41 +450,59 @@ def get_stock_level(
     if not stock_item_id:
         return {"error": f"Item found for SKU '{sku}' but StockItemId was missing", "sku": sku}
 
-    # Step 2: fetch stock levels via batch endpoint (confirmed working in tenant learnings)
     levels_response = call_linnworks(
         "Stock/GetStockLevel_Batch",
         {"request": {"StockItemIds": [stock_item_id]}},
     )
 
-    # Response is a list: [{pkStockItemId, StockItemLevels: [...]}, ...]
     batch = levels_response if isinstance(levels_response, list) else []
     item_row = next((r for r in batch if r.get("pkStockItemId") == stock_item_id), None)
     levels = item_row.get("StockItemLevels") or [] if item_row else []
 
-    # Filter to requested location unless the caller wants the default aggregate
     if location_id != DEFAULT_LOCATION_ID:
         levels = [
             l for l in levels
             if (l.get("Location") or {}).get("StockLocationId") == location_id
         ]
 
-    return {
+    formatted = [
+        {
+            "location_name": (l.get("Location") or {}).get("LocationName"),
+            "location_id": (l.get("Location") or {}).get("StockLocationId"),
+            "stock_level": l.get("StockLevel"),
+            "available": l.get("Available"),
+            "in_order_book": l.get("InOrderBook"),
+            "due": l.get("Due"),
+        }
+        for l in levels
+    ]
+
+    if not include_empty_locations:
+        formatted = [f for f in formatted if (f["stock_level"] or 0) > 0]
+
+    # Detect potential duplicate supplier counts: multiple non-Default locations
+    # sharing the same non-zero stock_level suggests virtual dropship rows.
+    notes = []
+    non_default = [f for f in formatted if f["location_id"] != DEFAULT_LOCATION_ID and (f["stock_level"] or 0) > 0]
+    if len(non_default) > 1:
+        level_values = [f["stock_level"] for f in non_default]
+        if len(set(level_values)) == 1:
+            notes.append(
+                f"{len(non_default)} non-Default locations all show stock_level={level_values[0]}. "
+                "These are likely virtual dropship supplier locations showing the same supplier "
+                "availability — not additional owned stock. Use the 'Default' row for owned inventory."
+            )
+
+    result = {
         "sku": sku,
         "stock_item_id": stock_item_id,
         "title": item.get("ItemTitle"),
-        "location_id": location_id,
-        "levels": [
-            {
-                "location_name": (l.get("Location") or {}).get("LocationName"),
-                "location_id": (l.get("Location") or {}).get("StockLocationId"),
-                "stock_level": l.get("StockLevel"),
-                "available": l.get("Available"),
-                "in_order_book": l.get("InOrderBook"),
-                "due": l.get("Due"),
-            }
-            for l in levels
-        ],
+        "location_id_filter": location_id,
+        "levels": formatted,
     }
+    if notes:
+        result["notes"] = notes
+    return result
 
 
 @mcp.tool()
@@ -844,6 +911,312 @@ def get_category_report(
         "date_field": date_field,
         "total_orders_scanned": total_orders_scanned,
         "categories": categories,
+    }
+
+
+# ---------- Revenue summary, top SKUs, period comparison ----------
+
+def _fetch_revenue_data(
+    from_date: str,
+    to_date: str,
+    date_field: str,
+) -> dict:
+    """
+    Internal helper: autopaginate SearchProcessedOrders and aggregate revenue
+    totals. Returns a plain dict — not an MCP tool itself.
+    """
+    PAGE_SIZE = 500
+
+    total_orders = 0
+    total_revenue = 0.0
+    by_source: dict[str, dict] = {}
+    by_country: dict[str, dict] = {}
+
+    page = 1
+    total_pages: int | None = None
+
+    while total_pages is None or page <= total_pages:
+        response = call_linnworks(
+            "ProcessedOrders/SearchProcessedOrders",
+            {
+                "request": {
+                    "DateField": date_field,
+                    "FromDate": f"{from_date}T00:00:00",
+                    "ToDate": f"{to_date}T23:59:59",
+                    "PageNumber": page,
+                    "ResultsPerPage": PAGE_SIZE,
+                }
+            },
+        )
+        wrapper = response.get("ProcessedOrders") or {}
+        raw_orders = wrapper.get("Data") or []
+
+        if total_pages is None:
+            total_pages = wrapper.get("TotalPages", 1)
+            total_orders = wrapper.get("TotalEntries", 0)
+
+        if not raw_orders:
+            break
+
+        for o in raw_orders:
+            charge = float(o.get("fTotalCharge") or 0)
+            total_revenue += charge
+
+            source = o.get("Source") or "Unknown"
+            if source not in by_source:
+                by_source[source] = {"orders": 0, "revenue": 0.0}
+            by_source[source]["orders"] += 1
+            by_source[source]["revenue"] += charge
+
+            country = o.get("cCountry") or "Unknown"
+            if country not in by_country:
+                by_country[country] = {"orders": 0, "revenue": 0.0}
+            by_country[country]["orders"] += 1
+            by_country[country]["revenue"] += charge
+
+        page += 1
+
+    avg_order_value = total_revenue / total_orders if total_orders > 0 else 0.0
+
+    return {
+        "total_orders": total_orders,
+        "total_revenue": round(total_revenue, 2),
+        "avg_order_value": round(avg_order_value, 2),
+        "by_source": sorted(
+            [
+                {
+                    "source": src,
+                    "orders": v["orders"],
+                    "revenue": round(v["revenue"], 2),
+                    "aov": round(v["revenue"] / v["orders"], 2) if v["orders"] > 0 else 0.0,
+                }
+                for src, v in by_source.items()
+            ],
+            key=lambda x: -x["revenue"],
+        ),
+        "by_country": sorted(
+            [
+                {
+                    "country": c,
+                    "orders": v["orders"],
+                    "revenue": round(v["revenue"], 2),
+                }
+                for c, v in by_country.items()
+            ],
+            key=lambda x: -x["orders"],
+        )[:15],
+    }
+
+
+@mcp.tool()
+def get_revenue_summary(
+    from_date: str,
+    to_date: str,
+    date_field: str = "received",
+) -> dict:
+    """
+    Total orders, revenue, and average order value for a date range.
+
+    Auto-paginates through all pages internally and returns aggregated totals —
+    never overflows context, unlike get_processed_orders. Also breaks down
+    orders and revenue by sales channel (source) and country.
+
+    Use this instead of get_processed_orders when the question is about totals:
+    "what was our total revenue in April?", "how many orders did we take last
+    month?", "what's our average order value?", "how is Shopify vs Amazon?".
+
+    For per-order or per-SKU detail, use get_processed_orders or
+    get_processed_order_items instead.
+
+    Note on Amazon FBA revenue: the total_charge field on FBA orders may capture
+    the marketplace fee rather than the full sale price, resulting in artificially
+    low AOV for that channel. Treat FBA revenue figures as indicative only.
+
+    Args:
+        from_date: Start of the date range in ISO format, e.g. "2026-04-01".
+        to_date: End of the date range in ISO format, e.g. "2026-04-30".
+        date_field: Which date to filter on — "received" (default), "processed",
+            "payment", or "cancelled".
+
+    Returns:
+        A dict with:
+          - from_date, to_date, date_field: the query parameters used
+          - total_orders:     total orders in the period
+          - total_revenue:    sum of order charges (£)
+          - avg_order_value:  total_revenue / total_orders
+          - by_source:        list of {source, orders, revenue, aov} sorted by revenue
+          - by_country:       list of {country, orders, revenue} sorted by order count
+    """
+    data = _fetch_revenue_data(from_date, to_date, date_field)
+    return {"from_date": from_date, "to_date": to_date, "date_field": date_field, **data}
+
+
+@mcp.tool()
+def get_top_skus(
+    from_date: str,
+    to_date: str,
+    date_field: str = "processed",
+    top_n: int = 20,
+    rank_by: str = "revenue",
+) -> dict:
+    """
+    Aggregate sales by individual SKU for a date range. Auto-paginates
+    internally and returns ranked SKU totals — revenue, units, and order count.
+
+    Use this when you need SKU-level analysis: "what are our top-selling
+    products?", "which SKUs drove the most revenue last month?", "how many
+    units of each product did we sell?".
+
+    For category-level analysis use get_category_report instead (faster).
+
+    Args:
+        from_date: Start of the date range in ISO format, e.g. "2026-05-01".
+        to_date: End of the date range in ISO format, e.g. "2026-05-31".
+        date_field: Which date to filter on — "received", "processed" (default),
+            "payment", or "cancelled".
+        top_n: Number of top SKUs to return. Defaults to 20.
+        rank_by: Sort order — "revenue" (default) or "units".
+
+    Returns:
+        A dict with:
+          - from_date, to_date, date_field: the query parameters used
+          - total_orders_scanned: total processed orders in the range
+          - ranked_by:            the rank_by value used
+          - skus: list of top_n SKU dicts sorted by rank_by desc, each with
+              rank, sku, title, revenue, units, orders (distinct order count)
+    """
+    from collections import defaultdict
+
+    if rank_by not in ("revenue", "units"):
+        rank_by = "revenue"
+
+    PAGE_SIZE = 500
+
+    sku_revenue: dict[str, float] = defaultdict(float)
+    sku_units: dict[str, int] = defaultdict(int)
+    sku_order_ids: dict[str, set] = defaultdict(set)
+    sku_titles: dict[str, str] = {}
+
+    total_orders_scanned = 0
+    page = 1
+    total_pages: int | None = None
+
+    while total_pages is None or page <= total_pages:
+        summary_response = call_linnworks(
+            "ProcessedOrders/SearchProcessedOrders",
+            {
+                "request": {
+                    "DateField": date_field,
+                    "FromDate": f"{from_date}T00:00:00",
+                    "ToDate": f"{to_date}T23:59:59",
+                    "PageNumber": page,
+                    "ResultsPerPage": PAGE_SIZE,
+                }
+            },
+        )
+        wrapper = summary_response.get("ProcessedOrders") or {}
+        raw_orders = wrapper.get("Data") or []
+
+        if total_pages is None:
+            total_pages = wrapper.get("TotalPages", 1)
+            total_orders_scanned = wrapper.get("TotalEntries", 0)
+
+        if not raw_orders:
+            break
+
+        guids = [o["pkOrderID"] for o in raw_orders]
+        items_by_order = _batch_order_items(guids)
+
+        for guid in guids:
+            for item in items_by_order.get(guid, []):
+                sku = item.get("sku") or "UNKNOWN"
+                qty = item.get("quantity") or 0
+                rev = float(item.get("line_total_inc_tax") or 0)
+                sku_revenue[sku] += rev
+                sku_units[sku] += qty
+                sku_order_ids[sku].add(guid)
+                if sku not in sku_titles and item.get("title"):
+                    sku_titles[sku] = item["title"]
+
+        page += 1
+
+    sort_key = (lambda s: sku_revenue[s]) if rank_by == "revenue" else (lambda s: sku_units[s])
+    all_skus = sorted(sku_revenue.keys(), key=sort_key, reverse=True)
+
+    skus = [
+        {
+            "rank": idx + 1,
+            "sku": sku,
+            "title": sku_titles.get(sku, ""),
+            "revenue": round(sku_revenue[sku], 2),
+            "units": sku_units[sku],
+            "orders": len(sku_order_ids[sku]),
+        }
+        for idx, sku in enumerate(all_skus[:top_n])
+    ]
+
+    return {
+        "from_date": from_date,
+        "to_date": to_date,
+        "date_field": date_field,
+        "total_orders_scanned": total_orders_scanned,
+        "ranked_by": rank_by,
+        "skus": skus,
+    }
+
+
+@mcp.tool()
+def get_period_comparison(
+    current_from: str,
+    current_to: str,
+    prior_from: str,
+    prior_to: str,
+    date_field: str = "received",
+) -> dict:
+    """
+    Compare revenue and order volume between two date ranges side-by-side.
+
+    Returns totals for both periods and the absolute and percentage change for
+    orders, revenue, and average order value. Useful for month-on-month,
+    week-on-week, or year-on-year comparisons.
+
+    Examples: "how does this month compare to last month?", "are we up or down
+    vs the same period last year?", "what's the MoM revenue change?".
+
+    Args:
+        current_from: Start of the current/comparison period, e.g. "2026-05-01".
+        current_to: End of the current/comparison period, e.g. "2026-05-31".
+        prior_from: Start of the prior/baseline period, e.g. "2026-04-01".
+        prior_to: End of the prior/baseline period, e.g. "2026-04-30".
+        date_field: Which date to filter on — "received" (default), "processed",
+            "payment", or "cancelled".
+
+    Returns:
+        A dict with:
+          - current / prior: revenue summary dicts for each period
+          - changes: {orders_delta, orders_pct, revenue_delta, revenue_pct,
+                      aov_delta, aov_pct} — positive = current better than prior
+    """
+    current = _fetch_revenue_data(current_from, current_to, date_field)
+    prior = _fetch_revenue_data(prior_from, prior_to, date_field)
+
+    def _pct(new: float, old: float) -> float | None:
+        if old == 0:
+            return None
+        return round((new - old) / old * 100, 1)
+
+    return {
+        "current": {"from_date": current_from, "to_date": current_to, **current},
+        "prior": {"from_date": prior_from, "to_date": prior_to, **prior},
+        "date_field": date_field,
+        "changes": {
+            "orders_delta": current["total_orders"] - prior["total_orders"],
+            "orders_pct": _pct(current["total_orders"], prior["total_orders"]),
+            "revenue_delta": round(current["total_revenue"] - prior["total_revenue"], 2),
+            "revenue_pct": _pct(current["total_revenue"], prior["total_revenue"]),
+            "aov_delta": round(current["avg_order_value"] - prior["avg_order_value"], 2),
+            "aov_pct": _pct(current["avg_order_value"], prior["avg_order_value"]),
+        },
     }
 
 
