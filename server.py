@@ -444,7 +444,7 @@ def get_processed_orders(
     to_date: str,
     date_field: str = "received",
     page: int = 1,
-    page_size: int = 50,
+    page_size: int = 500,
 ) -> dict:
     """
     List processed (dispatched/fulfilled) orders from Linnworks within a date range.
@@ -463,7 +463,8 @@ def get_processed_orders(
             "processed", "payment", "cancelled". Use "processed" for dispatch date,
             "received" for order received date.
         page: Page number for paginated results. Defaults to 1.
-        page_size: Number of orders per page. Min 20, defaults to 50.
+        page_size: Orders per page. Min 20, defaults to 500 (recommended for large
+            date ranges to minimise round-trips).
 
     Returns:
         A dict with:
@@ -655,7 +656,7 @@ def get_processed_order_items(
     to_date: str,
     date_field: str = "received",
     page: int = 1,
-    page_size: int = 50,
+    page_size: int = 500,
 ) -> dict:
     """
     List processed orders with full line-item detail within a date range.
@@ -675,8 +676,9 @@ def get_processed_order_items(
         date_field: Which date to filter on — "received" (default), "processed",
             "payment", or "cancelled".
         page: Page number for paginated results. Defaults to 1.
-        page_size: Orders per page. Min 20, defaults to 50. Use pagination for
-            large date ranges — each page triggers a batch detail fetch.
+        page_size: Orders per page. Min 20, defaults to 500 (recommended for large
+            date ranges to minimise round-trips). Each page triggers a batch detail
+            fetch.
 
     Returns:
         A dict with:
@@ -746,6 +748,102 @@ def get_processed_order_items(
         "total_count": total_count,
         "count": len(orders),
         "orders": orders,
+    }
+
+
+@mcp.tool()
+def get_category_report(
+    from_date: str,
+    to_date: str,
+    date_field: str = "processed",
+    top_n: int = 20,
+) -> dict:
+    """
+    Aggregate sales by product category for a date range. Auto-paginates internally
+    and returns ranked category totals — revenue, units, and order count. Use this
+    instead of get_processed_order_items when you need category-level analysis.
+    Much faster than manual pagination.
+
+    Args:
+        from_date: Start of the date range in ISO format, e.g. "2026-04-01".
+        to_date: End of the date range in ISO format, e.g. "2026-04-30".
+        date_field: Which date to filter on — "received", "processed" (default),
+            "payment", or "cancelled".
+        top_n: Number of top categories to return, ranked by revenue. Defaults to 20.
+
+    Returns:
+        A dict with:
+          - from_date, to_date, date_field: the query parameters used
+          - total_orders_scanned: total number of processed orders in the range
+          - categories: list of top_n category dicts sorted by revenue desc, each with
+              rank, category, revenue, units, orders (distinct order count)
+    """
+    from collections import defaultdict
+
+    PAGE_SIZE = 500
+
+    # Running totals per category — no full order objects kept in memory
+    cat_revenue: dict[str, float] = defaultdict(float)
+    cat_units: dict[str, int] = defaultdict(int)
+    cat_order_ids: dict[str, set] = defaultdict(set)
+
+    total_orders_scanned = 0
+    page = 1
+    total_pages: int | None = None
+
+    while total_pages is None or page <= total_pages:
+        summary_response = call_linnworks(
+            "ProcessedOrders/SearchProcessedOrders",
+            {
+                "request": {
+                    "DateField": date_field,
+                    "FromDate": f"{from_date}T00:00:00",
+                    "ToDate": f"{to_date}T23:59:59",
+                    "PageNumber": page,
+                    "ResultsPerPage": PAGE_SIZE,
+                }
+            },
+        )
+        wrapper = summary_response.get("ProcessedOrders") or {}
+        raw_orders = wrapper.get("Data") or []
+
+        if total_pages is None:
+            total_pages = wrapper.get("TotalPages", 1)
+            total_orders_scanned = wrapper.get("TotalEntries", 0)
+
+        if not raw_orders:
+            break
+
+        guids = [o["pkOrderID"] for o in raw_orders]
+        items_by_order = _batch_order_items(guids)
+
+        for guid in guids:
+            for item in items_by_order.get(guid, []):
+                cat = item.get("category") or "Uncategorised"
+                cat_revenue[cat] += item.get("line_total_inc_tax") or 0.0
+                cat_units[cat] += item.get("quantity") or 0
+                cat_order_ids[cat].add(guid)
+
+        page += 1
+
+    all_cats = sorted(cat_revenue.keys(), key=lambda c: cat_revenue[c], reverse=True)
+    categories = [
+        {
+            "rank": idx + 1,
+            "category": cat,
+            "revenue": round(cat_revenue[cat], 2),
+            "units": cat_units[cat],
+            "orders": len(cat_order_ids[cat]),
+        }
+        for idx, cat in enumerate(all_cats[:top_n])
+    ]
+
+    return {
+        "from_date": from_date,
+        "to_date": to_date,
+        "date_field": date_field,
+        "total_orders_scanned": total_orders_scanned,
+        "categories": categories,
     }
 
 
