@@ -1505,11 +1505,10 @@ def deliver_purchase_order(
         }
 
     # Step 2 — deliver all items.
-    # Tried unwrapped first per tenant pattern; wrapper to try if this fails:
-    # {"pkPurchaseId": purchase_id} as body directly (already is unwrapped).
+    # Unwrapped failed ("The request is invalid.") — trying {"request":{...}} wrapper.
     response = call_linnworks(
         "PurchaseOrder/Deliver_PurchaseItemAll",
-        {"pkPurchaseId": purchase_id},
+        {"request": {"pkPurchaseId": purchase_id}},
     )
 
     delivered_header = response.get("PurchaseOrderHeader") or {}
@@ -1554,10 +1553,10 @@ def add_purchase_order_note(
     """
     purchase_id = purchase_id.strip()
 
-    # Spec parameter name is "addNoteParameter" — wrapped accordingly.
+    # {"addNoteParameter":{...}} failed — trying unwrapped.
     response = call_linnworks(
         "PurchaseOrder/Add_PurchaseOrderNote",
-        {"addNoteParameter": {"pkPurchaseId": purchase_id, "Note": note}},
+        {"pkPurchaseId": purchase_id, "Note": note},
     )
 
     return {
