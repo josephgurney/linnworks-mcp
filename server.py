@@ -1280,6 +1280,7 @@ def get_suppliers() -> dict:
 @mcp.tool()
 def update_purchase_order_header(
     purchase_id: str,
+    supplier_id: str = "",
     supplier_reference: str = "",
     external_invoice_number: str = "",
     quoted_delivery_date: str = "",
@@ -1301,6 +1302,9 @@ def update_purchase_order_header(
 
     Args:
         purchase_id: The UUID of the purchase order to update (pkPurchaseID).
+        supplier_id: The UUID of the supplier (pkSupplierID) to assign to this
+            PO. Use get_suppliers() to look up the correct UUID by name.
+            Leave blank to keep the current supplier.
         supplier_reference: The supplier's own reference/PO number. Leave blank
             to keep the current value.
         external_invoice_number: The invoice number or your internal PO ref.
@@ -1347,6 +1351,7 @@ def update_purchase_order_header(
             before[field_key] = current_val
             after[field_key] = new_val
 
+    _register("fkSupplierId", header.get("fkSupplierId", ""), supplier_id)
     _register("SupplierReferenceNumber", header.get("SupplierReferenceNumber", ""), supplier_reference)
     _register("ExternalInvoiceNumber", header.get("ExternalInvoiceNumber", ""), external_invoice_number)
     _register("Currency", header.get("Currency", ""), currency)
@@ -1395,7 +1400,7 @@ def update_purchase_order_header(
         "QuotedDeliveryDate": after.get("QuotedDeliveryDate", header.get("QuotedDeliveryDate")),
         "DateOfPurchase": after.get("DateOfPurchase", header.get("DateOfPurchase")),
         "ConversionRate": after.get("ConversionRate", header.get("ConversionRate", 1.0)),
-        "fkSupplierId": header.get("fkSupplierId"),
+        "fkSupplierId": after.get("fkSupplierId", header.get("fkSupplierId")),
         "fkLocationId": header.get("fkLocationId"),
         "ShippingTaxRate": header.get("ShippingTaxRate", 0.0),
         "PostagePaid": header.get("PostagePaid", 0.0),
