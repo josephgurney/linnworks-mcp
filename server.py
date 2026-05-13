@@ -1427,6 +1427,148 @@ def update_purchase_order_header(
     }
 
 
+@mcp.tool()
+def deliver_purchase_order(
+    purchase_id: str,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Record delivery of all outstanding items on an OPEN purchase order.
+
+    Marks every undelivered line as fully received, which immediately updates
+    stock levels in Linnworks. The PO status will move to DELIVERED (or PARTIAL
+    if some lines were already delivered). Linnworks sets the delivery timestamp
+    to the current time — it cannot be backdated via the API.
+
+    WARNING: This updates live stock levels and cannot be easily undone.
+    dry_run=True (default) shows you what would be delivered without writing
+    anything. Always confirm the item list before setting dry_run=False.
+
+    The PO must be in OPEN or PARTIAL status — PENDING orders cannot be
+    delivered.
+
+    Args:
+        purchase_id: The UUID of the purchase order (pkPurchaseID).
+        dry_run: If True (default), shows outstanding items without delivering.
+            Set to False to record the delivery and update stock.
+
+    Returns:
+        A dict with:
+          - purchase_id:         the PO acted on
+          - dry_run:             whether this was a dry run
+          - status:              "dry_run", "delivered", or "error"
+          - outstanding_items:   items that were/would be delivered
+          - delivered_header:    updated PO header after delivery (live only)
+    """
+    purchase_id = purchase_id.strip()
+
+    # Step 1 — read current state
+    current = call_linnworks("PurchaseOrder/Get_PurchaseOrder", {"pkPurchaseId": purchase_id})
+    header = current.get("PurchaseOrderHeader") or {}
+    items = [i for i in (current.get("PurchaseOrderItem") or []) if not i.get("IsDeleted")]
+
+    current_status = header.get("Status", "")
+    if current_status not in ("OPEN", "PARTIAL"):
+        return {
+            "purchase_id": purchase_id,
+            "error": f"PO must be OPEN or PARTIAL to deliver. Current status: {current_status}",
+            "status": "error",
+        }
+
+    outstanding = [
+        {
+            "sku": i.get("SKU"),
+            "title": i.get("ItemTitle"),
+            "quantity": i.get("Quantity"),
+            "delivered": i.get("Delivered"),
+            "outstanding": (i.get("Quantity") or 0) - (i.get("Delivered") or 0),
+        }
+        for i in items
+        if ((i.get("Quantity") or 0) - (i.get("Delivered") or 0)) > 0
+    ]
+
+    if not outstanding:
+        return {
+            "purchase_id": purchase_id,
+            "dry_run": dry_run,
+            "status": "no_changes",
+            "message": "All items on this PO are already fully delivered.",
+        }
+
+    if dry_run:
+        return {
+            "purchase_id": purchase_id,
+            "dry_run": True,
+            "status": "dry_run",
+            "message": "No delivery recorded. Set dry_run=False to deliver all items and update stock.",
+            "outstanding_items": outstanding,
+        }
+
+    # Step 2 — deliver all items.
+    # Tried unwrapped first per tenant pattern; wrapper to try if this fails:
+    # {"pkPurchaseId": purchase_id} as body directly (already is unwrapped).
+    response = call_linnworks(
+        "PurchaseOrder/Deliver_PurchaseItemAll",
+        {"pkPurchaseId": purchase_id},
+    )
+
+    delivered_header = response.get("PurchaseOrderHeader") or {}
+
+    return {
+        "purchase_id": purchase_id,
+        "dry_run": False,
+        "status": "delivered",
+        "outstanding_items": outstanding,
+        "delivered_header": {
+            "status": delivered_header.get("Status"),
+            "date_of_delivery": delivered_header.get("DateOfDelivery"),
+            "delivered_lines_count": delivered_header.get("DeliveredLinesCount"),
+            "line_count": delivered_header.get("LineCount"),
+        },
+    }
+
+
+@mcp.tool()
+def add_purchase_order_note(
+    purchase_id: str,
+    note: str,
+) -> dict:
+    """
+    Add a text note to a purchase order.
+
+    Notes are visible in the Linnworks UI on the PO detail page. Use this to
+    record information that has no dedicated field — such as a delivery
+    tracking number, courier name, or expected arrival date.
+
+    Args:
+        purchase_id: The UUID of the purchase order (pkPurchaseID).
+        note: The text content of the note to add.
+
+    Returns:
+        A dict with:
+          - purchase_id:   the PO the note was added to
+          - note_id:       the UUID of the newly created note
+          - note:          the note text as stored
+          - date_created:  timestamp the note was created
+          - created_by:    the Linnworks user the note was attributed to
+    """
+    purchase_id = purchase_id.strip()
+
+    # Spec parameter name is "addNoteParameter" — wrapped accordingly.
+    response = call_linnworks(
+        "PurchaseOrder/Add_PurchaseOrderNote",
+        {"addNoteParameter": {"pkPurchaseId": purchase_id, "Note": note}},
+    )
+
+    return {
+        "purchase_id": purchase_id,
+        "note_id": response.get("pkPurchaseNoteId"),
+        "note": response.get("Note"),
+        "date_created": response.get("DateCreated"),
+        "created_by": response.get("CreatedBy"),
+    }
+
+
 # ---------- Purchase orders ----------
 
 _PO_STATUS_LABELS: dict[str, str] = {
