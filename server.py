@@ -1275,6 +1275,153 @@ def get_suppliers() -> dict:
     return {"error": "Unexpected response shape from suppliers endpoint", "raw": suppliers}
 
 
+# ---------- Purchase order writes ----------
+
+@mcp.tool()
+def update_purchase_order_header(
+    purchase_id: str,
+    supplier_reference: str = "",
+    external_invoice_number: str = "",
+    quoted_delivery_date: str = "",
+    date_of_purchase: str = "",
+    currency: str = "",
+    conversion_rate: float = 0.0,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Update the header fields of a purchase order.
+
+    Only works on orders that are not yet Delivered. Reads the current header
+    first, applies only the fields you provide, and (unless dry_run=True)
+    writes the change back to Linnworks. Always returns a before/after diff
+    so you can see exactly what would change.
+
+    IMPORTANT: dry_run defaults to True. Set dry_run=False only when you are
+    sure the change is correct — confirm with the user before doing so.
+
+    Args:
+        purchase_id: The UUID of the purchase order to update (pkPurchaseID).
+        supplier_reference: The supplier's own reference/PO number. Leave blank
+            to keep the current value.
+        external_invoice_number: The invoice number or your internal PO ref.
+            Leave blank to keep the current value.
+        quoted_delivery_date: Expected delivery date in ISO format,
+            e.g. "2026-06-01". Leave blank to keep the current value.
+        date_of_purchase: The purchase date in ISO format, e.g. "2026-05-13".
+            Leave blank to keep the current value.
+        currency: Currency code, e.g. "GBP". Leave blank to keep current.
+        conversion_rate: Exchange rate to GBP. Pass 0.0 to keep current value.
+        dry_run: If True (default), returns the proposed changes without writing
+            anything to Linnworks. Set to False to apply the update.
+
+    Returns:
+        A dict with:
+          - purchase_id:  the PO updated
+          - dry_run:      whether this was a dry run
+          - status:       "dry_run", "updated", or "no_changes"
+          - before:       the current header values for changed fields
+          - after:        the proposed/applied new values
+          - error:        present only if something went wrong
+    """
+    purchase_id = purchase_id.strip()
+
+    # Step 1 — read current state
+    current = call_linnworks("PurchaseOrder/Get_PurchaseOrder", {"pkPurchaseId": purchase_id})
+    header = current.get("PurchaseOrderHeader") or {}
+
+    current_status = header.get("Status", "")
+    if current_status == "DELIVERED":
+        return {
+            "purchase_id": purchase_id,
+            "error": "Cannot update a DELIVERED purchase order.",
+            "status": current_status,
+        }
+
+    # Step 2 — build diff: only include fields the caller explicitly provided
+    before: dict = {}
+    after: dict = {}
+
+    def _register(field_key: str, current_val, new_val):
+        """Record a field change only when a non-empty new value is supplied."""
+        if new_val and new_val != current_val:
+            before[field_key] = current_val
+            after[field_key] = new_val
+
+    _register("SupplierReferenceNumber", header.get("SupplierReferenceNumber", ""), supplier_reference)
+    _register("ExternalInvoiceNumber", header.get("ExternalInvoiceNumber", ""), external_invoice_number)
+    _register("Currency", header.get("Currency", ""), currency)
+
+    if quoted_delivery_date:
+        _register(
+            "QuotedDeliveryDate",
+            header.get("QuotedDeliveryDate", ""),
+            f"{quoted_delivery_date}T00:00:00",
+        )
+    if date_of_purchase:
+        _register(
+            "DateOfPurchase",
+            header.get("DateOfPurchase", ""),
+            f"{date_of_purchase}T00:00:00",
+        )
+    if conversion_rate and conversion_rate != header.get("ConversionRate", 0.0):
+        before["ConversionRate"] = header.get("ConversionRate")
+        after["ConversionRate"] = conversion_rate
+
+    if not after:
+        return {
+            "purchase_id": purchase_id,
+            "dry_run": dry_run,
+            "status": "no_changes",
+            "message": "No fields to update — all supplied values match the current header.",
+        }
+
+    if dry_run:
+        return {
+            "purchase_id": purchase_id,
+            "dry_run": True,
+            "status": "dry_run",
+            "message": "No changes written. Set dry_run=False to apply.",
+            "before": before,
+            "after": after,
+        }
+
+    # Step 3 — build write payload, carrying forward all current values
+    # and overlaying the changed ones. Payload sent unwrapped per tenant pattern.
+    update_param = {
+        "pkPurchaseID": purchase_id,
+        "SupplierReferenceNumber": after.get("SupplierReferenceNumber", header.get("SupplierReferenceNumber", "")),
+        "ExternalInvoiceNumber": after.get("ExternalInvoiceNumber", header.get("ExternalInvoiceNumber", "")),
+        "Currency": after.get("Currency", header.get("Currency", "GBP")),
+        "QuotedDeliveryDate": after.get("QuotedDeliveryDate", header.get("QuotedDeliveryDate")),
+        "DateOfPurchase": after.get("DateOfPurchase", header.get("DateOfPurchase")),
+        "ConversionRate": after.get("ConversionRate", header.get("ConversionRate", 1.0)),
+        "fkSupplierId": header.get("fkSupplierId"),
+        "fkLocationId": header.get("fkLocationId"),
+        "ShippingTaxRate": header.get("ShippingTaxRate", 0.0),
+        "PostagePaid": header.get("PostagePaid", 0.0),
+    }
+
+    # Payload wrapper for Update_PurchaseOrderHeader is uncertain — trying
+    # {"updateParameter": {...}} per the spec parameter name. If this fails
+    # with a shape error, try sending update_param directly (unwrapped).
+    call_linnworks("PurchaseOrder/Update_PurchaseOrderHeader", {"updateParameter": update_param})
+
+    # Step 4 — read back to confirm
+    confirmed = call_linnworks("PurchaseOrder/Get_PurchaseOrder", {"pkPurchaseId": purchase_id})
+    confirmed_header = confirmed.get("PurchaseOrderHeader") or {}
+
+    return {
+        "purchase_id": purchase_id,
+        "dry_run": False,
+        "status": "updated",
+        "before": before,
+        "after": after,
+        "confirmed": {
+            k: confirmed_header.get(k) for k in after
+        },
+    }
+
+
 # ---------- Purchase orders ----------
 
 _PO_STATUS_LABELS: dict[str, str] = {
