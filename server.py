@@ -109,6 +109,49 @@ def ensure_auth() -> tuple[str, str]:
     return _token, _server
 
 
+def call_linnworks_form(method_path: str, payload: dict) -> dict:
+    """
+    POST a Linnworks API call with form-encoded data (application/x-www-form-urlencoded).
+
+    Some older Linnworks write endpoints reject JSON and require form encoding instead.
+    Use this when call_linnworks returns HTTP 400 "The request is invalid."
+
+    method_path: e.g. "PurchaseOrder/Deliver_PurchaseItemAll"
+    payload:     flat dict of form fields
+    """
+    global _token, _server
+    token, server = ensure_auth()
+    url = f"{server.rstrip('/')}/api/{method_path}"
+
+    response = _session.post(
+        url,
+        data=payload,
+        headers={"Authorization": token},
+        timeout=60,
+    )
+
+    if response.status_code == 401:
+        _token, _server = None, None
+        token, server = ensure_auth()
+        url = f"{server.rstrip('/')}/api/{method_path}"
+        response = _session.post(
+            url,
+            data=payload,
+            headers={"Authorization": token},
+            timeout=60,
+        )
+
+    if not response.ok:
+        raise RuntimeError(
+            f"Linnworks {method_path} failed: HTTP {response.status_code} — {response.text}"
+        )
+
+    # Some endpoints return 204 No Content
+    if not response.text:
+        return {}
+    return response.json()
+
+
 def call_linnworks(method_path: str, payload: dict) -> dict:
     """
     POST a Linnworks API call with one automatic re-auth on token expiry.
@@ -1505,10 +1548,11 @@ def deliver_purchase_order(
         }
 
     # Step 2 — deliver all items.
-    # Unwrapped failed ("The request is invalid.") — trying {"request":{...}} wrapper.
-    response = call_linnworks(
+    # JSON (unwrapped) and JSON ({"request":{...}}) both returned HTTP 400.
+    # Trying form-encoded data — some older Linnworks write endpoints require this.
+    response = call_linnworks_form(
         "PurchaseOrder/Deliver_PurchaseItemAll",
-        {"request": {"pkPurchaseId": purchase_id}},
+        {"pkPurchaseId": purchase_id},
     )
 
     delivered_header = response.get("PurchaseOrderHeader") or {}
