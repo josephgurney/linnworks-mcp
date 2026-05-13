@@ -1220,6 +1220,268 @@ def get_period_comparison(
     }
 
 
+# ---------- Suppliers ----------
+
+@mcp.tool()
+def get_suppliers() -> dict:
+    """
+    List all suppliers configured in Linnworks.
+
+    Returns every supplier with their ID and name. Useful for resolving a
+    supplier name to a GUID before filtering purchase orders by supplier,
+    or for answering "what suppliers do we have?" and "what is the ID for
+    supplier X?".
+
+    Returns:
+        A dict with:
+          - count:     total number of suppliers
+          - suppliers: list of supplier records with id and name
+    """
+    # The Suppliers API is not in the public specs — try the most likely paths.
+    # Endpoint confirmed working will be noted in CLAUDE.md.
+    suppliers = call_linnworks_get("Inventory/GetSuppliers")
+
+    if isinstance(suppliers, list):
+        return {
+            "count": len(suppliers),
+            "suppliers": [
+                {
+                    "supplier_id": s.get("pkSupplierID") or s.get("SupplierId") or s.get("Id"),
+                    "name": s.get("SupplierName") or s.get("Name") or s.get("name"),
+                    "code": s.get("SupplierCode") or s.get("Code"),
+                    "currency": s.get("Currency"),
+                }
+                for s in suppliers
+            ],
+        }
+
+    # If the response is wrapped, try common wrapper keys
+    for key in ("Suppliers", "Data", "Result"):
+        if isinstance(suppliers, dict) and key in suppliers:
+            items = suppliers[key]
+            return {
+                "count": len(items),
+                "suppliers": [
+                    {
+                        "supplier_id": s.get("pkSupplierID") or s.get("SupplierId") or s.get("Id"),
+                        "name": s.get("SupplierName") or s.get("Name") or s.get("name"),
+                        "code": s.get("SupplierCode") or s.get("Code"),
+                        "currency": s.get("Currency"),
+                    }
+                    for s in items
+                ],
+            }
+
+    return {"error": "Unexpected response shape from suppliers endpoint", "raw": suppliers}
+
+
+# ---------- Purchase orders ----------
+
+_PO_STATUS_LABELS: dict[str, str] = {
+    "PENDING": "Pending",
+    "OPEN": "Open",
+    "PARTIAL": "Partial Delivery",
+    "DELIVERED": "Delivered",
+}
+
+
+@mcp.tool()
+def search_purchase_orders(
+    status: str = "",
+    from_date: str = "",
+    to_date: str = "",
+    search_value: str = "",
+    search_type: str = "All",
+    page: int = 1,
+    page_size: int = 50,
+) -> dict:
+    """
+    Search and list purchase orders from Linnworks.
+
+    Returns purchase order headers matching the given filters — status, date
+    range, reference number, SKU, or supplier code. Useful for questions like
+    "what purchase orders are currently open?", "which POs are due for
+    delivery?", "show me pending orders from the last 30 days", or "which
+    POs contain SKU ABC-123?".
+
+    Args:
+        status: Filter by PO status. One of: "PENDING", "OPEN", "PARTIAL",
+            "DELIVERED". Leave blank to return all statuses.
+        from_date: Start of the date range in ISO format, e.g. "2026-04-01".
+            Filters on DateOfPurchase. Leave blank for no lower bound.
+        to_date: End of the date range in ISO format, e.g. "2026-05-13".
+            Leave blank for no upper bound.
+        search_value: A keyword to search for. What it matches depends on
+            search_type. Leave blank to skip keyword filtering.
+        search_type: What the search_value matches against. One of:
+            "All" (default), "Reference", "StockItemSKU", "SupplierCode",
+            "SupplierReference". Ignored when search_value is blank.
+        page: Page number for paginated results. Defaults to 1.
+        page_size: Results per page. Defaults to 50.
+
+    Returns:
+        A dict with:
+          - page, total_pages, total_count: pagination info
+          - count: number of POs on this page
+          - purchase_orders: list of PO header summaries
+    """
+    request_body: dict = {
+        "EntriesPerPage": page_size,
+        "PageNumber": page,
+        "SearchType": search_type,
+    }
+
+    if status:
+        request_body["Status"] = status.upper()
+    if from_date:
+        request_body["DateFrom"] = f"{from_date}T00:00:00"
+    if to_date:
+        request_body["DateTo"] = f"{to_date}T23:59:59"
+    if search_value:
+        request_body["SearchValue"] = search_value
+
+    # Sent unwrapped — the "request" in the spec is the parameter name,
+    # not a JSON wrapper. Wrapping as {"request": {...}} causes filters
+    # to be silently ignored (confirmed in tenant testing May 2026).
+    response = call_linnworks(
+        "PurchaseOrder/Search_PurchaseOrders2",
+        request_body,
+    )
+
+    result = response.get("Result") or []
+    total_pages = response.get("TotalPages", 1)
+    total_count = response.get("TotalNumberOfRecords", 0)
+
+    pos = [
+        {
+            "purchase_id": po.get("pkPurchaseID"),
+            "supplier_id": po.get("fkSupplierId"),
+            "location_id": po.get("fkLocationId"),
+            "status": po.get("Status"),
+            "status_label": _PO_STATUS_LABELS.get(po.get("Status", ""), po.get("Status")),
+            "currency": po.get("Currency"),
+            "external_invoice_number": po.get("ExternalInvoiceNumber"),
+            "supplier_reference": po.get("SupplierReferenceNumber"),
+            "date_of_purchase": po.get("DateOfPurchase"),
+            "quoted_delivery_date": po.get("QuotedDeliveryDate"),
+            "date_of_delivery": po.get("DateOfDelivery"),
+            "line_count": po.get("LineCount"),
+            "delivered_lines_count": po.get("DeliveredLinesCount"),
+            "total_cost": po.get("TotalCost"),
+            "tax_paid": po.get("taxPaid"),
+            "locked": po.get("Locked"),
+        }
+        for po in result
+    ]
+
+    return {
+        "page": page,
+        "total_pages": total_pages,
+        "total_count": total_count,
+        "count": len(pos),
+        "purchase_orders": pos,
+    }
+
+
+@mcp.tool()
+def get_purchase_order(purchase_id: str) -> dict:
+    """
+    Fetch full detail for a single purchase order by its ID.
+
+    Returns the PO header, all line items (SKUs, quantities, costs, delivered
+    quantities), and any delivery records. Use this to answer questions like
+    "show me PO [ID] in full", "how many units of each SKU are on this PO?",
+    "how much of this PO has been delivered?", or "what's the total cost and
+    tax on this order?".
+
+    Args:
+        purchase_id: The UUID of the purchase order (pkPurchaseID), as returned
+            by search_purchase_orders.
+
+    Returns:
+        A dict with:
+          - purchase_id: the ID queried
+          - header: PO header fields (status, dates, costs, supplier, location)
+          - item_count: number of line items
+          - items: list of line items with SKU, quantity, cost, delivered qty
+          - delivered_records: list of delivery events (if any)
+          - note_count: number of notes attached to the PO
+    """
+    purchase_id = purchase_id.strip()
+
+    # Spec shows pkPurchaseId as a direct top-level field (unwrapped).
+    # If this fails, try {"request": {"pkPurchaseId": purchase_id}}.
+    response = call_linnworks(
+        "PurchaseOrder/Get_PurchaseOrder",
+        {"pkPurchaseId": purchase_id},
+    )
+
+    header_raw = response.get("PurchaseOrderHeader") or {}
+    items_raw = response.get("PurchaseOrderItem") or []
+    delivered_raw = response.get("DeliveredRecords") or []
+
+    header = {
+        "purchase_id": header_raw.get("pkPurchaseID"),
+        "supplier_id": header_raw.get("fkSupplierId"),
+        "location_id": header_raw.get("fkLocationId"),
+        "status": header_raw.get("Status"),
+        "status_label": _PO_STATUS_LABELS.get(header_raw.get("Status", ""), header_raw.get("Status")),
+        "currency": header_raw.get("Currency"),
+        "external_invoice_number": header_raw.get("ExternalInvoiceNumber"),
+        "supplier_reference": header_raw.get("SupplierReferenceNumber"),
+        "date_of_purchase": header_raw.get("DateOfPurchase"),
+        "quoted_delivery_date": header_raw.get("QuotedDeliveryDate"),
+        "date_of_delivery": header_raw.get("DateOfDelivery"),
+        "line_count": header_raw.get("LineCount"),
+        "delivered_lines_count": header_raw.get("DeliveredLinesCount"),
+        "total_cost": header_raw.get("TotalCost"),
+        "tax_paid": header_raw.get("taxPaid"),
+        "conversion_rate": header_raw.get("ConversionRate"),
+        "converted_grand_total": header_raw.get("ConvertedGrandTotal"),
+        "locked": header_raw.get("Locked"),
+    }
+
+    items = [
+        {
+            "purchase_item_id": i.get("pkPurchaseItemId"),
+            "stock_item_id": i.get("fkStockItemId"),
+            "sku": i.get("SKU"),
+            "title": i.get("ItemTitle"),
+            "supplier_code": i.get("SupplierCode"),
+            "bin_rack": i.get("BinRack"),
+            "quantity": i.get("Quantity"),
+            "delivered": i.get("Delivered"),
+            "outstanding": (i.get("Quantity") or 0) - (i.get("Delivered") or 0),
+            "cost": i.get("Cost"),
+            "tax_rate": i.get("TaxRate"),
+            "tax": i.get("Tax"),
+            "pack_quantity": i.get("PackQuantity"),
+            "pack_size": i.get("PackSize"),
+        }
+        for i in items_raw
+        if not i.get("IsDeleted")
+    ]
+
+    delivered = [
+        {
+            "stock_item_id": d.get("fkStockItemId"),
+            "sku": d.get("SKU"),
+            "quantity_delivered": d.get("Qty"),
+            "delivery_date": d.get("DeliveryDate"),
+        }
+        for d in delivered_raw
+    ]
+
+    return {
+        "purchase_id": purchase_id,
+        "header": header,
+        "item_count": len(items),
+        "items": items,
+        "delivered_records": delivered,
+        "note_count": response.get("NoteCount", 0),
+    }
+
+
 # ---------- Entrypoint ----------
 
 def main() -> None:
