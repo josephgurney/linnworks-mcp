@@ -1321,6 +1321,191 @@ def get_suppliers() -> dict:
 # ---------- Purchase order writes ----------
 
 @mcp.tool()
+def create_purchase_order(
+    supplier_id: str,
+    items: str,
+    location_id: str = "00000000-0000-0000-0000-000000000000",
+    external_invoice_number: str = "",
+    supplier_reference: str = "",
+    quoted_delivery_date: str = "",
+    currency: str = "GBP",
+    dry_run: bool = True,
+) -> dict:
+    """
+    Create a new purchase order in PENDING status and add line items to it.
+
+    Two-step process: first creates the PO header, then adds each line item
+    by resolving each SKU to a stock item GUID. Use open_purchase_order()
+    afterwards to move the PO from PENDING to OPEN.
+
+    IMPORTANT: dry_run defaults to True. It will resolve all SKUs and show
+    exactly what would be created without writing anything. Set dry_run=False
+    only after confirming the resolved items look correct.
+
+    Args:
+        supplier_id: UUID of the supplier (pkSupplierID). Use get_suppliers()
+            to look up the correct UUID by name.
+        items: JSON array of line items to add. Each item must have:
+            - "sku":       the product SKU (will be resolved to a stock item ID)
+            - "quantity":  integer quantity to order
+            - "cost":      unit cost excluding tax (e.g. 10.50)
+            - "tax_rate":  tax percentage (e.g. 20.0 for 20%). Defaults to 20.0.
+            Example: '[{"sku":"ABC-123","quantity":5,"cost":10.50,"tax_rate":20.0}]'
+        location_id: UUID of the destination warehouse location. Defaults to
+            the "Default" (all stock) location.
+        supplier_reference: YOUR reference for this order as quoted to the supplier
+            — e.g. "TEST-PO001". This is the field staff and suppliers see. Leave
+            blank if not needed.
+        external_invoice_number: Linnworks auto-generates its own PO number here.
+            Leave blank in almost all cases — only set this if you need to override
+            the Linnworks-generated reference.
+        quoted_delivery_date: Expected delivery date in ISO format, e.g. "2026-06-01".
+        currency: Currency code, e.g. "GBP". Defaults to "GBP".
+        dry_run: If True (default), resolves SKUs and shows what would be created
+            without writing anything. Set to False to create the PO.
+
+    Note: DateOfPurchase is always set to the current date/time at creation.
+    The Linnworks stored procedure requires it — null or missing causes a SQL
+    overflow error. This mirrors the UI behaviour where today's date is the default.
+
+    Returns:
+        A dict with:
+          - dry_run:       whether this was a dry run
+          - status:        "dry_run", "created", or "error"
+          - purchase_id:   UUID of the new PO (live runs only)
+          - resolved_items: the items with resolved stock_item_ids and totals
+          - errors:        list of SKUs that could not be resolved (if any)
+          - header:        the PO header fields that were/would be submitted
+    """
+    import json as _json
+
+    # Step 1 — parse items JSON
+    try:
+        item_list = _json.loads(items)
+        if not isinstance(item_list, list) or len(item_list) == 0:
+            return {"status": "error", "error": "items must be a non-empty JSON array."}
+    except Exception as exc:
+        return {"status": "error", "error": f"Could not parse items JSON: {exc}"}
+
+    # Step 2 — resolve every SKU to a stock item GUID
+    resolved = []
+    errors = []
+    for item in item_list:
+        sku = item.get("sku", "").strip()
+        if not sku:
+            errors.append({"sku": sku, "error": "empty SKU"})
+            continue
+        try:
+            inv = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+            stock_item_id = (inv or {}).get("StockItemId")
+            if not stock_item_id:
+                errors.append({"sku": sku, "error": "SKU not found in Linnworks"})
+                continue
+        except Exception as exc:
+            errors.append({"sku": sku, "error": str(exc)})
+            continue
+
+        qty = int(item.get("quantity", 1))
+        cost = float(item.get("cost", 0.0))
+        tax_rate = float(item.get("tax_rate", 20.0))
+        tax = round(cost * qty * (tax_rate / 100), 4)
+        resolved.append({
+            "sku": sku,
+            "stock_item_id": stock_item_id,
+            "quantity": qty,
+            "cost": cost,
+            "tax_rate": tax_rate,
+            "line_total_ex_tax": round(cost * qty, 4),
+            "tax": tax,
+        })
+
+    if errors:
+        return {
+            "status": "error",
+            "error": f"{len(errors)} SKU(s) could not be resolved — fix these before creating the PO.",
+            "errors": errors,
+            "resolved_items": resolved,
+        }
+
+    # Build the header fields dict for display / submission.
+    # DateOfPurchase is required by SQL — default to today if not supplied.
+    today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    # All fields below are always sent — the stored procedure requires them
+    # even when empty. DateOfPurchase defaults to today (SQL rejects null/min).
+    header_fields: dict = {
+        "fkSupplierId": supplier_id,
+        "fkLocationId": location_id,
+        "Currency": currency,
+        "DateOfPurchase": today_iso,
+        "ExternalInvoiceNumber": external_invoice_number,
+        "SupplierReferenceNumber": supplier_reference,
+        "QuotedDeliveryDate": f"{quoted_delivery_date}T00:00:00" if quoted_delivery_date else today_iso,
+        "ConversionRate": 1.0,
+        "PostagePaid": 0.0,
+        "ShippingTaxRate": 0.0,
+        "UnitAmountTaxIncludedType": 0,
+    }
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "status": "dry_run",
+            "message": "No PO created. Set dry_run=False to create.",
+            "header": header_fields,
+            "resolved_items": resolved,
+            "errors": errors,
+        }
+
+    # Step 3 — create PO header
+    create_payload = {"createParameters": header_fields}
+    new_po_id = call_linnworks("PurchaseOrder/Create_PurchaseOrder_Initial", create_payload)
+    if not new_po_id or not isinstance(new_po_id, str):
+        return {
+            "status": "error",
+            "error": f"Create_PurchaseOrder_Initial returned an unexpected response: {new_po_id!r}",
+        }
+
+    # Step 4 — add each line item
+    item_errors = []
+    for r in resolved:
+        add_payload = {
+            "addItemParameter": {
+                "pkPurchaseId": new_po_id,
+                "fkStockItemId": r["stock_item_id"],
+                "Qty": r["quantity"],
+                "Cost": r["cost"],
+                "TaxRate": r["tax_rate"],
+                "PackQuantity": 1,
+                "PackSize": 1,
+            }
+        }
+        try:
+            call_linnworks("PurchaseOrder/Add_PurchaseOrderItem", add_payload)
+        except Exception as exc:
+            item_errors.append({"sku": r["sku"], "error": str(exc)})
+
+    # Step 5 — read back the new PO to confirm
+    confirmed = call_linnworks("PurchaseOrder/Get_PurchaseOrder", {"pkPurchaseId": new_po_id})
+    confirmed_header = confirmed.get("PurchaseOrderHeader") or {}
+
+    result = {
+        "dry_run": False,
+        "status": "created",
+        "purchase_id": new_po_id,
+        "linnworks_status": confirmed_header.get("Status"),
+        "external_invoice_number": confirmed_header.get("ExternalInvoiceNumber", ""),
+        "line_count": confirmed_header.get("LineCount", 0),
+        "total_cost": confirmed_header.get("GrandTotal"),
+        "resolved_items": resolved,
+        "header": header_fields,
+    }
+    if item_errors:
+        result["item_errors"] = item_errors
+        result["warning"] = "PO header was created but some line items failed — check item_errors."
+    return result
+
+
+@mcp.tool()
 def update_purchase_order_header(
     purchase_id: str,
     supplier_id: str = "",
@@ -1467,6 +1652,93 @@ def update_purchase_order_header(
         "confirmed": {
             k: confirmed_header.get(k) for k in after
         },
+    }
+
+
+@mcp.tool()
+def open_purchase_order(
+    purchase_id: str,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Move a purchase order from PENDING to OPEN status.
+
+    Opening a PO signals to Linnworks that the order has been placed and
+    stock is on its way — it populates "Due (On Order)" values in stock
+    levels so you can see inbound stock. Use this after creating or
+    confirming a PO with your supplier.
+
+    Only works on PENDING orders. OPEN, PARTIAL, and DELIVERED orders are
+    rejected with a clear error. Use deliver_purchase_order() to mark
+    items as received once they arrive.
+
+    IMPORTANT: dry_run defaults to True. Set dry_run=False only when you
+    are sure — confirm with the user before doing so.
+
+    Args:
+        purchase_id: The UUID of the purchase order (pkPurchaseID), as
+            returned by search_purchase_orders() or get_purchase_order().
+        dry_run: If True (default), shows what would happen without writing
+            anything. Set to False to apply the status change.
+
+    Returns:
+        A dict with:
+          - purchase_id:     the PO acted on
+          - dry_run:         whether this was a dry run
+          - status:          "dry_run", "opened", or "error"
+          - from_status:     the status before the change
+          - to_status:       "OPEN" (or the confirmed status on read-back)
+          - external_invoice_number: the PO reference number, for confirmation
+          - error:           present only if the PO cannot be opened
+    """
+    purchase_id = purchase_id.strip()
+
+    # Step 1 — read current state
+    current = call_linnworks("PurchaseOrder/Get_PurchaseOrder", {"pkPurchaseId": purchase_id})
+    header = current.get("PurchaseOrderHeader") or {}
+    current_status = header.get("Status", "")
+    ext_inv = header.get("ExternalInvoiceNumber", "")
+
+    if current_status != "PENDING":
+        return {
+            "purchase_id": purchase_id,
+            "status": "error",
+            "error": (
+                f"Cannot open this PO — current status is {current_status!r}. "
+                "Only PENDING orders can be moved to OPEN."
+            ),
+            "from_status": current_status,
+            "external_invoice_number": ext_inv,
+        }
+
+    if dry_run:
+        return {
+            "purchase_id": purchase_id,
+            "dry_run": True,
+            "status": "dry_run",
+            "message": "No changes written. Set dry_run=False to open this PO.",
+            "from_status": current_status,
+            "to_status": "OPEN",
+            "external_invoice_number": ext_inv,
+        }
+
+    # Step 2 — change status to OPEN
+    call_linnworks(
+        "PurchaseOrder/Change_PurchaseOrderStatus",
+        {"changeStatusParameter": {"pkPurchaseId": purchase_id, "status": "OPEN"}},
+    )
+
+    # Step 3 — read back to confirm
+    confirmed = call_linnworks("PurchaseOrder/Get_PurchaseOrder", {"pkPurchaseId": purchase_id})
+    confirmed_status = (confirmed.get("PurchaseOrderHeader") or {}).get("Status", "")
+
+    return {
+        "purchase_id": purchase_id,
+        "dry_run": False,
+        "status": "opened",
+        "from_status": current_status,
+        "to_status": confirmed_status,
+        "external_invoice_number": ext_inv,
     }
 
 
