@@ -2091,6 +2091,149 @@ def get_purchase_order(purchase_id: str) -> dict:
     }
 
 
+# ---------- Rules Engine ----------
+
+@mcp.tool()
+def get_rules() -> dict:
+    """
+    List all rules configured in the Linnworks Rules Engine.
+
+    The Rules Engine applies automatic changes to orders as they arrive —
+    assigning shipping services, routing to folders, locking/parking orders,
+    tagging, running macros, and more. Each rule has an ordered list of
+    conditions, and the first matching condition's action fires.
+
+    Returns every rule with its ID, name, type, enabled state, run order,
+    and draft status. Use this to answer questions like "what rules do we
+    have set up?", "which rules are currently enabled?", "what order do
+    rules run in?", or "are any rules in draft?".
+
+    Rule types: "Orders" (fires on incoming orders), "Test" (sandbox rules).
+
+    Returns:
+        A dict with:
+          - count:  total number of rules
+          - rules:  list of rule summaries, each with pk_rule_id, rule_name,
+                    rule_type, enabled, run_order, draft, pk_rule_id_draft
+    """
+    response = call_linnworks_get("RulesEngine/GetRules")
+
+    rules = response if isinstance(response, list) else []
+
+    return {
+        "count": len(rules),
+        "rules": [
+            {
+                "pk_rule_id": r.get("pkRuleId"),
+                "rule_name": r.get("RuleName"),
+                "rule_type": r.get("RuleType"),
+                "rule_type_display": r.get("RuleTypeDisplayName"),
+                "enabled": r.get("Enabled"),
+                "run_order": r.get("RunOrder"),
+                "draft": r.get("Draft"),
+                "pk_rule_id_draft": r.get("pkRuleId_Draft"),
+            }
+            for r in rules
+        ],
+    }
+
+
+def _format_condition_tree(node: dict) -> dict:
+    """
+    Recursively format a RuleConditionHeader node into a readable structure.
+    Each node has conditions (IF clauses), an action (THEN clause),
+    and optional subrules (nested conditions).
+    """
+    # Format condition items (the IF clauses)
+    conditions = [
+        {
+            "field": c.get("FieldName"),
+            "evaluation": c.get("Evaluation"),
+            "key_value": c.get("KeyValue"),
+            "values": c.get("Values") or [],
+        }
+        for c in (node.get("Conditions") or [])
+    ]
+
+    # Format the action (the THEN clause)
+    raw_action = node.get("Action") or {}
+    action = None
+    if raw_action.get("pkActionId"):
+        action = {
+            "pk_action_id": raw_action.get("pkActionId"),
+            "action_name": raw_action.get("ActionName"),
+            "action_type": raw_action.get("ActionType"),
+            "action_value": raw_action.get("ActionValue"),
+            "properties": [
+                {
+                    "name": p.get("DisplayName"),
+                    "value": p.get("Value"),
+                }
+                for p in (raw_action.get("Properties") or [])
+            ],
+        }
+
+    # Recurse into subrules
+    subrules = [
+        _format_condition_tree(sub)
+        for sub in (node.get("Subrules") or [])
+    ]
+
+    return {
+        "pk_condition_id": node.get("pkConditionId"),
+        "condition_name": node.get("ConditionName"),
+        "run_order": node.get("RunOrder"),
+        "enabled": node.get("Enabled"),
+        "conditions": conditions,
+        "action": action,
+        "subrules": subrules,
+    }
+
+
+@mcp.tool()
+def get_rule(rule_id: int) -> dict:
+    """
+    Fetch the full condition and action tree for a single Rules Engine rule.
+
+    Returns the complete "IF [conditions] THEN [action]" logic for every
+    branch of the rule, including nested subrules. Use this to answer questions
+    like "what does this rule actually do?", "what conditions trigger the
+    shipping assignment rule?", "which rule assigns orders to the HLC folder?",
+    or "why is this order being routed to a particular service?".
+
+    Each condition node has:
+      - conditions: the IF clauses (field + evaluator + values)
+      - action:     the THEN clause (action type + properties)
+      - subrules:   nested condition branches (else-if chains)
+
+    Common action types: AssignShippingService, AssignToFolder,
+    AssignToLocation, AssignTagToOrder, ChangeOrderParkStatus,
+    ChangeOrderLockStatus, ExecuteMacro, AddNoteToOrder, SetDispatchDate.
+
+    Args:
+        rule_id: The integer ID of the rule (pk_rule_id from get_rules).
+
+    Returns:
+        A dict with:
+          - pk_rule_id:   the rule queried
+          - condition_count: number of top-level condition nodes
+          - conditions:  list of condition trees, each with conditions,
+                         action, and nested subrules
+    """
+    response = call_linnworks_get(
+        "RulesEngine/GetRuleConditionNodes",
+        params={"pkRuleId": rule_id},
+    )
+
+    nodes = response if isinstance(response, list) else []
+
+    return {
+        "pk_rule_id": rule_id,
+        "condition_count": len(nodes),
+        "conditions": [_format_condition_tree(n) for n in nodes],
+    }
+
+
 # ---------- Import / Export ----------
 
 @mcp.tool()

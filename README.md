@@ -45,6 +45,13 @@ Once installed, Claude gets access to these tools:
 | `deliver_purchase_order` | Record delivery of all outstanding items on an OPEN PO (dry-run by default) |
 | `add_purchase_order_note` | Add a text note to a PO (e.g. tracking number, expected arrival) |
 
+**Rules Engine**
+
+| Tool | What it does |
+|---|---|
+| `get_rules` | List all Rules Engine rules — name, type, enabled state, run order, draft status |
+| `get_rule` | Full IF/THEN condition tree for a single rule — every condition clause and action with nested subrules |
+
 **Import / Export monitoring**
 
 | Tool | What it does |
@@ -66,6 +73,8 @@ Example questions you can ask:
 > Which imports are currently in error?
 > When did the stock level import last run, and what's its feed URL?
 > Show me all purchase orders from this supplier that are currently open.
+> Which rules are currently enabled, and in what order do they run?
+> What does the "Nathan Shipping Rules" rule actually do — show me the full conditions and actions.
 
 ---
 
