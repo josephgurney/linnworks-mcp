@@ -10,16 +10,49 @@ This is a **single-tenant stdio server**: it runs on your machine, connects to y
 
 Once installed, Claude gets access to these tools:
 
+**Orders & stock**
+
 | Tool | What it does |
 |---|---|
-| `get_open_orders` | List current open (unprocessed) orders — count, SKUs, dispatch deadlines |
+| `get_open_orders` | List current open (unprocessed) orders — count, SKUs, dispatch deadlines, overdue flag |
 | `get_processed_orders` | Search dispatched orders by date range — volume, sources, tracking |
-| `get_processed_order_items` | Processed orders **with full line items** — top-selling SKUs, sold-together analysis, revenue by category |
+| `get_processed_order_items` | Processed orders **with full line items** — top-selling SKUs, sold-together analysis, revenue by product |
 | `get_order` | Full detail on a single order by numeric ID or GUID |
 | `get_stock_level` | Current stock level for a SKU across all locations |
 | `find_inventory_item` | Look up an inventory item by exact SKU |
 | `get_extended_properties` | Fetch custom metadata (extended properties) for a product |
 | `get_locations` | List all warehouse and fulfilment locations with their GUIDs |
+
+**Reporting**
+
+| Tool | What it does |
+|---|---|
+| `get_revenue_summary` | Total orders, revenue, and AOV for a date range — broken down by channel and country |
+| `get_top_skus` | Top-selling SKUs by revenue or units for a date range |
+| `get_category_report` | Revenue and units by product category for a date range |
+| `get_period_comparison` | Side-by-side revenue comparison between two date ranges (MoM, YoY, etc.) |
+
+**Purchase orders**
+
+| Tool | What it does |
+|---|---|
+| `search_purchase_orders` | Search POs by status, date range, or keyword |
+| `get_purchase_order` | Full detail for a single PO — header, line items, delivery records |
+| `get_suppliers` | List all suppliers with their GUIDs |
+| `create_purchase_order` | Create a new PO and add line items (dry-run by default) |
+| `update_purchase_order_header` | Edit PO header fields — supplier, reference, dates, currency (dry-run by default) |
+| `open_purchase_order` | Move a PO from PENDING → OPEN status (dry-run by default) |
+| `deliver_purchase_order` | Record delivery of all outstanding items on an OPEN PO (dry-run by default) |
+| `add_purchase_order_note` | Add a text note to a PO (e.g. tracking number, expected arrival) |
+
+**Import / Export monitoring**
+
+| Tool | What it does |
+|---|---|
+| `get_import_list` | List all configured import tasks — name, type, enabled state, last run, status, next schedule |
+| `get_export_list` | List all configured export tasks — same fields plus last export success/fail |
+| `get_import` | Full detail for one import — feed URL, column mappings, schedule config |
+| `get_export` | Full detail for one export — destination, filters, schedule config |
 
 Example questions you can ask:
 
@@ -29,6 +62,10 @@ Example questions you can ask:
 > What's the stock level for SKU ABC-123?
 > What extended properties does product XYZ have?
 > Which of our locations hold inventory?
+> How does this month's revenue compare to last month?
+> Which imports are currently in error?
+> When did the stock level import last run, and what's its feed URL?
+> Show me all purchase orders from this supplier that are currently open.
 
 ---
 
@@ -150,7 +187,7 @@ The most common causes are wrong absolute paths in the config, or Python below 3
 
 - Credentials go directly from your machine to Linnworks. Nothing is hosted or proxied.
 - `.env` is gitignored. Never commit it.
-- All current tools are **read-only**. No write operations are implemented.
+- Write tools (`create_purchase_order`, `update_purchase_order_header`, `open_purchase_order`, `deliver_purchase_order`) all default to `dry_run=True` and will not modify data unless you explicitly confirm.
 
 ---
 

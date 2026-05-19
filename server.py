@@ -2091,6 +2091,230 @@ def get_purchase_order(purchase_id: str) -> dict:
     }
 
 
+# ---------- Import / Export ----------
+
+@mcp.tool()
+def get_import_list() -> dict:
+    """
+    List all configured import tasks in Linnworks.
+
+    Returns every scheduled import with its ID, friendly name, type, enabled
+    state, current execution status, last run timestamps, last import status,
+    and next scheduled run time. Use this to answer questions like "what imports
+    do we have set up?", "which imports are currently enabled?", "when did the
+    stock level import last run?", or "is any import currently executing or
+    queued?". Also useful for debugging — check ImportStatus and Completed to
+    spot failed or stale imports.
+
+    Returns:
+        A dict with:
+          - count:   total number of configured imports
+          - imports: list of import summaries, each with id, friendly_name, type,
+                     enabled, executing, is_queued, started, completed,
+                     import_status, import_skipped, all_schedules_disabled,
+                     next_schedule, schedule_count
+    """
+    response = call_linnworks_get("ImportExport/GetImportList")
+
+    # Response: {"register": [...]}
+    register = response.get("register") if isinstance(response, dict) else response
+    if not isinstance(register, list):
+        register = []
+
+    imports = [
+        {
+            "id": r.get("Id"),
+            "friendly_name": r.get("FriendlyName"),
+            "type": r.get("Type"),
+            "enabled": r.get("Enabled"),
+            "executing": r.get("Executing"),
+            "is_queued": r.get("IsQueued"),
+            "started": r.get("Started"),
+            "completed": r.get("Completed"),
+            "import_status": r.get("ImportStatus"),
+            "import_skipped": r.get("ImportSkipped"),
+            "all_schedules_disabled": r.get("AllSchedulesDisabled"),
+            "next_schedule": r.get("NextSchedule"),
+            "schedule_count": len(r.get("Schedules") or []),
+        }
+        for r in register
+    ]
+
+    return {"count": len(imports), "imports": imports}
+
+
+@mcp.tool()
+def get_export_list() -> dict:
+    """
+    List all configured export tasks in Linnworks.
+
+    Returns every scheduled export with its ID, friendly name, type, enabled
+    state, current execution status, last run timestamps, last export status,
+    and next scheduled run time. Use this to answer questions like "what exports
+    do we have set up?", "which exports are enabled?", "when did the inventory
+    export last run?", or "is any export currently failing?". Also useful for
+    debugging — check last_export_status and completed to spot issues.
+
+    Returns:
+        A dict with:
+          - count:   total number of configured exports
+          - exports: list of export summaries, each with id, friendly_name, type,
+                     enabled, executing, is_queued, started, completed,
+                     last_export_status, all_schedules_disabled, next_schedule,
+                     schedule_count
+    """
+    response = call_linnworks_get("ImportExport/GetExportList")
+
+    register = response.get("register") if isinstance(response, dict) else response
+    if not isinstance(register, list):
+        register = []
+
+    exports = [
+        {
+            "id": r.get("Id"),
+            "friendly_name": r.get("FriendlyName"),
+            "type": r.get("Type"),
+            "enabled": r.get("Enabled"),
+            "executing": r.get("Executing"),
+            "is_queued": r.get("IsQueued"),
+            "started": r.get("Started"),
+            "completed": r.get("Completed"),
+            "last_export_status": r.get("LastExportStatus"),
+            "all_schedules_disabled": r.get("AllSchedulesDisabled"),
+            "next_schedule": r.get("NextSchedule"),
+            "schedule_count": len(r.get("Schedules") or []),
+        }
+        for r in register
+    ]
+
+    return {"count": len(exports), "exports": exports}
+
+
+@mcp.tool()
+def get_import(import_id: int) -> dict:
+    """
+    Fetch full detail for a single configured import task.
+
+    Returns the complete import configuration including the specification
+    (file source, column mappings, field settings), the register (current
+    status and timestamps), and all schedule entries with their cron
+    configuration. Use this when you need to inspect exactly how an import
+    is configured — e.g. "what file path is the stock level import reading
+    from?", "what columns are mapped on this import?", or "what schedule is
+    this import running on?".
+
+    Args:
+        import_id: The integer ID of the import (as returned by get_import_list).
+
+    Returns:
+        A dict with:
+          - id:            the import ID queried
+          - friendly_name: human-readable import name
+          - type:          the import type (e.g. "StockLevel", "Inventory")
+          - enabled:       whether the import is enabled
+          - executing:     whether it is currently running
+          - is_queued:     whether it is queued for execution
+          - started:       last start timestamp
+          - completed:     last completion timestamp
+          - import_status: last import status string
+          - import_skipped: whether the last run was skipped (no file change)
+          - next_schedule: next scheduled run time
+          - schedules:     list of schedule entries with their configuration
+          - specification: full specification dict (file source, column mappings, etc.)
+    """
+    response = call_linnworks_get("ImportExport/GetImport", params={"id": import_id})
+
+    register = response.get("Register") or {}
+    schedules = response.get("Schedules") or []
+    spec = response.get("Specification") or {}
+
+    return {
+        "id": register.get("Id"),
+        "friendly_name": register.get("FriendlyName"),
+        "type": register.get("Type"),
+        "enabled": register.get("Enabled"),
+        "executing": register.get("Executing"),
+        "is_queued": register.get("IsQueued"),
+        "started": register.get("Started"),
+        "completed": register.get("Completed"),
+        "import_status": register.get("ImportStatus"),
+        "import_skipped": register.get("ImportSkipped"),
+        "next_schedule": register.get("NextSchedule"),
+        "all_schedules_disabled": register.get("AllSchedulesDisabled"),
+        "schedules": [
+            {
+                "schedule_id": s.get("Id"),
+                "name": s.get("Name"),
+                "schedule_xml": s.get("ScheduleXML"),
+                "configuration": s.get("Configuration"),
+            }
+            for s in schedules
+        ],
+        "specification": spec,
+    }
+
+
+@mcp.tool()
+def get_export(export_id: int) -> dict:
+    """
+    Fetch full detail for a single configured export task.
+
+    Returns the complete export configuration including the specification
+    (destination, query/filter settings), the register (current status and
+    timestamps), and all schedule entries with their cron configuration.
+    Use this when you need to inspect exactly how an export is configured —
+    e.g. "where is this export sending data?", "what filters does this export
+    apply?", or "what schedule is this export running on?".
+
+    Args:
+        export_id: The integer ID of the export (as returned by get_export_list).
+
+    Returns:
+        A dict with:
+          - id:               the export ID queried
+          - friendly_name:    human-readable export name
+          - type:             the export type
+          - enabled:          whether the export is enabled
+          - executing:        whether it is currently running
+          - is_queued:        whether it is queued for execution
+          - started:          last start timestamp
+          - completed:        last completion timestamp
+          - last_export_status: whether the last run succeeded (bool)
+          - next_schedule:    next scheduled run time
+          - schedules:        list of schedule entries with their configuration
+          - specification:    full specification dict (destination, filters, etc.)
+    """
+    response = call_linnworks_get("ImportExport/GetExport", params={"id": export_id})
+
+    register = response.get("Register") or {}
+    schedules = response.get("Schedules") or []
+    spec = response.get("Specification") or {}
+
+    return {
+        "id": register.get("Id"),
+        "friendly_name": register.get("FriendlyName"),
+        "type": register.get("Type"),
+        "enabled": register.get("Enabled"),
+        "executing": register.get("Executing"),
+        "is_queued": register.get("IsQueued"),
+        "started": register.get("Started"),
+        "completed": register.get("Completed"),
+        "last_export_status": register.get("LastExportStatus"),
+        "next_schedule": register.get("NextSchedule"),
+        "all_schedules_disabled": register.get("AllSchedulesDisabled"),
+        "schedules": [
+            {
+                "schedule_id": s.get("Id"),
+                "name": s.get("Name"),
+                "schedule_xml": s.get("ScheduleXML"),
+                "configuration": s.get("Configuration"),
+            }
+            for s in schedules
+        ],
+        "specification": spec,
+    }
+
+
 # ---------- Entrypoint ----------
 
 def main() -> None:
