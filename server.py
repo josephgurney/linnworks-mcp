@@ -760,6 +760,47 @@ def _batch_order_items(order_guids: list[str]) -> dict[str, list]:
     return result
 
 
+def _fetch_supplier_for_items(stock_item_ids: list[str]) -> dict[str, dict]:
+    """
+    Return a map of stock_item_id → {supplier_name, supplier_id} for the
+    primary (IsDefault=True, else first) supplier of each item.
+
+    Uses Stock/GetStockItemsFullByIds with DataRequirements:[1] — the only
+    confirmed path for reading supplier-item relationships in this tenant.
+    All dedicated Inventory/GetInventoryItemSuppliers endpoints return 404.
+    DataRequirements:[1] confirmed May 2026.
+
+    Batches in groups of 200 to avoid oversized requests.
+    Items with no supplier linked are mapped to supplier_name="No Supplier".
+    """
+    result: dict[str, dict] = {}
+    batch_size = 200
+    for i in range(0, len(stock_item_ids), batch_size):
+        batch = stock_item_ids[i : i + batch_size]
+        try:
+            resp = call_linnworks(
+                "Stock/GetStockItemsFullByIds",
+                {"request": {"StockItemIds": batch, "DataRequirements": [1]}},
+            )
+            for item in resp.get("StockItemsFullExtended", []):
+                iid = item.get("StockItemId", "")
+                suppliers = item.get("Suppliers") or []
+                if suppliers:
+                    sup = next(
+                        (s for s in suppliers if s.get("IsDefault")), suppliers[0]
+                    )
+                    result[iid] = {
+                        "supplier_name": sup.get("Supplier") or "No Supplier",
+                        "supplier_id": sup.get("SupplierID") or "",
+                    }
+                else:
+                    result[iid] = {"supplier_name": "No Supplier", "supplier_id": ""}
+        except Exception:
+            # Best-effort: items we can't resolve stay absent from the map.
+            pass
+    return result
+
+
 @mcp.tool()
 def get_processed_order_items(
     from_date: str,
@@ -1101,6 +1142,7 @@ def get_top_skus(
     date_field: str = "processed",
     top_n: int = 20,
     rank_by: str = "revenue",
+    supplier_name: str = "",
 ) -> dict:
     """
     Aggregate sales by individual SKU for a date range. Auto-paginates
@@ -1109,6 +1151,10 @@ def get_top_skus(
     Use this when you need SKU-level analysis: "what are our top-selling
     products?", "which SKUs drove the most revenue last month?", "how many
     units of each product did we sell?".
+
+    Optionally filter to a single supplier's SKUs by passing supplier_name
+    (case-insensitive partial match against the primary supplier name on each
+    item). Use get_suppliers() to see the full list of supplier names.
 
     For category-level analysis use get_category_report instead (faster).
 
@@ -1119,14 +1165,17 @@ def get_top_skus(
             "payment", or "cancelled".
         top_n: Number of top SKUs to return. Defaults to 20.
         rank_by: Sort order — "revenue" (default) or "units".
+        supplier_name: Optional. Filter results to SKUs whose primary supplier
+            name contains this string (case-insensitive). Leave blank for all.
 
     Returns:
         A dict with:
           - from_date, to_date, date_field: the query parameters used
           - total_orders_scanned: total processed orders in the range
           - ranked_by:            the rank_by value used
+          - supplier_filter:      the supplier_name filter applied (or "")
           - skus: list of top_n SKU dicts sorted by rank_by desc, each with
-              rank, sku, title, revenue, units, orders (distinct order count)
+              rank, sku, title, supplier, revenue, units, orders
     """
     from collections import defaultdict
 
@@ -1134,11 +1183,13 @@ def get_top_skus(
         rank_by = "revenue"
 
     PAGE_SIZE = 500
+    supplier_filter = supplier_name.strip().lower()
 
     sku_revenue: dict[str, float] = defaultdict(float)
     sku_units: dict[str, int] = defaultdict(int)
     sku_order_ids: dict[str, set] = defaultdict(set)
     sku_titles: dict[str, str] = {}
+    sku_stock_ids: dict[str, str] = {}  # sku → stock_item_id
 
     total_orders_scanned = 0
     page = 1
@@ -1180,17 +1231,35 @@ def get_top_skus(
                 sku_order_ids[sku].add(guid)
                 if sku not in sku_titles and item.get("title"):
                     sku_titles[sku] = item["title"]
+                if sku not in sku_stock_ids and item.get("stock_item_id"):
+                    sku_stock_ids[sku] = item["stock_item_id"]
 
         page += 1
 
+    # Resolve suppliers for all unique stock item IDs, then filter if requested
+    unique_ids = list({v for v in sku_stock_ids.values() if v})
+    supplier_map: dict[str, dict] = {}
+    if unique_ids:
+        supplier_map = _fetch_supplier_for_items(unique_ids)
+    # Build sku → supplier lookup
+    sku_supplier: dict[str, str] = {}
+    for sku, sid in sku_stock_ids.items():
+        sup = supplier_map.get(sid, {})
+        sku_supplier[sku] = sup.get("supplier_name") or "No Supplier"
+
     sort_key = (lambda s: sku_revenue[s]) if rank_by == "revenue" else (lambda s: sku_units[s])
     all_skus = sorted(sku_revenue.keys(), key=sort_key, reverse=True)
+
+    # Apply supplier filter
+    if supplier_filter:
+        all_skus = [s for s in all_skus if supplier_filter in sku_supplier.get(s, "").lower()]
 
     skus = [
         {
             "rank": idx + 1,
             "sku": sku,
             "title": sku_titles.get(sku, ""),
+            "supplier": sku_supplier.get(sku, ""),
             "revenue": round(sku_revenue[sku], 2),
             "units": sku_units[sku],
             "orders": len(sku_order_ids[sku]),
@@ -1204,7 +1273,155 @@ def get_top_skus(
         "date_field": date_field,
         "total_orders_scanned": total_orders_scanned,
         "ranked_by": rank_by,
+        "supplier_filter": supplier_name.strip(),
         "skus": skus,
+    }
+
+
+@mcp.tool()
+def get_sales_by_supplier(
+    from_date: str,
+    to_date: str,
+    date_field: str = "processed",
+    top_n: int = 20,
+    rank_by: str = "revenue",
+) -> dict:
+    """
+    Aggregate sales by supplier for a date range. Auto-paginates internally
+    and returns ranked supplier totals — revenue, units, order count, and
+    the number of distinct SKUs sold.
+
+    Use this when you need supplier-level sales analysis: "which suppliers
+    drove the most revenue last month?", "how much did we sell from Shiner?",
+    "which supplier's products sell best by volume?".
+
+    Supplier assignment is based on the primary (IsDefault) supplier linked to
+    each SKU in Linnworks inventory. SKUs with no supplier are grouped under
+    "No Supplier".
+
+    Use get_suppliers() to see all configured supplier names.
+    Use get_top_skus(supplier_name=...) to drill into a specific supplier's SKUs.
+
+    Args:
+        from_date: Start of the date range in ISO format, e.g. "2026-05-01".
+        to_date: End of the date range in ISO format, e.g. "2026-05-31".
+        date_field: Which date to filter on — "received", "processed" (default),
+            "payment", or "cancelled".
+        top_n: Number of top suppliers to return. Defaults to 20.
+        rank_by: Sort order — "revenue" (default) or "units".
+
+    Returns:
+        A dict with:
+          - from_date, to_date, date_field: the query parameters used
+          - total_orders_scanned: total processed orders in the range
+          - ranked_by: the rank_by value used
+          - suppliers: list of top_n supplier dicts sorted by rank_by desc, each with
+              rank, supplier_name, supplier_id, revenue, units, orders, sku_count
+    """
+    from collections import defaultdict
+
+    if rank_by not in ("revenue", "units"):
+        rank_by = "revenue"
+
+    PAGE_SIZE = 500
+
+    # Accumulate per-SKU data first; resolve to supplier at the end.
+    sku_revenue: dict[str, float] = defaultdict(float)
+    sku_units: dict[str, int] = defaultdict(int)
+    sku_order_ids: dict[str, set] = defaultdict(set)
+    sku_stock_ids: dict[str, str] = {}  # sku → stock_item_id
+
+    total_orders_scanned = 0
+    page = 1
+    total_pages: int | None = None
+
+    while total_pages is None or page <= total_pages:
+        summary_response = call_linnworks(
+            "ProcessedOrders/SearchProcessedOrders",
+            {
+                "request": {
+                    "DateField": date_field,
+                    "FromDate": f"{from_date}T00:00:00",
+                    "ToDate": f"{to_date}T23:59:59",
+                    "PageNumber": page,
+                    "ResultsPerPage": PAGE_SIZE,
+                }
+            },
+        )
+        wrapper = summary_response.get("ProcessedOrders") or {}
+        raw_orders = wrapper.get("Data") or []
+
+        if total_pages is None:
+            total_pages = wrapper.get("TotalPages", 1)
+            total_orders_scanned = wrapper.get("TotalEntries", 0)
+
+        if not raw_orders:
+            break
+
+        guids = [o["pkOrderID"] for o in raw_orders]
+        items_by_order = _batch_order_items(guids)
+
+        for guid in guids:
+            for item in items_by_order.get(guid, []):
+                sku = item.get("sku") or "UNKNOWN"
+                qty = item.get("quantity") or 0
+                rev = float(item.get("line_total_inc_tax") or 0)
+                sku_revenue[sku] += rev
+                sku_units[sku] += qty
+                sku_order_ids[sku].add(guid)
+                if sku not in sku_stock_ids and item.get("stock_item_id"):
+                    sku_stock_ids[sku] = item["stock_item_id"]
+
+        page += 1
+
+    # Resolve suppliers for all unique stock item IDs
+    unique_ids = list({v for v in sku_stock_ids.values() if v})
+    supplier_map: dict[str, dict] = {}
+    if unique_ids:
+        supplier_map = _fetch_supplier_for_items(unique_ids)
+
+    # Aggregate by supplier
+    sup_revenue: dict[str, float] = defaultdict(float)
+    sup_units: dict[str, int] = defaultdict(int)
+    sup_order_ids: dict[str, set] = defaultdict(set)
+    sup_sku_count: dict[str, set] = defaultdict(set)
+    sup_ids: dict[str, str] = {}  # supplier_name → supplier_id
+
+    for sku in sku_revenue:
+        sid = sku_stock_ids.get(sku, "")
+        sup_info = supplier_map.get(sid, {})
+        sup_name = sup_info.get("supplier_name") or "No Supplier"
+        sup_id = sup_info.get("supplier_id") or ""
+        sup_revenue[sup_name] += sku_revenue[sku]
+        sup_units[sup_name] += sku_units[sku]
+        sup_order_ids[sup_name] |= sku_order_ids[sku]
+        sup_sku_count[sup_name].add(sku)
+        if sup_name not in sup_ids:
+            sup_ids[sup_name] = sup_id
+
+    sort_key = (lambda s: sup_revenue[s]) if rank_by == "revenue" else (lambda s: sup_units[s])
+    all_sups = sorted(sup_revenue.keys(), key=sort_key, reverse=True)
+
+    suppliers = [
+        {
+            "rank": idx + 1,
+            "supplier_name": sup,
+            "supplier_id": sup_ids.get(sup, ""),
+            "revenue": round(sup_revenue[sup], 2),
+            "units": sup_units[sup],
+            "orders": len(sup_order_ids[sup]),
+            "sku_count": len(sup_sku_count[sup]),
+        }
+        for idx, sup in enumerate(all_sups[:top_n])
+    ]
+
+    return {
+        "from_date": from_date,
+        "to_date": to_date,
+        "date_field": date_field,
+        "total_orders_scanned": total_orders_scanned,
+        "ranked_by": rank_by,
+        "suppliers": suppliers,
     }
 
 
