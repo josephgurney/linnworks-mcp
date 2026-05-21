@@ -17,7 +17,8 @@ Once installed, Claude gets access to these tools:
 | `get_open_orders` | List current open (unprocessed) orders — count, SKUs, dispatch deadlines, overdue flag |
 | `get_processed_orders` | Search dispatched orders by date range — volume, sources, tracking |
 | `get_processed_order_items` | Processed orders **with full line items** — top-selling SKUs, sold-together analysis, revenue by product |
-| `get_order` | Full detail on a single order by numeric ID or GUID |
+| `get_order` | Full detail on a single order by numeric ID or GUID — includes customer name and email |
+| `find_open_orders_for_sku` | Find all open orders containing a specific SKU — returns customer name, email, and dispatch deadline for each |
 | `get_stock_level` | Current stock level for a SKU across all locations |
 | `find_inventory_item` | Look up an inventory item by exact SKU |
 | `get_extended_properties` | Fetch custom metadata (extended properties) for a product |
@@ -28,9 +29,10 @@ Once installed, Claude gets access to these tools:
 | Tool | What it does |
 |---|---|
 | `get_revenue_summary` | Total orders, revenue, and AOV for a date range — broken down by channel and country |
-| `get_top_skus` | Top-selling SKUs by revenue or units for a date range |
+| `get_top_skus` | Top-selling SKUs by revenue or units for a date range — optional supplier filter |
 | `get_category_report` | Revenue and units by product category for a date range |
 | `get_period_comparison` | Side-by-side revenue comparison between two date ranges (MoM, YoY, etc.) |
+| `get_sales_by_supplier` | Revenue, units, and order count aggregated by supplier for a date range |
 
 **Purchase orders**
 
@@ -70,6 +72,10 @@ Example questions you can ask:
 > What extended properties does product XYZ have?
 > Which of our locations hold inventory?
 > How does this month's revenue compare to last month?
+> Which suppliers drove the most revenue last month?
+> What are the top selling SKUs from supplier Shiner this quarter?
+> Which customers have open orders waiting on SKU ABC-123?
+> Show me order 596475 — what's the customer's email address?
 > Which imports are currently in error?
 > When did the stock level import last run, and what's its feed URL?
 > Show me all purchase orders from this supplier that are currently open.
