@@ -234,6 +234,8 @@ def _format_order_detail(raw: dict) -> dict:
     """Normalise a single Linnworks order detail record into a consistent shape."""
     general = raw.get("GeneralInfo") or {}
     shipping = raw.get("ShippingInfo") or {}
+    customer = raw.get("CustomerInfo") or {}
+    address = customer.get("Address") or {}
     items = raw.get("Items") or []
     return {
         "order_id": raw.get("OrderId"),
@@ -248,6 +250,8 @@ def _format_order_detail(raw: dict) -> dict:
         "sub_source": general.get("SubSource"),
         "postal_service_name": shipping.get("PostalServiceName"),
         "tracking_number": shipping.get("TrackingNumber"),
+        "customer_name": address.get("FullName") or customer.get("ChannelBuyerName") or "",
+        "customer_email": address.get("EmailAddress") or "",
         "items": [
             {
                 "StockItemId": i.get("StockItemId"),
