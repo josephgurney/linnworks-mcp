@@ -452,6 +452,111 @@ def get_order(order_id: str) -> dict:
 
 
 @mcp.tool()
+def find_open_orders_for_sku(
+    sku: str,
+    location_id: str = DEFAULT_LOCATION_ID,
+) -> dict:
+    """
+    Find all currently open (unprocessed) orders that contain a given SKU.
+
+    Returns each matching order with customer name, email, order reference,
+    dispatch deadline, and the quantity of the requested SKU in that order.
+
+    This is the primary tool for the "PO gap → customer impact" workflow:
+    if a purchase order item is delayed or missing, use this to find which
+    customers are waiting for that SKU so they can be contacted proactively.
+
+    Searches both top-level order items and composite child components, so
+    bundle SKUs are found even when the parent composite is the line item.
+
+    Note: enriching with customer details requires a second API call per
+    batch of 50 matched orders. For SKUs with very high open-order volume
+    this may be slow — but in practice most SKUs will have a handful of
+    open orders at any one time.
+
+    Args:
+        sku: The exact SKU to search for (case-insensitive).
+        location_id: Linnworks location to query. Defaults to "Default".
+
+    Returns:
+        A dict with:
+          - sku:            the SKU searched
+          - total_open_orders_scanned: total open orders checked
+          - match_count:   number of orders containing this SKU
+          - orders: list of matching order dicts, each with:
+              order_id, num_order_id, reference_num, dispatch_by,
+              customer_name, customer_email, quantity (of the matched SKU)
+    """
+    sku_lower = sku.strip().lower()
+
+    # Step 1: fetch all open orders (low-fidelity includes item SKUs)
+    response = call_linnworks(
+        "OpenOrders/GetOrdersLowFidelity",
+        {"request": {"LocationId": location_id}},
+    )
+    all_orders = response.get("Orders") or []
+
+    # Step 2: filter to orders that contain the SKU (top-level or composite child)
+    def _find_qty(items: list) -> int:
+        """Sum quantity of sku across items and their CompositeChild lists."""
+        total = 0
+        for item in items:
+            if (item.get("SKU") or "").lower() == sku_lower:
+                total += item.get("Quantity") or 0
+            children = item.get("CompositeChild") or []
+            if children:
+                total += _find_qty(children)
+        return total
+
+    matched: list[dict] = []
+    for order in all_orders:
+        qty = _find_qty(order.get("Items") or [])
+        if qty > 0:
+            matched.append({
+                "_guid": order.get("pkOrderID"),
+                "order_id": order.get("pkOrderID"),
+                "num_order_id": order.get("OrderId"),
+                "reference_num": order.get("ReferenceNum"),
+                "dispatch_by": order.get("DispatchBy"),
+                "quantity": qty,
+                "customer_name": "",
+                "customer_email": "",
+            })
+
+    # Step 3: enrich matched orders with customer details via GetOrdersById
+    batch_size = 50
+    guids = [o["_guid"] for o in matched if o["_guid"]]
+    customer_info: dict[str, dict] = {}
+
+    for i in range(0, len(guids), batch_size):
+        batch = guids[i : i + batch_size]
+        detail_orders = call_linnworks("Orders/GetOrdersById", {"pkOrderIds": batch})
+        if not isinstance(detail_orders, list):
+            detail_orders = detail_orders.get("Orders") or []
+        for detail in detail_orders:
+            oid = detail.get("OrderId")
+            fmt = _format_order_detail(detail)
+            customer_info[oid] = {
+                "customer_name": fmt.get("customer_name", ""),
+                "customer_email": fmt.get("customer_email", ""),
+            }
+
+    # Step 4: merge customer info back and clean up internal key
+    for order in matched:
+        info = customer_info.get(order["_guid"], {})
+        order["customer_name"] = info.get("customer_name", "")
+        order["customer_email"] = info.get("customer_email", "")
+        del order["_guid"]
+
+    return {
+        "sku": sku.strip(),
+        "total_open_orders_scanned": len(all_orders),
+        "match_count": len(matched),
+        "orders": matched,
+    }
+
+
+@mcp.tool()
 def get_stock_level(
     sku: str,
     location_id: str = DEFAULT_LOCATION_ID,
