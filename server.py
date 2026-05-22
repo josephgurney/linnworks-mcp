@@ -2210,6 +2210,449 @@ def add_purchase_order_note(
     }
 
 
+@mcp.tool()
+def add_purchase_order_item(
+    purchase_id: str,
+    sku: str,
+    quantity: int,
+    cost: float,
+    tax_rate: float = 20.0,
+    pack_quantity: int = 1,
+    pack_size: int = 1,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Add a new line item to an existing purchase order.
+
+    Resolves the SKU to a Linnworks stock item GUID, then adds it as a new
+    line on the PO. Works on PENDING, OPEN, or PARTIAL orders — DELIVERED
+    orders are blocked.
+
+    Use this when you need to add an item that was missed when the PO was
+    originally created, or when a supplier suggests adding extra SKUs to an
+    existing order.
+
+    IMPORTANT: dry_run defaults to True. It resolves the SKU and shows
+    exactly what would be added without writing anything. Set dry_run=False
+    only after confirming the resolved item looks correct.
+
+    Args:
+        purchase_id: The UUID of the purchase order (pkPurchaseID), as
+            returned by search_purchase_orders() or get_purchase_order().
+        sku: The exact SKU of the item to add. Must match a Linnworks stock
+            item exactly — use find_inventory_item() to verify the SKU first.
+        quantity: Number of units to order.
+        cost: Unit cost excluding tax (e.g. 10.50).
+        tax_rate: Tax percentage (e.g. 20.0 for 20%). Defaults to 20.0.
+        pack_quantity: Number of packs. Defaults to 1.
+        pack_size: Units per pack. Defaults to 1.
+        dry_run: If True (default), resolves the SKU and shows what would be
+            added without writing anything. Set to False to add the item.
+
+    Returns:
+        A dict with:
+          - purchase_id:          the PO being modified
+          - dry_run:              whether this was a dry run
+          - status:               "dry_run", "added", or "error"
+          - item:                 resolved item details (sku, title, stock_item_id,
+                                  quantity, cost, tax_rate, line_total_ex_tax, tax)
+          - updated_line_count:   number of lines after the change (live only)
+          - updated_total_cost:   PO grand total after the change (live only)
+    """
+    purchase_id = purchase_id.strip()
+    sku = sku.strip()
+
+    # Step 1 — read current PO to validate status
+    current = call_linnworks("PurchaseOrder/Get_PurchaseOrder", {"pkPurchaseId": purchase_id})
+    header = current.get("PurchaseOrderHeader") or {}
+    current_status = header.get("Status", "")
+
+    if current_status == "DELIVERED":
+        return {
+            "purchase_id": purchase_id,
+            "status": "error",
+            "error": "Cannot modify a DELIVERED purchase order.",
+        }
+
+    # Step 2 — resolve SKU to stock item GUID
+    try:
+        inv = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+        stock_item_id = (inv or {}).get("StockItemId")
+        item_title = (inv or {}).get("ItemTitle", "")
+        if not stock_item_id:
+            return {
+                "purchase_id": purchase_id,
+                "status": "error",
+                "error": f"SKU {sku!r} not found in Linnworks.",
+            }
+    except Exception as exc:
+        return {
+            "purchase_id": purchase_id,
+            "status": "error",
+            "error": f"Could not resolve SKU {sku!r}: {exc}",
+        }
+
+    line_total = round(cost * quantity, 4)
+    tax = round(line_total * (tax_rate / 100), 4)
+
+    item_detail = {
+        "sku": sku,
+        "title": item_title,
+        "stock_item_id": stock_item_id,
+        "quantity": quantity,
+        "cost": cost,
+        "tax_rate": tax_rate,
+        "line_total_ex_tax": line_total,
+        "tax": tax,
+        "pack_quantity": pack_quantity,
+        "pack_size": pack_size,
+    }
+
+    if dry_run:
+        return {
+            "purchase_id": purchase_id,
+            "dry_run": True,
+            "status": "dry_run",
+            "message": "No changes written. Set dry_run=False to add this item.",
+            "current_po_status": current_status,
+            "item": item_detail,
+        }
+
+    # Step 3 — add the item
+    call_linnworks(
+        "PurchaseOrder/Add_PurchaseOrderItem",
+        {
+            "addItemParameter": {
+                "pkPurchaseId": purchase_id,
+                "fkStockItemId": stock_item_id,
+                "Qty": quantity,
+                "Cost": cost,
+                "TaxRate": tax_rate,
+                "PackQuantity": pack_quantity,
+                "PackSize": pack_size,
+            }
+        },
+    )
+
+    # Step 4 — read back to confirm
+    confirmed = call_linnworks("PurchaseOrder/Get_PurchaseOrder", {"pkPurchaseId": purchase_id})
+    confirmed_header = confirmed.get("PurchaseOrderHeader") or {}
+
+    return {
+        "purchase_id": purchase_id,
+        "dry_run": False,
+        "status": "added",
+        "item": item_detail,
+        "updated_line_count": confirmed_header.get("LineCount"),
+        "updated_total_cost": confirmed_header.get("GrandTotal") or confirmed_header.get("TotalCost"),
+    }
+
+
+@mcp.tool()
+def update_purchase_order_item(
+    purchase_id: str,
+    purchase_item_id: str,
+    quantity: Optional[int] = None,
+    cost: Optional[float] = None,
+    tax_rate: Optional[float] = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Edit the quantity, cost, or tax rate of a line item on an existing purchase order.
+
+    Reads the current line item from the PO, applies only the fields you
+    provide (leaving others unchanged), and (unless dry_run=True) writes the
+    change back. Always returns a before/after diff so you can see exactly
+    what would change.
+
+    Works on PENDING, OPEN, or PARTIAL orders — DELIVERED orders are blocked.
+
+    To find purchase_item_id: call get_purchase_order() and look in the
+    "items" list — each entry has a "purchase_item_id" field.
+
+    IMPORTANT: dry_run defaults to True. Set dry_run=False only when you are
+    sure the change is correct — confirm with the user before doing so.
+
+    Args:
+        purchase_id: The UUID of the purchase order (pkPurchaseID).
+        purchase_item_id: The UUID of the specific line item to update
+            (pkPurchaseItemId). Use get_purchase_order() to find this — it
+            appears as "purchase_item_id" in each item in the "items" list.
+        quantity: New quantity to order. Omit (or pass None) to keep current.
+        cost: New unit cost excluding tax (e.g. 12.00). Omit to keep current.
+        tax_rate: New tax percentage (e.g. 20.0). Omit to keep current.
+        dry_run: If True (default), shows the proposed changes without writing
+            anything. Set to False to apply the update.
+
+    Returns:
+        A dict with:
+          - purchase_id:        the PO being modified
+          - purchase_item_id:   the line item updated
+          - dry_run:            whether this was a dry run
+          - status:             "dry_run", "updated", "no_changes", or "error"
+          - sku:                the SKU of the item updated, for confirmation
+          - before:             current values of the fields that would change
+          - after:              proposed/applied new values for those fields
+    """
+    purchase_id = purchase_id.strip()
+    purchase_item_id = purchase_item_id.strip()
+
+    # Step 1 — read current PO to find the item and validate status
+    current = call_linnworks("PurchaseOrder/Get_PurchaseOrder", {"pkPurchaseId": purchase_id})
+    header = current.get("PurchaseOrderHeader") or {}
+    current_status = header.get("Status", "")
+
+    if current_status == "DELIVERED":
+        return {
+            "purchase_id": purchase_id,
+            "status": "error",
+            "error": "Cannot modify a DELIVERED purchase order.",
+        }
+
+    items_raw = [
+        i for i in (current.get("PurchaseOrderItem") or [])
+        if not i.get("IsDeleted")
+    ]
+    current_item = next(
+        (i for i in items_raw if i.get("pkPurchaseItemId") == purchase_item_id),
+        None,
+    )
+    if current_item is None:
+        return {
+            "purchase_id": purchase_id,
+            "purchase_item_id": purchase_item_id,
+            "status": "error",
+            "error": (
+                f"Line item {purchase_item_id!r} not found on PO {purchase_id!r}. "
+                "Use get_purchase_order() to list current items and their IDs."
+            ),
+        }
+
+    sku = current_item.get("SKU", "")
+
+    # Step 2 — build diff: only record fields the caller explicitly provided
+    before: dict = {}
+    after: dict = {}
+
+    new_quantity = current_item.get("Quantity")
+    new_cost = current_item.get("Cost")
+    new_tax_rate = current_item.get("TaxRate")
+
+    if quantity is not None and quantity != current_item.get("Quantity"):
+        before["quantity"] = current_item.get("Quantity")
+        after["quantity"] = quantity
+        new_quantity = quantity
+
+    if cost is not None and cost != current_item.get("Cost"):
+        before["cost"] = current_item.get("Cost")
+        after["cost"] = cost
+        new_cost = cost
+
+    if tax_rate is not None and tax_rate != current_item.get("TaxRate"):
+        before["tax_rate"] = current_item.get("TaxRate")
+        after["tax_rate"] = tax_rate
+        new_tax_rate = tax_rate
+
+    if not before:
+        return {
+            "purchase_id": purchase_id,
+            "purchase_item_id": purchase_item_id,
+            "dry_run": dry_run,
+            "status": "no_changes",
+            "message": "The values you provided match the current item — no update needed.",
+            "sku": sku,
+        }
+
+    if dry_run:
+        return {
+            "purchase_id": purchase_id,
+            "purchase_item_id": purchase_item_id,
+            "dry_run": True,
+            "status": "dry_run",
+            "message": "No changes written. Set dry_run=False to apply this update.",
+            "sku": sku,
+            "before": before,
+            "after": after,
+        }
+
+    # Step 3 — submit update (all fields required; carry unchanged values through)
+    call_linnworks(
+        "PurchaseOrder/Update_PurchaseOrderItem",
+        {
+            "updateItemParameter": {
+                "pkPurchaseItemId": purchase_item_id,
+                "pkPurchaseId": purchase_id,
+                "Quantity": new_quantity,
+                "PackQuantity": current_item.get("PackQuantity", 1),
+                "PackSize": current_item.get("PackSize", 1),
+                "Cost": new_cost,
+                "TaxRate": new_tax_rate,
+            }
+        },
+    )
+
+    # Step 4 — read back to confirm the change landed
+    confirmed = call_linnworks("PurchaseOrder/Get_PurchaseOrder", {"pkPurchaseId": purchase_id})
+    confirmed_items = [
+        i for i in (confirmed.get("PurchaseOrderItem") or [])
+        if not i.get("IsDeleted")
+    ]
+    confirmed_item = next(
+        (i for i in confirmed_items if i.get("pkPurchaseItemId") == purchase_item_id),
+        None,
+    )
+
+    confirmed_after: dict = {}
+    if confirmed_item:
+        if "quantity" in after:
+            confirmed_after["quantity"] = confirmed_item.get("Quantity")
+        if "cost" in after:
+            confirmed_after["cost"] = confirmed_item.get("Cost")
+        if "tax_rate" in after:
+            confirmed_after["tax_rate"] = confirmed_item.get("TaxRate")
+
+    return {
+        "purchase_id": purchase_id,
+        "purchase_item_id": purchase_item_id,
+        "dry_run": False,
+        "status": "updated",
+        "sku": sku,
+        "before": before,
+        "after": confirmed_after or after,
+    }
+
+
+@mcp.tool()
+def remove_purchase_order_item(
+    purchase_id: str,
+    purchase_item_id: str,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Remove a line item from an existing purchase order.
+
+    Reads the current item from the PO so you can confirm what will be
+    removed, then (unless dry_run=True) deletes the line. Works on PENDING,
+    OPEN, or PARTIAL orders — DELIVERED orders are blocked.
+
+    To find purchase_item_id: call get_purchase_order() and look in the
+    "items" list — each entry has a "purchase_item_id" field.
+
+    WARNING: Removal cannot be undone via the API. dry_run=True (default)
+    shows you exactly what would be removed without writing anything.
+    Always confirm with the user before setting dry_run=False.
+
+    Args:
+        purchase_id: The UUID of the purchase order (pkPurchaseID).
+        purchase_item_id: The UUID of the specific line item to remove
+            (pkPurchaseItemId). Use get_purchase_order() to find this — it
+            appears as "purchase_item_id" in each item in the "items" list.
+        dry_run: If True (default), shows what would be removed without
+            writing anything. Set to False to delete the line item.
+
+    Returns:
+        A dict with:
+          - purchase_id:          the PO being modified
+          - purchase_item_id:     the line item removed
+          - dry_run:              whether this was a dry run
+          - status:               "dry_run", "removed", or "error"
+          - removed_item:         the item that was/would be removed
+                                  (sku, title, quantity, delivered, cost, tax_rate)
+          - remaining_line_count: number of lines remaining after removal (live only)
+          - warning:              present if read-back suggests removal may have failed
+    """
+    purchase_id = purchase_id.strip()
+    purchase_item_id = purchase_item_id.strip()
+
+    # Step 1 — read current PO to find the item and validate status
+    current = call_linnworks("PurchaseOrder/Get_PurchaseOrder", {"pkPurchaseId": purchase_id})
+    header = current.get("PurchaseOrderHeader") or {}
+    current_status = header.get("Status", "")
+
+    if current_status == "DELIVERED":
+        return {
+            "purchase_id": purchase_id,
+            "status": "error",
+            "error": "Cannot modify a DELIVERED purchase order.",
+        }
+
+    items_raw = [
+        i for i in (current.get("PurchaseOrderItem") or [])
+        if not i.get("IsDeleted")
+    ]
+    target_item = next(
+        (i for i in items_raw if i.get("pkPurchaseItemId") == purchase_item_id),
+        None,
+    )
+    if target_item is None:
+        return {
+            "purchase_id": purchase_id,
+            "purchase_item_id": purchase_item_id,
+            "status": "error",
+            "error": (
+                f"Line item {purchase_item_id!r} not found on PO {purchase_id!r}. "
+                "Use get_purchase_order() to list current items and their IDs."
+            ),
+        }
+
+    removed_item = {
+        "sku": target_item.get("SKU"),
+        "title": target_item.get("ItemTitle"),
+        "quantity": target_item.get("Quantity"),
+        "delivered": target_item.get("Delivered"),
+        "cost": target_item.get("Cost"),
+        "tax_rate": target_item.get("TaxRate"),
+    }
+
+    if dry_run:
+        return {
+            "purchase_id": purchase_id,
+            "purchase_item_id": purchase_item_id,
+            "dry_run": True,
+            "status": "dry_run",
+            "message": "No changes written. Set dry_run=False to remove this item.",
+            "current_po_status": current_status,
+            "removed_item": removed_item,
+        }
+
+    # Step 2 — delete the item
+    call_linnworks(
+        "PurchaseOrder/Delete_PurchaseOrderItem",
+        {
+            "deleteItemParameter": {
+                "pkPurchaseItemId": purchase_item_id,
+                "pkPurchaseId": purchase_id,
+            }
+        },
+    )
+
+    # Step 3 — read back to confirm the item is gone
+    confirmed = call_linnworks("PurchaseOrder/Get_PurchaseOrder", {"pkPurchaseId": purchase_id})
+    confirmed_header = confirmed.get("PurchaseOrderHeader") or {}
+    confirmed_items = [
+        i for i in (confirmed.get("PurchaseOrderItem") or [])
+        if not i.get("IsDeleted")
+    ]
+    still_present = any(
+        i.get("pkPurchaseItemId") == purchase_item_id for i in confirmed_items
+    )
+
+    result = {
+        "purchase_id": purchase_id,
+        "purchase_item_id": purchase_item_id,
+        "dry_run": False,
+        "status": "removed",
+        "removed_item": removed_item,
+        "remaining_line_count": confirmed_header.get("LineCount"),
+    }
+    if still_present:
+        result["warning"] = (
+            "Item still appears in read-back — removal may have failed. "
+            "Check the PO in the Linnworks UI."
+        )
+    return result
+
+
 # ---------- Purchase orders ----------
 
 _PO_STATUS_LABELS: dict[str, str] = {
