@@ -21,7 +21,7 @@ A local stdio MCP server that exposes Linnworks data to Claude Desktop. This is 
 
 ## Tools
 
-27 tools, all live-tested. See `server.py` for full docstrings and parameter details.
+30 tools (27 original + 3 added in v1.4.0), all live-tested. See `server.py` for full docstrings and parameter details.
 
 ### Orders & stock (read)
 
@@ -56,6 +56,9 @@ A local stdio MCP server that exposes Linnworks data to Claude Desktop. This is 
 | `get_suppliers()` | `Inventory/GetSuppliers` GET — not in public OpenAPI specs but confirmed working |
 | `create_purchase_order(..., dry_run=True)` | `DateOfPurchase` always required (SQL rejects null); `SupplierReferenceNumber` always required (send `""` if none) |
 | `update_purchase_order_header(..., dry_run=True)` | Carry all existing header fields — missing fields are cleared; blocks on DELIVERED status |
+| `add_purchase_order_item(purchase_id, sku, quantity, cost, tax_rate, dry_run=True)` | Add a new line to a PENDING/OPEN/PARTIAL PO; resolves SKU → GUID automatically |
+| `update_purchase_order_item(purchase_id, purchase_item_id, quantity, cost, tax_rate, dry_run=True)` | Edit a line item; only fields you provide change; shows before/after diff; use `get_purchase_order` to find `purchase_item_id` |
+| `remove_purchase_order_item(purchase_id, purchase_item_id, dry_run=True)` | Delete a line item; confirms what will be removed; read-back after write |
 | `open_purchase_order(purchase_id, dry_run=True)` | PENDING → OPEN only |
 | `deliver_purchase_order(...)` | Marks items as delivered |
 | `add_purchase_order_note(...)` | Use for carrier tracking numbers — the "Add delivery" dialog in the UI has no public API equivalent |
@@ -102,6 +105,9 @@ Rule types seen in practice: `Orders` (fires on incoming orders), `Test` (sandbo
 | `PurchaseOrder/Search_PurchaseOrders2` | POST | `{"Status":"PENDING","EntriesPerPage":50,"PageNumber":1,...}` **unwrapped** | Wrapping in `{"request":{...}}` silently ignores all filters |
 | `PurchaseOrder/Get_PurchaseOrder` | POST | `{"pkPurchaseId":"guid"}` **unwrapped** | Returns header + items + delivery records |
 | `PurchaseOrder/Update_PurchaseOrderHeader` | POST | `{"updateParameter":{...all fields...}}` | Must carry all existing fields — nulls clear values; blocks on DELIVERED |
+| `PurchaseOrder/Add_PurchaseOrderItem` | POST | `{"addItemParameter":{"pkPurchaseId","fkStockItemId","Qty","Cost","TaxRate","PackQuantity","PackSize"}}` | Adds a new line; same endpoint used by `create_purchase_order` |
+| `PurchaseOrder/Update_PurchaseOrderItem` | POST | `{"updateItemParameter":{"pkPurchaseItemId","pkPurchaseId","Quantity","PackQuantity","PackSize","Cost","TaxRate"}}` | Note: uses `Quantity` (not `Qty` like Add); all fields required — carry unchanged values through |
+| `PurchaseOrder/Delete_PurchaseOrderItem` | POST | `{"deleteItemParameter":{"pkPurchaseItemId","pkPurchaseId"}}` | Removes a line item; `pkPurchaseItemId` from `Get_PurchaseOrder` response |
 | `RulesEngine/GetRules` | GET | — | Flat list of rule headers |
 | `RulesEngine/GetRuleConditionNodes` | GET | `?pkRuleId=<int>` | Full IF/THEN tree for one rule |
 | `ImportExport/GetImportList` | GET | — | List endpoint — reliable status |
