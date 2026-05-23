@@ -21,7 +21,9 @@ A local stdio MCP server that exposes Linnworks data to Claude Desktop. This is 
 
 ## Tools
 
-30 tools (27 original + 3 added in v1.4.0), all live-tested. See `server.py` for full docstrings and parameter details.
+32 tools (27 original + 3 in v1.4.0 + 1 in v1.5.0), all live-tested. See `server.py` for full docstrings and parameter details.
+
+> **v1.5.0:** `get_order` now returns `delivery_address` and `billing_address` dicts with all address fields. New `set_order_address` write tool.
 
 ### Orders & stock (read)
 
@@ -29,7 +31,8 @@ A local stdio MCP server that exposes Linnworks data to Claude Desktop. This is 
 |---|---|---|
 | `get_open_orders(location_id, limit, overdue_only)` | `OpenOrders/GetOrdersLowFidelity` | Always returns `overdue_count`; `overdue_only=True` filters past-deadline; `StatusLabel` decoded |
 | `find_inventory_item(sku_or_title)` | `Inventory/GetInventoryItem` | **Exact SKU only** — no fuzzy/title search |
-| `get_order(order_id)` | `Orders/GetOrdersById` or `GetOrderDetailsByNumOrderId` | GUID → POST; numeric ID → GET; returns `customer_name` and `customer_email` from `CustomerInfo.Address` |
+| `get_order(order_id)` | `Orders/GetOrdersById` or `GetOrderDetailsByNumOrderId` | GUID → POST; numeric ID → GET; returns `customer_name`, `customer_email`, `delivery_address` (all address fields), and `billing_address` |
+| `set_order_address(order_id, ..., dry_run=True)` | `Orders/SetOrderCustomerInfo` | Update delivery address on open orders only; GUID or numeric order_id; pass only the fields to change (None = keep current); read-before-write diff; blocks on processed orders |
 | `find_open_orders_for_sku(sku, location_id)` | `GetOrdersLowFidelity` + `GetOrdersById` | Finds all open orders containing a SKU; searches composite children too; enriches with customer name + email; use for "who's waiting on this item?" |
 | `get_stock_level(sku, location_id, include_empty_locations)` | `GetInventoryItem` → `Stock/GetStockLevel_Batch` | Zeros filtered by default; warns on virtual dropship duplicate rows |
 | `get_processed_orders(from_date, to_date, date_field, page, page_size)` | `ProcessedOrders/SearchProcessedOrders` | Flat response; min page_size 20; overflows context at 500 — use aggregation tools for wide ranges |
@@ -104,6 +107,7 @@ Rule types seen in practice: `Orders` (fires on incoming orders), `Test` (sandbo
 | `Inventory/GetSuppliers` | GET | — | Not in public OpenAPI specs but confirmed working; returns flat supplier list |
 | `PurchaseOrder/Search_PurchaseOrders2` | POST | `{"Status":"PENDING","EntriesPerPage":50,"PageNumber":1,...}` **unwrapped** | Wrapping in `{"request":{...}}` silently ignores all filters |
 | `PurchaseOrder/Get_PurchaseOrder` | POST | `{"pkPurchaseId":"guid"}` **unwrapped** | Returns header + items + delivery records |
+| `Orders/SetOrderCustomerInfo` | POST | `{"orderId":"guid","info":{"ChannelBuyerName":"...","Address":{...},"BillingAddress":{...}},"saveToCrm":false}` **unwrapped** | Address fields: FullName, Company, Address1/2/3, Town, Region, PostCode, Country, PhoneNumber, EmailAddress, CountryId, Continent; **not in public GitHub OpenAPI spec** but confirmed in apidocs.linnworks.net; returns OrderTotalsInfo |
 | `PurchaseOrder/Update_PurchaseOrderHeader` | POST | `{"updateParameter":{...all fields...}}` | Must carry all existing fields — nulls clear values; blocks on DELIVERED |
 | `PurchaseOrder/Add_PurchaseOrderItem` | POST | `{"addItemParameter":{"pkPurchaseId","fkStockItemId","Qty","Cost","TaxRate","PackQuantity","PackSize"}}` | Adds a new line; same endpoint used by `create_purchase_order` |
 | `PurchaseOrder/Update_PurchaseOrderItem` | POST | `{"updateItemParameter":{"pkPurchaseItemId","pkPurchaseId","Quantity","PackQuantity","PackSize","Cost","TaxRate"}}` | Note: uses `Quantity` (not `Qty` like Add); all fields required — carry unchanged values through |
