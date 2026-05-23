@@ -169,6 +169,78 @@ Credentials go in `.env` (local dev) or the Claude Desktop config `env` block (p
 
 ---
 
+## Build workflow (Claude Code CLI)
+
+When asked to "build the latest approved issue" or "build issue #N", follow these steps exactly — do not ask clarifying questions, just execute:
+
+### Step 1 — Find the issue
+```bash
+gh issue list --repo josephgurney/linnworks-mcp --label approved --state open --json number,title,body,labels
+```
+Take the lowest-numbered result. Read the full issue body carefully.
+
+### Step 2 — Understand what to build
+Read this CLAUDE.md (you're reading it now). Cross-check the request against:
+- The existing tools table — does it already exist?
+- The confirmed working endpoints — which endpoint does this need?
+- The broken endpoints — is it blocked?
+
+### Step 3 — Write the tool
+Add the new tool function to `server.py` following these rules:
+- Place it in the correct section (Orders, Purchase Orders, Reporting, etc.)
+- Add `@mcp.tool()` decorator
+- Follow the read-before-write pattern for any write tool
+- Default `dry_run=True` for all write tools
+- Write the docstring carefully — it's the UX description Claude sees
+- Match the payload wrapper pattern of nearby tools (some endpoints need `{"request":{}}`, some don't — check the confirmed endpoints table)
+
+### Step 4 — Verify syntax
+```bash
+.venv/bin/python3 -m py_compile server.py && echo "Syntax OK"
+```
+Fix any errors before proceeding.
+
+### Step 5 — Verify auth
+```bash
+.venv/bin/python3 server.py --check-auth
+```
+Confirms the server loads and credentials are valid.
+
+### Step 6 — Update CLAUDE.md
+- Add the new tool to the Tools table
+- Add any newly confirmed endpoints to the confirmed endpoints table
+- Add any newly discovered broken endpoints to the broken endpoints table
+
+### Step 7 — Commit and push
+```bash
+git add server.py CLAUDE.md
+git commit -m "Add <tool_name> tool (closes #N)"
+git push origin main
+```
+
+### Step 8 — Comment on the issue
+```bash
+gh issue comment N --repo josephgurney/linnworks-mcp --body "## Built
+
+Added \`tool_name\` in this commit. To use it, pull the latest \`server.py\` and restart Claude Desktop.
+
+**What was built:** [one sentence]
+**Endpoint used:** \`Endpoint/Name\`
+**Dry run default:** yes/no"
+```
+
+### Step 9 — Label the issue
+```bash
+gh issue edit N --repo josephgurney/linnworks-mcp --add-label "built" --remove-label "approved"
+```
+
+### Important notes for CLI builds
+- The Linnworks MCP is **not connected** in the CLI session — you cannot call Linnworks tools directly to test. Use `--check-auth` to verify the server loads, and note in your commit that live testing should be done via Claude Desktop.
+- Do not ask the user for confirmation between steps — execute the full workflow and report back at the end.
+- If an endpoint is unknown, check `https://apidocs.linnworks.net` or `https://raw.githubusercontent.com/LinnSystems/PublicApiSpecs/master/1.0/` before guessing.
+
+---
+
 ## Out of scope for Phase 1
 
 - OAuth, Dynamic Client Registration — Phase 2

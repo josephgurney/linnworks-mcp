@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python -m py_compile server.py *)",
+      "Bash(.venv/bin/python3 -m py_compile server.py *)",
+      "Bash(.venv/bin/python3 server.py --check-auth *)",
+      "Bash(.venv/bin/python server.py --check-auth *)",
+      "Bash(python3 server.py --check-auth *)",
+      "Bash(git add server.py *)",
+      "Bash(git add CLAUDE.md *)",
+      "Bash(git add README.md *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(gh issue list *)",
+      "Bash(gh issue view *)",
+      "Bash(gh issue comment *)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:apidocs.linnworks.net)"
+    ]
+  }
+}
