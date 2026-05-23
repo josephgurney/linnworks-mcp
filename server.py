@@ -236,6 +236,7 @@ def _format_order_detail(raw: dict) -> dict:
     shipping = raw.get("ShippingInfo") or {}
     customer = raw.get("CustomerInfo") or {}
     address = customer.get("Address") or {}
+    billing = customer.get("BillingAddress") or {}
     items = raw.get("Items") or []
     return {
         "order_id": raw.get("OrderId"),
@@ -250,8 +251,37 @@ def _format_order_detail(raw: dict) -> dict:
         "sub_source": general.get("SubSource"),
         "postal_service_name": shipping.get("PostalServiceName"),
         "tracking_number": shipping.get("TrackingNumber"),
+        # Top-level shortcuts kept for backward compatibility
         "customer_name": address.get("FullName") or customer.get("ChannelBuyerName") or "",
         "customer_email": address.get("EmailAddress") or "",
+        # Full delivery address — use set_order_address() to update any of these fields
+        "delivery_address": {
+            "full_name": address.get("FullName"),
+            "company": address.get("Company"),
+            "address1": address.get("Address1"),
+            "address2": address.get("Address2"),
+            "address3": address.get("Address3"),
+            "town": address.get("Town"),
+            "region": address.get("Region"),
+            "postcode": address.get("PostCode"),
+            "country": address.get("Country"),
+            "phone": address.get("PhoneNumber"),
+            "email": address.get("EmailAddress"),
+        },
+        # Billing address (read-only for now)
+        "billing_address": {
+            "full_name": billing.get("FullName"),
+            "company": billing.get("Company"),
+            "address1": billing.get("Address1"),
+            "address2": billing.get("Address2"),
+            "address3": billing.get("Address3"),
+            "town": billing.get("Town"),
+            "region": billing.get("Region"),
+            "postcode": billing.get("PostCode"),
+            "country": billing.get("Country"),
+            "phone": billing.get("PhoneNumber"),
+            "email": billing.get("EmailAddress"),
+        },
         "items": [
             {
                 "StockItemId": i.get("StockItemId"),
@@ -449,6 +479,207 @@ def get_order(order_id: str) -> dict:
             if orders:
                 return _format_order_detail(orders[0])
         return {"error": f"No order found for numeric ID '{order_id}'", "raw": response}
+
+
+@mcp.tool()
+def set_order_address(
+    order_id: str,
+    full_name: Optional[str] = None,
+    company: Optional[str] = None,
+    address1: Optional[str] = None,
+    address2: Optional[str] = None,
+    address3: Optional[str] = None,
+    town: Optional[str] = None,
+    region: Optional[str] = None,
+    postcode: Optional[str] = None,
+    country: Optional[str] = None,
+    phone: Optional[str] = None,
+    email: Optional[str] = None,
+    save_to_crm: bool = False,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Update the delivery address on an open (unprocessed) Linnworks order.
+
+    Reads the current address first, applies only the fields you provide
+    (all others remain unchanged), then writes the change back. Always
+    returns a before/after diff so you can confirm exactly what would change.
+    Already-processed orders are rejected.
+
+    Use get_order() first to see the current delivery_address before calling
+    this tool, so you can confirm what needs changing.
+
+    IMPORTANT: dry_run defaults to True. Set dry_run=False only when you are
+    sure the change is correct — confirm with the user before doing so.
+
+    Args:
+        order_id: The order to update. Accepts either a GUID pkOrderID
+            (e.g. "a1b2c3d4-...") or a numeric order number (e.g. "596475").
+        full_name: Recipient full name. Pass None (default) to keep current.
+        company: Company name. Pass None to keep current.
+        address1: First line of the street address. Pass None to keep current.
+        address2: Second address line. Pass None to keep current.
+        address3: Third address line. Pass None to keep current.
+        town: Town or city. Pass None to keep current.
+        region: County, state, or region. Pass None to keep current.
+        postcode: Postcode or ZIP code. Pass None to keep current.
+        country: Country name (e.g. "United Kingdom"). Pass None to keep current.
+        phone: Phone number. Pass None to keep current.
+        email: Email address. Pass None to keep current.
+        save_to_crm: If True, saves the updated address into the Linnworks CRM
+            record for this customer. Defaults to False.
+        dry_run: If True (default), shows the proposed changes without writing
+            anything. Set to False to apply the address update.
+
+    Returns:
+        A dict with:
+          - order_id:    the ID passed in
+          - order_guid:  the resolved GUID (useful when you passed a numeric ID)
+          - dry_run:     whether this was a dry run
+          - status:      "dry_run", "updated", "no_changes", or "error"
+          - before:      current values of the fields that would change
+          - after:       proposed/applied new values for those fields
+          - error:       present only if the update was rejected
+    """
+    order_id = order_id.strip()
+
+    # ---------- Field mapping: tool param name → Linnworks Address field name ----------
+    _FIELD_MAP = {
+        "full_name": "FullName",
+        "company":   "Company",
+        "address1":  "Address1",
+        "address2":  "Address2",
+        "address3":  "Address3",
+        "town":      "Town",
+        "region":    "Region",
+        "postcode":  "PostCode",
+        "country":   "Country",
+        "phone":     "PhoneNumber",
+        "email":     "EmailAddress",
+    }
+    user_provided = {
+        "full_name": full_name,
+        "company":   company,
+        "address1":  address1,
+        "address2":  address2,
+        "address3":  address3,
+        "town":      town,
+        "region":    region,
+        "postcode":  postcode,
+        "country":   country,
+        "phone":     phone,
+        "email":     email,
+    }
+
+    # ---------- Step 1: fetch current order (read-before-write) ----------
+    raw: dict = {}
+    order_guid: str = ""
+
+    if _UUID_RE.match(order_id):
+        resp = call_linnworks("Orders/GetOrdersById", {"pkOrderIds": [order_id]})
+        orders = resp if isinstance(resp, list) else (resp.get("Orders") or resp.get("Data") or [])
+        if not orders:
+            return {"order_id": order_id, "status": "error", "error": f"No order found for GUID '{order_id}'."}
+        raw = orders[0]
+        order_guid = raw.get("OrderId") or order_id
+    else:
+        raw = call_linnworks_get("Orders/GetOrderDetailsByNumOrderId", params={"orderId": order_id})
+        if not isinstance(raw, dict) or ("GeneralInfo" not in raw and "NumOrderId" not in raw):
+            return {"order_id": order_id, "status": "error", "error": f"No order found for numeric ID '{order_id}'."}
+        order_guid = raw.get("OrderId", "")
+
+    # ---------- Step 2: refuse if already processed ----------
+    if raw.get("Processed"):
+        return {
+            "order_id": order_id,
+            "order_guid": order_guid,
+            "status": "error",
+            "error": (
+                "Cannot edit an already-processed order. "
+                "Address changes can only be made to open (unprocessed) orders."
+            ),
+        }
+
+    # ---------- Step 3: extract current customer info ----------
+    customer = raw.get("CustomerInfo") or {}
+    current_address = customer.get("Address") or {}
+    current_billing = customer.get("BillingAddress") or {}
+    channel_buyer_name = customer.get("ChannelBuyerName") or ""
+
+    # ---------- Step 4: build diff (only fields the caller explicitly provided) ----------
+    before: dict = {}
+    after: dict = {}
+
+    for param, lw_field in _FIELD_MAP.items():
+        new_val = user_provided[param]
+        if new_val is not None and new_val != current_address.get(lw_field):
+            before[param] = current_address.get(lw_field)
+            after[param] = new_val
+
+    if not before:
+        return {
+            "order_id": order_id,
+            "order_guid": order_guid,
+            "dry_run": dry_run,
+            "status": "no_changes",
+            "message": "The values you provided already match the current address — no update needed.",
+        }
+
+    if dry_run:
+        return {
+            "order_id": order_id,
+            "order_guid": order_guid,
+            "dry_run": True,
+            "status": "dry_run",
+            "message": "No changes written. Set dry_run=False to apply this update.",
+            "before": before,
+            "after": after,
+        }
+
+    # ---------- Step 5: build merged address and submit ----------
+    # Start with the full current address (preserves CountryId, Continent, etc.)
+    # then overlay the user's changes.
+    new_address = dict(current_address)
+    for param, lw_field in _FIELD_MAP.items():
+        new_val = user_provided[param]
+        if new_val is not None:
+            new_address[lw_field] = new_val
+
+    call_linnworks(
+        "Orders/SetOrderCustomerInfo",
+        {
+            "orderId": order_guid,
+            "info": {
+                "ChannelBuyerName": channel_buyer_name,
+                "Address": new_address,
+                "BillingAddress": current_billing,
+            },
+            "saveToCrm": save_to_crm,
+        },
+    )
+
+    # ---------- Step 6: read back to confirm ----------
+    confirmed_resp = call_linnworks("Orders/GetOrdersById", {"pkOrderIds": [order_guid]})
+    confirmed_orders = (
+        confirmed_resp if isinstance(confirmed_resp, list)
+        else (confirmed_resp.get("Orders") or confirmed_resp.get("Data") or [])
+    )
+
+    confirmed_after: dict = {}
+    if confirmed_orders:
+        confirmed_address = (confirmed_orders[0].get("CustomerInfo") or {}).get("Address") or {}
+        for param, lw_field in _FIELD_MAP.items():
+            if param in after:
+                confirmed_after[param] = confirmed_address.get(lw_field)
+
+    return {
+        "order_id": order_id,
+        "order_guid": order_guid,
+        "dry_run": False,
+        "status": "updated",
+        "before": before,
+        "after": confirmed_after or after,
+    }
 
 
 @mcp.tool()
