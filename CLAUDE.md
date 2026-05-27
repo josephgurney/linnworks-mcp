@@ -1,6 +1,6 @@
 # Linnworks MCP Server — Claude context
 
-**Current version: 1.7.0** — 37 tools. See `pyproject.toml` for full metadata.
+**Current version: 1.8.0** — 38 tools. See `pyproject.toml` for full metadata.
 
 A local stdio MCP server that exposes Linnworks data to Claude Desktop. This is **Phase 1** of a two-phase plan:
 
@@ -40,6 +40,7 @@ A local stdio MCP server that exposes Linnworks data to Claude Desktop. This is 
 | `update_order_note(order_id, note_id, note, internal=None, dry_run=True)` | `ProcessedOrders/DeleteOrderNote` + `Orders/AddOrdersNote` | No dedicated update endpoint — deletes old note then adds replacement; preserves internal flag if not supplied; before/after diff |
 | `delete_order_note(order_id, note_id, dry_run=True)` | `ProcessedOrders/DeleteOrderNote` | Permanently removes a note; read-before-write confirms existence and captures text; dry_run default |
 | `find_open_orders_for_sku(sku, location_id)` | `GetOrdersLowFidelity` + `GetOrdersById` | Finds all open orders containing a SKU; searches composite children too; enriches with customer name + email; use for "who's waiting on this item?" |
+| `find_orders_by_reference(reference, include_processed=False, location_id)` | `OpenOrders/SearchOrders` + `GetOrdersById` | Look up orders by channel reference (Shopify "#11177274", Amazon "202-...", eBay etc.); strips leading #; returns customer name + email + external_reference; include_processed=True extends to dispatched orders; **SearchOrders not yet live-tested on this tenant (May 2026)** |
 | `get_stock_level(sku, location_id, include_empty_locations)` | `GetInventoryItem` → `Stock/GetStockLevel_Batch` | Zeros filtered by default; warns on virtual dropship duplicate rows |
 | `get_processed_orders(from_date, to_date, date_field, page, page_size)` | `ProcessedOrders/SearchProcessedOrders` | Flat response; min page_size 20; overflows context at 500 — use aggregation tools for wide ranges |
 | `get_locations()` | `Inventory/GetStockLocations` | Returns all physical + virtual locations |
@@ -124,6 +125,7 @@ Rule types seen in practice: `Orders` (fires on incoming orders), `Test` (sandbo
 | `ImportExport/GetExportList` | GET | — | Same shape as import list |
 | `ImportExport/GetImport` | GET | `?id=<int>` | Config only — `ImportStatus` is null even for erroring imports |
 | `ImportExport/GetExport` | GET | `?id=<int>` | Config only |
+| `OpenOrders/SearchOrders` | POST | `{"request":{"LocationId":"...","SearchTerm":"...","IncludeProcessed":false}}` | Searches by ReferenceNum, ExternalReference, and related fields; response: `{"OpenOrders":[{"OrderIds":["guid",...]}],"ProcessedOrders":["guid",...]}` — open orders grouped in view objects, processed orders as flat GUID list; **confirmed in public OpenAPI spec, not yet live-tested on this tenant (May 2026)** |
 | `Orders/GetOrderNotes` | GET | `?orderId=<guid>` | Returns a plain JSON array of `OrderNote` objects; fields: `pkOrderNoteId`, `Note`, `IsInternal`, `NoteCreatedOn`, `NoteCreatedBy`; **GUID required** — numeric IDs must be resolved first |
 | `Orders/AddOrdersNote` | POST | `{"OrderIds":["guid",...],"NoteText":"...","IsInternal":true,"IsProcessingNote":false}` **unwrapped** | Accepts a list of order GUIDs; works on both open and processed orders |
 | `ProcessedOrders/DeleteOrderNote` | POST | `{"pkOrderNoteId":"guid"}` **unwrapped** | Deletes a single note by its GUID; works on both open and processed orders; **no UpdateOrderNote endpoint exists** — use delete+add via `update_order_note` instead |

@@ -9,7 +9,7 @@ See README.md for setup instructions.
 """
 from __future__ import annotations
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 import os
 import sys
@@ -249,6 +249,7 @@ def _format_order_detail(raw: dict) -> dict:
         "is_parked": general.get("IsParked"),
         "marker": general.get("Marker"),
         "reference_num": general.get("ReferenceNum"),
+        "external_reference": general.get("ExternalReference"),
         "source": general.get("Source"),
         "sub_source": general.get("SubSource"),
         "postal_service_name": shipping.get("PostalServiceName"),
@@ -1385,6 +1386,135 @@ def find_open_orders_for_sku(
         "total_open_orders_scanned": len(all_orders),
         "match_count": len(matched),
         "orders": matched,
+    }
+
+
+@mcp.tool()
+def find_orders_by_reference(
+    reference: str,
+    include_processed: bool = False,
+    location_id: str = DEFAULT_LOCATION_ID,
+) -> dict:
+    """
+    Find Linnworks orders by channel or source reference number.
+
+    Accepts the identifier that appears in customer emails, support tickets,
+    and the selling channel's own dashboard — not the internal Linnworks
+    numeric order ID. Examples:
+      - Shopify:  "11177274" or "#11177274"
+      - Amazon:   "202-3420523-7292364"
+      - eBay:     the 13-digit reference
+
+    Leading '#' characters are stripped automatically, so you can paste
+    references directly from Shopify or customer emails.
+
+    By default only open (unprocessed) orders are searched. Pass
+    include_processed=True to also search dispatched orders.
+
+    Returns 0, 1, or multiple matching orders. If more than one order
+    matches (e.g. the same reference appears on different channels), all
+    are returned so you can disambiguate before acting.
+
+    Backed by OpenOrders/SearchOrders. This endpoint searches across
+    ReferenceNum, ExternalReference, and related fields — it is the
+    API-native approach for this use case.
+
+    Note: SearchOrders is confirmed in the public Linnworks OpenAPI spec
+    but had not been live-tested on this tenant as of May 2026. If it
+    returns an unexpected error, fall back to find_open_orders_for_sku
+    or get_open_orders filtered manually.
+
+    Args:
+        reference: The channel/source order reference to search for.
+            Accepts Shopify "#11177274", Amazon "202-3420523-7292364",
+            eBay references, or any Linnworks ReferenceNum/ExternalReference.
+        include_processed: If True, also searches dispatched/processed orders.
+            Defaults to False (open orders only).
+        location_id: Linnworks location to search. Defaults to "Default".
+
+    Returns:
+        A dict with:
+          - reference:    the reference string searched (# stripped)
+          - match_count:  number of orders found
+          - orders:       list of matching order dicts, each with:
+              order_id, num_order_id, reference_num, external_reference,
+              source, sub_source, status, processed, received_date,
+              customer_name, customer_email
+    """
+    # Strip leading # so users can paste "#11177274" directly
+    reference = reference.strip().lstrip("#").strip()
+    if not reference:
+        return {"error": "reference must not be empty after stripping '#'"}
+
+    # --- Step 1: API-native search ---
+    # SearchOrders returns GUIDs grouped into OpenOrders views and ProcessedOrders.
+    # Payload uses the {"request": {...}} wrapper consistent with other OpenOrders endpoints.
+    resp = call_linnworks(
+        "OpenOrders/SearchOrders",
+        {
+            "request": {
+                "LocationId": location_id,
+                "SearchTerm": reference,
+                "IncludeProcessed": include_processed,
+            }
+        },
+    )
+
+    # --- Step 2: collect all GUIDs (deduplicated) ---
+    # OpenOrders: list of OrderViewIds objects, each with an OrderIds array.
+    # ProcessedOrders: flat list of GUIDs.
+    seen: set[str] = set()
+    all_guids: list[str] = []
+
+    for view in (resp.get("OpenOrders") or []):
+        for guid in (view.get("OrderIds") or []):
+            if guid and guid not in seen:
+                seen.add(guid)
+                all_guids.append(guid)
+
+    if include_processed:
+        for guid in (resp.get("ProcessedOrders") or []):
+            if guid and guid not in seen:
+                seen.add(guid)
+                all_guids.append(guid)
+
+    if not all_guids:
+        return {
+            "reference": reference,
+            "match_count": 0,
+            "orders": [],
+        }
+
+    # --- Step 3: enrich with full order detail (customer name, email, etc.) ---
+    orders: list[dict] = []
+    batch_size = 50
+    for i in range(0, len(all_guids), batch_size):
+        batch = all_guids[i : i + batch_size]
+        detail_resp = call_linnworks("Orders/GetOrdersById", {"pkOrderIds": batch})
+        detail_list = (
+            detail_resp if isinstance(detail_resp, list)
+            else (detail_resp.get("Orders") or detail_resp.get("Data") or [])
+        )
+        for order in detail_list:
+            fmt = _format_order_detail(order)
+            orders.append({
+                "order_id":           fmt["order_id"],
+                "num_order_id":       fmt["num_order_id"],
+                "reference_num":      fmt["reference_num"],
+                "external_reference": fmt["external_reference"],
+                "source":             fmt["source"],
+                "sub_source":         fmt["sub_source"],
+                "status":             fmt["status"],
+                "processed":          fmt["processed"],
+                "received_date":      fmt["received_date"],
+                "customer_name":      fmt["customer_name"],
+                "customer_email":     fmt["customer_email"],
+            })
+
+    return {
+        "reference": reference,
+        "match_count": len(orders),
+        "orders": orders,
     }
 
 

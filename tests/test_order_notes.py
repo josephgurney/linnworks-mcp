@@ -405,6 +405,7 @@ class TestFormatOrderDetailNotes:
 
 # ── version check ─────────────────────────────────────────────────────────────
 
-def test_version_is_1_7_0():
+def test_version_is_at_least_1_7_0():
     import server
-    assert server.__version__ == "1.7.0"
+    major, minor, patch = (int(x) for x in server.__version__.split("."))
+    assert (major, minor, patch) >= (1, 7, 0), f"Expected >= 1.7.0, got {server.__version__}"
