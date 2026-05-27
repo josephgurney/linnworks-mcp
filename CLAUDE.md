@@ -1,5 +1,7 @@
 # Linnworks MCP Server — Claude context
 
+**Current version: 1.5.0** — 32 tools. See `pyproject.toml` for full metadata.
+
 A local stdio MCP server that exposes Linnworks data to Claude Desktop. This is **Phase 1** of a two-phase plan:
 
 - **Phase 1 (current)**: Single-tenant stdio server, runs on your machine, no OAuth, no hosting. Used to iterate on tool design with a fast feedback loop.

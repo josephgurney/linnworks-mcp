@@ -1,5 +1,7 @@
 # Linnworks MCP Server
 
+![Version](https://img.shields.io/badge/version-1.5.0-blue)
+
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
 
 This is a **single-tenant stdio server**: it runs on your machine, connects to your Linnworks account using your own API credentials, and is not hosted anywhere. Each person who installs it uses their own credentials.

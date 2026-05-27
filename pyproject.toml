@@ -1,0 +1,21 @@
+[project]
+name = "linnworks-mcp"
+version = "1.5.0"
+description = "A local MCP server that connects Claude Desktop to your Linnworks account"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "mcp>=1.27.0",
+    "requests>=2.33.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/josephgurney/linnworks-mcp"
+Repository = "https://github.com/josephgurney/linnworks-mcp"
+Issues = "https://github.com/josephgurney/linnworks-mcp/issues"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
