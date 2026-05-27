@@ -9,7 +9,7 @@ See README.md for setup instructions.
 """
 from __future__ import annotations
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 import os
 import sys
@@ -292,6 +292,18 @@ def _format_order_detail(raw: dict) -> dict:
                 "Quantity": i.get("Quantity"),
             }
             for i in items
+        ],
+        # Notes attached to this order. Field names use .get() with fallbacks
+        # because the Linnworks docs use slightly different names across endpoints.
+        "notes": [
+            {
+                "note_id": n.get("pkOrderNoteId"),
+                "note": n.get("Note") or n.get("NoteText"),
+                "internal": n.get("IsInternal"),
+                "created_on": n.get("NoteCreatedOn") or n.get("DateCreated"),
+                "created_by": n.get("NoteCreatedBy") or n.get("CreatedBy"),
+            }
+            for n in (raw.get("Notes") or [])
         ],
     }
 
@@ -871,6 +883,403 @@ def update_order_shipping_address(
         "order_id": order_guid,
         "numeric_id": numeric_id,
         "updated_address": updated_address,
+    }
+
+
+# ---------- Helper: resolve any order_id (GUID or numeric) to its GUID ----------
+
+def _resolve_order_guid(order_id: str) -> tuple[str, dict]:
+    """
+    Given a GUID or numeric order ID, return (guid, raw_order_dict).
+    Raises RuntimeError if not found.
+    """
+    order_id = order_id.strip()
+    if _UUID_RE.match(order_id):
+        resp = call_linnworks("Orders/GetOrdersById", {"pkOrderIds": [order_id]})
+        orders = resp if isinstance(resp, list) else (resp.get("Orders") or resp.get("Data") or [])
+        if not orders:
+            raise RuntimeError(f"No order found for GUID '{order_id}'.")
+        return orders[0].get("OrderId") or order_id, orders[0]
+    else:
+        raw = call_linnworks_get(
+            "Orders/GetOrderDetailsByNumOrderId",
+            params={"orderId": order_id},
+        )
+        if not isinstance(raw, dict) or ("GeneralInfo" not in raw and "NumOrderId" not in raw):
+            raise RuntimeError(f"No order found for numeric ID '{order_id}'.")
+        return raw.get("OrderId", ""), raw
+
+
+@mcp.tool()
+def get_order_notes(order_id: str) -> dict:
+    """
+    Fetch all notes attached to a Linnworks order.
+
+    Works for both open (unprocessed) and processed orders. Returns every
+    note with its ID, text, internal flag, creation timestamp, and creator.
+
+    Use this to read the notes on an order before adding, editing, or deleting
+    one — the note_id returned here is required by add_order_note,
+    update_order_note, and delete_order_note.
+
+    Args:
+        order_id: GUID pkOrderID (e.g. "a1b2c3d4-1234-...") or numeric order
+            number (e.g. "596475"). Both formats are accepted.
+
+    Returns:
+        A dict with:
+          - order_id:    the GUID of the order
+          - note_count:  total number of notes
+          - notes:       list of note dicts, each with:
+              note_id, note, internal, created_on, created_by
+    """
+    order_id = order_id.strip()
+
+    # Resolve numeric → GUID (GetOrderNotes only accepts GUID)
+    if _UUID_RE.match(order_id):
+        order_guid = order_id
+    else:
+        order_guid, _ = _resolve_order_guid(order_id)
+
+    raw_notes = call_linnworks_get("Orders/GetOrderNotes", params={"orderId": order_guid})
+
+    # Response is a plain list of OrderNote objects
+    if not isinstance(raw_notes, list):
+        raw_notes = raw_notes.get("Notes") or [] if isinstance(raw_notes, dict) else []
+
+    notes = [
+        {
+            "note_id": n.get("pkOrderNoteId"),
+            "note": n.get("Note") or n.get("NoteText"),
+            "internal": n.get("IsInternal"),
+            "created_on": n.get("NoteCreatedOn") or n.get("DateCreated"),
+            "created_by": n.get("NoteCreatedBy") or n.get("CreatedBy"),
+        }
+        for n in raw_notes
+    ]
+
+    return {
+        "order_id": order_guid,
+        "note_count": len(notes),
+        "notes": notes,
+    }
+
+
+@mcp.tool()
+def add_order_note(
+    order_id: str,
+    note: str,
+    internal: bool = True,
+    is_processing_note: bool = False,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Add a note to a Linnworks order (open or processed).
+
+    The note is added immediately and appears on the order in the Linnworks
+    UI. Both open and processed orders accept notes.
+
+    IMPORTANT: dry_run defaults to True. Set dry_run=False only when you are
+    sure the note text is correct — confirm with the user before doing so.
+
+    Args:
+        order_id: GUID pkOrderID (e.g. "a1b2c3d4-1234-...") or numeric order
+            number (e.g. "596475"). Both formats are accepted.
+        note: The text of the note to add.
+        internal: If True (default), the note is marked as internal (visible
+            only to staff, not shown on customer-facing documents).
+        is_processing_note: If True, marks the note as a processing note.
+            Defaults to False.
+        dry_run: If True (default), shows what would be added without writing
+            anything. Set to False to actually add the note.
+
+    Returns:
+        A dict with:
+          - order_id:  the GUID of the order
+          - dry_run:   whether this was a dry run
+          - success:   True if the note was added (or would be, on dry run)
+          - note:      the note text that was (or would be) added
+          - internal:  the internal flag value
+    """
+    order_id = order_id.strip()
+
+    # Resolve to GUID
+    if _UUID_RE.match(order_id):
+        order_guid = order_id
+    else:
+        order_guid, _ = _resolve_order_guid(order_id)
+
+    if dry_run:
+        return {
+            "order_id": order_guid,
+            "dry_run": True,
+            "success": True,
+            "note": note,
+            "internal": internal,
+            "message": "No note written. Set dry_run=False to add this note.",
+        }
+
+    # Orders/AddOrdersNote accepts a list of order IDs so one call can note
+    # multiple orders — we always pass a single-element list here.
+    call_linnworks(
+        "Orders/AddOrdersNote",
+        {
+            "OrderIds": [order_guid],
+            "NoteText": note,
+            "IsInternal": internal,
+            "IsProcessingNote": is_processing_note,
+        },
+    )
+
+    # Read back to confirm the note was created
+    raw_notes = call_linnworks_get("Orders/GetOrderNotes", params={"orderId": order_guid})
+    if not isinstance(raw_notes, list):
+        raw_notes = raw_notes.get("Notes") or [] if isinstance(raw_notes, dict) else []
+
+    notes_after = [
+        {
+            "note_id": n.get("pkOrderNoteId"),
+            "note": n.get("Note") or n.get("NoteText"),
+            "internal": n.get("IsInternal"),
+            "created_on": n.get("NoteCreatedOn") or n.get("DateCreated"),
+            "created_by": n.get("NoteCreatedBy") or n.get("CreatedBy"),
+        }
+        for n in raw_notes
+    ]
+
+    return {
+        "order_id": order_guid,
+        "dry_run": False,
+        "success": True,
+        "note": note,
+        "internal": internal,
+        "note_count_after": len(notes_after),
+        "notes": notes_after,
+    }
+
+
+@mcp.tool()
+def update_order_note(
+    order_id: str,
+    note_id: str,
+    note: str,
+    internal: Optional[bool] = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Edit an existing note on a Linnworks order.
+
+    Linnworks has no dedicated "edit note" endpoint, so this tool uses a
+    delete-then-add pattern: the old note is deleted and a new one with the
+    updated text is created. The new note gets a new note_id; the old
+    note_id will no longer exist after this call.
+
+    Use get_order_notes() first to find the note_id you want to update.
+
+    IMPORTANT: dry_run defaults to True. Set dry_run=False only when you are
+    sure the new text is correct — confirm with the user before doing so.
+
+    Args:
+        order_id: GUID pkOrderID (e.g. "a1b2c3d4-1234-...") or numeric order
+            number (e.g. "596475"). Both formats are accepted.
+        note_id: The pkOrderNoteId GUID of the note to replace (from
+            get_order_notes).
+        note: The replacement note text.
+        internal: Internal flag for the new note. If None (default), the
+            existing note's internal flag is preserved.
+        dry_run: If True (default), shows the before/after without writing
+            anything. Set to False to apply the update.
+
+    Returns:
+        A dict with:
+          - order_id:     the GUID of the order
+          - dry_run:      whether this was a dry run
+          - success:      True if the update succeeded (or would, on dry run)
+          - old_note_id:  the deleted note's ID
+          - old_note:     the text that was replaced
+          - new_note:     the replacement text
+          - internal:     the internal flag on the new note
+    """
+    order_id = order_id.strip()
+    note_id = note_id.strip()
+
+    # Resolve to GUID
+    if _UUID_RE.match(order_id):
+        order_guid = order_id
+    else:
+        order_guid, _ = _resolve_order_guid(order_id)
+
+    # Read current notes (read-before-write: verify the note exists)
+    raw_notes = call_linnworks_get("Orders/GetOrderNotes", params={"orderId": order_guid})
+    if not isinstance(raw_notes, list):
+        raw_notes = raw_notes.get("Notes") or [] if isinstance(raw_notes, dict) else []
+
+    existing = next(
+        (n for n in raw_notes if (n.get("pkOrderNoteId") or "") == note_id),
+        None,
+    )
+    if existing is None:
+        return {
+            "order_id": order_guid,
+            "success": False,
+            "error": f"Note '{note_id}' not found on order '{order_guid}'.",
+        }
+
+    old_note_text = existing.get("Note") or existing.get("NoteText") or ""
+    # Preserve existing internal flag if caller didn't specify
+    new_internal = internal if internal is not None else bool(existing.get("IsInternal"))
+
+    if dry_run:
+        return {
+            "order_id": order_guid,
+            "dry_run": True,
+            "success": True,
+            "old_note_id": note_id,
+            "old_note": old_note_text,
+            "new_note": note,
+            "internal": new_internal,
+            "message": (
+                "No changes written. Set dry_run=False to delete the old note "
+                "and create the new one."
+            ),
+        }
+
+    # Step 1: delete the old note
+    call_linnworks(
+        "ProcessedOrders/DeleteOrderNote",
+        {"pkOrderNoteId": note_id},
+    )
+
+    # Step 2: add the replacement note
+    call_linnworks(
+        "Orders/AddOrdersNote",
+        {
+            "OrderIds": [order_guid],
+            "NoteText": note,
+            "IsInternal": new_internal,
+            "IsProcessingNote": False,
+        },
+    )
+
+    # Read back to confirm
+    raw_notes_after = call_linnworks_get("Orders/GetOrderNotes", params={"orderId": order_guid})
+    if not isinstance(raw_notes_after, list):
+        raw_notes_after = (
+            raw_notes_after.get("Notes") or []
+            if isinstance(raw_notes_after, dict)
+            else []
+        )
+
+    notes_after = [
+        {
+            "note_id": n.get("pkOrderNoteId"),
+            "note": n.get("Note") or n.get("NoteText"),
+            "internal": n.get("IsInternal"),
+            "created_on": n.get("NoteCreatedOn") or n.get("DateCreated"),
+            "created_by": n.get("NoteCreatedBy") or n.get("CreatedBy"),
+        }
+        for n in raw_notes_after
+    ]
+
+    return {
+        "order_id": order_guid,
+        "dry_run": False,
+        "success": True,
+        "old_note_id": note_id,
+        "old_note": old_note_text,
+        "new_note": note,
+        "internal": new_internal,
+        "note_count_after": len(notes_after),
+        "notes": notes_after,
+    }
+
+
+@mcp.tool()
+def delete_order_note(
+    order_id: str,
+    note_id: str,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Delete a specific note from a Linnworks order.
+
+    Permanently removes the note identified by note_id. This cannot be
+    undone — use get_order_notes() to review the note text before deleting.
+
+    IMPORTANT: dry_run defaults to True. Set dry_run=False only when you are
+    sure you want to delete the note — confirm with the user before doing so.
+
+    Args:
+        order_id: GUID pkOrderID (e.g. "a1b2c3d4-1234-...") or numeric order
+            number (e.g. "596475"). Both formats are accepted.
+        note_id: The pkOrderNoteId GUID of the note to delete (from
+            get_order_notes).
+        dry_run: If True (default), shows what would be deleted without
+            writing anything. Set to False to permanently delete the note.
+
+    Returns:
+        A dict with:
+          - order_id:         the GUID of the order
+          - dry_run:          whether this was a dry run
+          - success:          True if the note was deleted (or would be)
+          - deleted_note_id:  the ID of the note that was (or would be) deleted
+          - deleted_note:     the text of the note that was (or would be) deleted
+          - note_count_after: number of notes remaining (live run only)
+    """
+    order_id = order_id.strip()
+    note_id = note_id.strip()
+
+    # Resolve to GUID
+    if _UUID_RE.match(order_id):
+        order_guid = order_id
+    else:
+        order_guid, _ = _resolve_order_guid(order_id)
+
+    # Read current notes (read-before-write: confirm the note exists + capture text)
+    raw_notes = call_linnworks_get("Orders/GetOrderNotes", params={"orderId": order_guid})
+    if not isinstance(raw_notes, list):
+        raw_notes = raw_notes.get("Notes") or [] if isinstance(raw_notes, dict) else []
+
+    existing = next(
+        (n for n in raw_notes if (n.get("pkOrderNoteId") or "") == note_id),
+        None,
+    )
+    if existing is None:
+        return {
+            "order_id": order_guid,
+            "success": False,
+            "error": f"Note '{note_id}' not found on order '{order_guid}'.",
+        }
+
+    note_text = existing.get("Note") or existing.get("NoteText") or ""
+
+    if dry_run:
+        return {
+            "order_id": order_guid,
+            "dry_run": True,
+            "success": True,
+            "deleted_note_id": note_id,
+            "deleted_note": note_text,
+            "message": "No changes written. Set dry_run=False to permanently delete this note.",
+        }
+
+    call_linnworks(
+        "ProcessedOrders/DeleteOrderNote",
+        {"pkOrderNoteId": note_id},
+    )
+
+    # Read back to confirm note count
+    raw_after = call_linnworks_get("Orders/GetOrderNotes", params={"orderId": order_guid})
+    if not isinstance(raw_after, list):
+        raw_after = raw_after.get("Notes") or [] if isinstance(raw_after, dict) else []
+
+    return {
+        "order_id": order_guid,
+        "dry_run": False,
+        "success": True,
+        "deleted_note_id": note_id,
+        "deleted_note": note_text,
+        "note_count_after": len(raw_after),
     }
 
 
