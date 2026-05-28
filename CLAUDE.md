@@ -1,6 +1,6 @@
 # Linnworks MCP Server — Claude context
 
-**Current version: 1.8.0** — 38 tools. See `pyproject.toml` for full metadata.
+**Current version: 1.8.1** — 38 tools. See `pyproject.toml` for full metadata.
 
 A local stdio MCP server that exposes Linnworks data to Claude Desktop. This is **Phase 1** of a two-phase plan:
 
@@ -126,7 +126,7 @@ Rule types seen in practice: `Orders` (fires on incoming orders), `Test` (sandbo
 | `ImportExport/GetImport` | GET | `?id=<int>` | Config only — `ImportStatus` is null even for erroring imports |
 | `ImportExport/GetExport` | GET | `?id=<int>` | Config only |
 | `OpenOrders/SearchOrders` | POST | `{"request":{"LocationId":"...","SearchTerm":"...","IncludeProcessed":false}}` | Searches by ReferenceNum, ExternalReference, and related fields; response: `{"OpenOrders":[{"OrderIds":["guid",...]}],"ProcessedOrders":["guid",...]}` — open orders grouped in view objects, processed orders as flat GUID list; **confirmed in public OpenAPI spec, not yet live-tested on this tenant (May 2026)** |
-| `Orders/GetOrderNotes` | GET | `?orderId=<guid>` | Returns a plain JSON array of `OrderNote` objects; fields: `pkOrderNoteId`, `Note`, `IsInternal`, `NoteCreatedOn`, `NoteCreatedBy`; **GUID required** — numeric IDs must be resolved first |
+| `Orders/GetOrderNotes` | GET | `?orderId=<guid>` | Returns a plain JSON array of `OrderNote` objects; **canonical fields per OpenAPI spec (confirmed May 2026)**: `OrderNoteId`, `OrderId`, `NoteDate`, `Internal` (bool, no `Is` prefix), `Note`, `CreatedBy`, `NoteTypeId`; **GUID required** — numeric IDs must be resolved first; **previously documented field names `pkOrderNoteId`/`IsInternal`/`NoteCreatedOn` were wrong** (fixed in issue #7) |
 | `Orders/AddOrdersNote` | POST | `{"OrderIds":["guid",...],"NoteText":"...","IsInternal":true,"IsProcessingNote":false}` **unwrapped** | Accepts a list of order GUIDs; works on both open and processed orders |
 | `ProcessedOrders/DeleteOrderNote` | POST | `{"pkOrderNoteId":"guid"}` **unwrapped** | Deletes a single note by its GUID; works on both open and processed orders; **no UpdateOrderNote endpoint exists** — use delete+add via `update_order_note` instead |
 

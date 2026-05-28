@@ -336,6 +336,7 @@ def test_format_order_detail_external_reference_absent():
 
 # ── version ───────────────────────────────────────────────────────────────────
 
-def test_version_is_1_8_0():
+def test_version_is_at_least_1_8_0():
     import server
-    assert server.__version__ == "1.8.0"
+    major, minor, patch = (int(x) for x in server.__version__.split("."))
+    assert (major, minor, patch) >= (1, 8, 0), f"Expected >= 1.8.0, got {server.__version__}"

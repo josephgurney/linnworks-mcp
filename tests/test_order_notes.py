@@ -21,21 +21,30 @@ NOTE_ID_1     = "nnnnnnnn-0001-0001-0001-000000000001"
 NOTE_ID_2     = "nnnnnnnn-0002-0002-0002-000000000002"
 NUMERIC_ID    = "596475"
 
-# Raw response shape returned by Orders/GetOrderNotes
+# Raw response shape returned by Orders/GetOrderNotes.
+# Field names match the canonical OrderNote schema from the public OpenAPI
+# spec — confirmed May 2026:
+#   OrderNoteId, OrderId, NoteDate, Internal, Note, CreatedBy, NoteTypeId
+# Previously these tests used invented names (pkOrderNoteId, IsInternal,
+# NoteCreatedOn) — that hid the bug fixed in issue #7.
 NOTES_RESPONSE = [
     {
-        "pkOrderNoteId": NOTE_ID_1,
-        "Note": "First note",
-        "IsInternal": True,
-        "NoteCreatedOn": "2026-05-01T10:00:00",
-        "NoteCreatedBy": "admin",
+        "OrderNoteId": NOTE_ID_1,
+        "OrderId":     VALID_GUID,
+        "Note":        "First note",
+        "Internal":    True,
+        "NoteDate":    "2026-05-01T10:00:00",
+        "CreatedBy":   "admin",
+        "NoteTypeId":  0,
     },
     {
-        "pkOrderNoteId": NOTE_ID_2,
-        "Note": "Second note",
-        "IsInternal": False,
-        "NoteCreatedOn": "2026-05-02T11:00:00",
-        "NoteCreatedBy": "admin",
+        "OrderNoteId": NOTE_ID_2,
+        "OrderId":     VALID_GUID,
+        "Note":        "Second note",
+        "Internal":    False,
+        "NoteDate":    "2026-05-02T11:00:00",
+        "CreatedBy":   "admin",
+        "NoteTypeId":  0,
     },
 ]
 
@@ -401,6 +410,93 @@ class TestFormatOrderDetailNotes:
         }
         result = server._format_order_detail(raw)
         assert result["notes"] == []
+
+
+# ── Regression: real OrderNote field names from spec (issue #7) ──────────────
+
+class TestOrderNoteFieldNamesFromSpec:
+    """
+    Pins the canonical OrderNote field names from the public Linnworks
+    OpenAPI spec (orders.json, May 2026):
+        OrderNoteId, NoteDate, Internal, Note, CreatedBy
+    Previously the code used invented names (pkOrderNoteId, NoteCreatedOn,
+    IsInternal) which silently returned null — issue #7.
+    """
+
+    SPEC_SHAPE = [{
+        "OrderNoteId": NOTE_ID_1,
+        "OrderId":     VALID_GUID,
+        "NoteDate":    "2026-05-28T09:00:00",
+        "Internal":    True,
+        "Note":        "Spec-shaped note",
+        "CreatedBy":   "spec-user",
+        "NoteTypeId":  0,
+    }]
+
+    def test_get_order_notes_parses_spec_field_names(self):
+        import server
+        with patch("server.call_linnworks_get", return_value=self.SPEC_SHAPE):
+            result = server.get_order_notes(order_id=VALID_GUID)
+
+        note = result["notes"][0]
+        assert note["note_id"]    == NOTE_ID_1,    "note_id must be parsed from OrderNoteId"
+        assert note["note"]       == "Spec-shaped note"
+        assert note["internal"]   is True,         "internal must be parsed from Internal"
+        assert note["created_on"] == "2026-05-28T09:00:00", "created_on must be parsed from NoteDate"
+        assert note["created_by"] == "spec-user"
+
+    def test_no_null_fields_when_spec_shape_supplied(self):
+        """The bug from issue #7: note_id, internal, created_on coming back null."""
+        import server
+        with patch("server.call_linnworks_get", return_value=self.SPEC_SHAPE):
+            result = server.get_order_notes(order_id=VALID_GUID)
+
+        note = result["notes"][0]
+        for field in ("note_id", "internal", "created_on", "created_by"):
+            assert note[field] is not None, f"{field} must not be null on spec-shaped input"
+
+    def test_update_lookup_matches_OrderNoteId(self):
+        """update_order_note must find the note by its real OrderNoteId, not pkOrderNoteId."""
+        import server
+        with patch("server.call_linnworks_get", return_value=self.SPEC_SHAPE), \
+             patch("server.call_linnworks"):
+            result = server.update_order_note(
+                order_id=VALID_GUID,
+                note_id=NOTE_ID_1,
+                note="replacement",
+                # dry_run defaults True
+            )
+
+        assert result["success"] is True
+        assert result["old_note"] == "Spec-shaped note"
+
+    def test_delete_lookup_matches_OrderNoteId(self):
+        """delete_order_note must find the note by its real OrderNoteId."""
+        import server
+        with patch("server.call_linnworks_get", return_value=self.SPEC_SHAPE):
+            result = server.delete_order_note(
+                order_id=VALID_GUID,
+                note_id=NOTE_ID_1,
+                # dry_run defaults True
+            )
+
+        assert result["success"] is True
+        assert result["deleted_note"] == "Spec-shaped note"
+
+    def test_format_order_detail_notes_uses_spec_names(self):
+        import server
+        raw = {
+            "OrderId": VALID_GUID, "NumOrderId": 1, "Processed": False,
+            "GeneralInfo": {}, "ShippingInfo": {},
+            "CustomerInfo": {"Address": {}, "BillingAddress": {}},
+            "Items": [],
+            "Notes": self.SPEC_SHAPE,
+        }
+        result = server._format_order_detail(raw)
+        note = result["notes"][0]
+        assert note["note_id"]    == NOTE_ID_1
+        assert note["internal"]   is True
+        assert note["created_on"] == "2026-05-28T09:00:00"
 
 
 # ── version check ─────────────────────────────────────────────────────────────

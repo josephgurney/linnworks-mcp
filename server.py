@@ -9,7 +9,7 @@ See README.md for setup instructions.
 """
 from __future__ import annotations
 
-__version__ = "1.8.0"
+__version__ = "1.8.1"
 
 import os
 import sys
@@ -232,6 +232,37 @@ def call_linnworks_get(method_path: str, params: dict | None = None) -> any:
     return response.json()
 
 
+def _format_order_note(n: dict) -> dict:
+    """
+    Normalise a single Linnworks OrderNote into the MCP-facing shape.
+
+    Centralised here so all five places that read notes (the order-detail
+    formatter, get_order_notes, and the read-back paths in add/update/delete)
+    use the same field mapping — and so future API field-name surprises only
+    need fixing in one place.
+
+    Verified from the OpenAPI spec (orders.json, OrderNote definition) the
+    canonical fields on a GetOrderNotes response are:
+        OrderNoteId, OrderId, NoteDate, Internal, Note, CreatedBy, NoteTypeId
+    Fallback keys are kept for resilience but should not be relied on.
+    """
+    internal = n.get("Internal")
+    if internal is None:
+        internal = n.get("IsInternal")
+    return {
+        "note_id":    n.get("OrderNoteId") or n.get("pkOrderNoteId"),
+        "note":       n.get("Note") or n.get("NoteText"),
+        "internal":   internal,
+        "created_on": n.get("NoteDate") or n.get("NoteCreatedOn") or n.get("DateCreated"),
+        "created_by": n.get("CreatedBy") or n.get("NoteCreatedBy"),
+    }
+
+
+def _note_id_of(n: dict) -> str:
+    """Return whichever field carries the note GUID (handles old + new shapes)."""
+    return n.get("OrderNoteId") or n.get("pkOrderNoteId") or ""
+
+
 def _format_order_detail(raw: dict) -> dict:
     """Normalise a single Linnworks order detail record into a consistent shape."""
     general = raw.get("GeneralInfo") or {}
@@ -296,16 +327,7 @@ def _format_order_detail(raw: dict) -> dict:
         ],
         # Notes attached to this order. Field names use .get() with fallbacks
         # because the Linnworks docs use slightly different names across endpoints.
-        "notes": [
-            {
-                "note_id": n.get("pkOrderNoteId"),
-                "note": n.get("Note") or n.get("NoteText"),
-                "internal": n.get("IsInternal"),
-                "created_on": n.get("NoteCreatedOn") or n.get("DateCreated"),
-                "created_by": n.get("NoteCreatedBy") or n.get("CreatedBy"),
-            }
-            for n in (raw.get("Notes") or [])
-        ],
+        "notes": [_format_order_note(n) for n in (raw.get("Notes") or [])],
     }
 
 
@@ -948,16 +970,7 @@ def get_order_notes(order_id: str) -> dict:
     if not isinstance(raw_notes, list):
         raw_notes = raw_notes.get("Notes") or [] if isinstance(raw_notes, dict) else []
 
-    notes = [
-        {
-            "note_id": n.get("pkOrderNoteId"),
-            "note": n.get("Note") or n.get("NoteText"),
-            "internal": n.get("IsInternal"),
-            "created_on": n.get("NoteCreatedOn") or n.get("DateCreated"),
-            "created_by": n.get("NoteCreatedBy") or n.get("CreatedBy"),
-        }
-        for n in raw_notes
-    ]
+    notes = [_format_order_note(n) for n in raw_notes]
 
     return {
         "order_id": order_guid,
@@ -1037,16 +1050,7 @@ def add_order_note(
     if not isinstance(raw_notes, list):
         raw_notes = raw_notes.get("Notes") or [] if isinstance(raw_notes, dict) else []
 
-    notes_after = [
-        {
-            "note_id": n.get("pkOrderNoteId"),
-            "note": n.get("Note") or n.get("NoteText"),
-            "internal": n.get("IsInternal"),
-            "created_on": n.get("NoteCreatedOn") or n.get("DateCreated"),
-            "created_by": n.get("NoteCreatedBy") or n.get("CreatedBy"),
-        }
-        for n in raw_notes
-    ]
+    notes_after = [_format_order_note(n) for n in raw_notes]
 
     return {
         "order_id": order_guid,
@@ -1083,7 +1087,7 @@ def update_order_note(
     Args:
         order_id: GUID pkOrderID (e.g. "a1b2c3d4-1234-...") or numeric order
             number (e.g. "596475"). Both formats are accepted.
-        note_id: The pkOrderNoteId GUID of the note to replace (from
+        note_id: The OrderNoteId GUID of the note to replace (from
             get_order_notes).
         note: The replacement note text.
         internal: Internal flag for the new note. If None (default), the
@@ -1116,7 +1120,7 @@ def update_order_note(
         raw_notes = raw_notes.get("Notes") or [] if isinstance(raw_notes, dict) else []
 
     existing = next(
-        (n for n in raw_notes if (n.get("pkOrderNoteId") or "") == note_id),
+        (n for n in raw_notes if _note_id_of(n) == note_id),
         None,
     )
     if existing is None:
@@ -1128,7 +1132,10 @@ def update_order_note(
 
     old_note_text = existing.get("Note") or existing.get("NoteText") or ""
     # Preserve existing internal flag if caller didn't specify
-    new_internal = internal if internal is not None else bool(existing.get("IsInternal"))
+    existing_internal = existing.get("Internal")
+    if existing_internal is None:
+        existing_internal = existing.get("IsInternal")
+    new_internal = internal if internal is not None else bool(existing_internal)
 
     if dry_run:
         return {
@@ -1171,16 +1178,7 @@ def update_order_note(
             else []
         )
 
-    notes_after = [
-        {
-            "note_id": n.get("pkOrderNoteId"),
-            "note": n.get("Note") or n.get("NoteText"),
-            "internal": n.get("IsInternal"),
-            "created_on": n.get("NoteCreatedOn") or n.get("DateCreated"),
-            "created_by": n.get("NoteCreatedBy") or n.get("CreatedBy"),
-        }
-        for n in raw_notes_after
-    ]
+    notes_after = [_format_order_note(n) for n in raw_notes_after]
 
     return {
         "order_id": order_guid,
@@ -1213,7 +1211,7 @@ def delete_order_note(
     Args:
         order_id: GUID pkOrderID (e.g. "a1b2c3d4-1234-...") or numeric order
             number (e.g. "596475"). Both formats are accepted.
-        note_id: The pkOrderNoteId GUID of the note to delete (from
+        note_id: The OrderNoteId GUID of the note to delete (from
             get_order_notes).
         dry_run: If True (default), shows what would be deleted without
             writing anything. Set to False to permanently delete the note.
@@ -1242,7 +1240,7 @@ def delete_order_note(
         raw_notes = raw_notes.get("Notes") or [] if isinstance(raw_notes, dict) else []
 
     existing = next(
-        (n for n in raw_notes if (n.get("pkOrderNoteId") or "") == note_id),
+        (n for n in raw_notes if _note_id_of(n) == note_id),
         None,
     )
     if existing is None:
