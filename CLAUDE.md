@@ -1,6 +1,6 @@
 # Linnworks MCP Server — Claude context
 
-**Current version: 1.8.1** — 38 tools. See `pyproject.toml` for full metadata.
+**Current version: 1.9.0** — 41 tools. See `pyproject.toml` for full metadata.
 
 A local stdio MCP server that exposes Linnworks data to Claude Desktop. This is **Phase 1** of a two-phase plan:
 
@@ -33,7 +33,7 @@ A local stdio MCP server that exposes Linnworks data to Claude Desktop. This is 
 |---|---|---|
 | `get_open_orders(location_id, limit, overdue_only)` | `OpenOrders/GetOrdersLowFidelity` | Always returns `overdue_count`; `overdue_only=True` filters past-deadline; `StatusLabel` decoded |
 | `find_inventory_item(sku_or_title)` | `Inventory/GetInventoryItem` | **Exact SKU only** — no fuzzy/title search |
-| `get_order(order_id)` | `Orders/GetOrdersById` or `GetOrderDetailsByNumOrderId` | GUID → POST; numeric ID → GET; returns `customer_name`, `customer_email`, `delivery_address`, `billing_address`, and `notes` list |
+| `get_order(order_id)` | `Orders/GetOrdersById` or `GetOrderDetailsByNumOrderId` | GUID → POST; numeric ID → GET; returns `customer_name`, `customer_email`, `delivery_address`, `billing_address`, `notes` list, `totals` (subtotal/postage/tax/total/currency), `fulfilment_location_id`; each item now also includes `row_id` (OrderItemRowId — required by `refund_order_lines`), `price_per_unit`, `cost_inc_tax` |
 | `set_order_address(order_id, ..., dry_run=True)` | `Orders/SetOrderCustomerInfo` | Update delivery address on open orders only; GUID or numeric order_id; pass only the fields to change (None = keep current); read-before-write diff; blocks on processed orders |
 | `get_order_notes(order_id)` | `Orders/GetOrderNotes` | Fetch all notes on an order (open or processed); returns note_id, text, internal flag, timestamp, creator; GUID or numeric order_id |
 | `add_order_note(order_id, note, internal=True, dry_run=True)` | `Orders/AddOrdersNote` | Add a note to any order; internal=True by default (staff-only); dry_run default; works on open and processed orders |
@@ -41,6 +41,9 @@ A local stdio MCP server that exposes Linnworks data to Claude Desktop. This is 
 | `delete_order_note(order_id, note_id, dry_run=True)` | `ProcessedOrders/DeleteOrderNote` | Permanently removes a note; read-before-write confirms existence and captures text; dry_run default |
 | `find_open_orders_for_sku(sku, location_id)` | `GetOrdersLowFidelity` + `GetOrdersById` | Finds all open orders containing a SKU; searches composite children too; enriches with customer name + email; use for "who's waiting on this item?" |
 | `find_orders_by_reference(reference, include_processed=False, location_id)` | `OpenOrders/SearchOrders` + `GetOrdersById` | Look up orders by channel reference (Shopify "#11177274", Amazon "202-...", eBay etc.); strips leading #; returns customer name + email + external_reference; include_processed=True extends to dispatched orders; **SearchOrders not yet live-tested on this tenant (May 2026)** |
+| `cancel_order(order_id, note=None, dry_run=True)` | `Orders/CancelOrder` | Cancel an open (unprocessed) order; refuses if already processed; dry_run shows items that would be cancelled; `fulfilmentCenter` taken from `FulfilmentLocationId` on the order; no `return_to_stock` param in API — controlled by workspace settings |
+| `refund_order(order_id, note=None, push_to_channel=True, dry_run=True)` | `ReturnsRefunds/GetRefundOptions` + `ReturnsRefunds/CreateRefund` + `ReturnsRefunds/ActionRefund` | Full refund of all items + postage on a **processed** order; `push_to_channel=True` calls ActionRefund to push to Shopify/Amazon/eBay; **spec-based, not yet live-tested** |
+| `refund_order_lines(order_id, lines, refund_postage=False, note=None, push_to_channel=True, dry_run=True)` | `ReturnsRefunds/GetRefundOptions` + `ReturnsRefunds/CreateRefund` + `ReturnsRefunds/ActionRefund` | Partial refund of specific lines; each entry needs `row_id` from `get_order` items; optional `amount` override and `quantity`; **spec-based, not yet live-tested** |
 | `get_stock_level(sku, location_id, include_empty_locations)` | `GetInventoryItem` → `Stock/GetStockLevel_Batch` | Zeros filtered by default; warns on virtual dropship duplicate rows |
 | `get_processed_orders(from_date, to_date, date_field, page, page_size)` | `ProcessedOrders/SearchProcessedOrders` | Flat response; min page_size 20; overflows context at 500 — use aggregation tools for wide ranges |
 | `get_locations()` | `Inventory/GetStockLocations` | Returns all physical + virtual locations |
@@ -100,7 +103,7 @@ Rule types seen in practice: `Orders` (fires on incoming orders), `Test` (sandbo
 | `Auth/AuthorizeByApplication` | POST | `{"ApplicationId","ApplicationSecret","Token"}` JSON body | Returns session `Token` + `Server` URL |
 | `OpenOrders/GetOrdersLowFidelity` | POST | `{"request":{"LocationId":"..."}}` | Primary open-orders list |
 | `OpenOrders/GetOpenOrdersDetails` | POST | `{"OrderIds":["pkOrderID-guid",...]}` **unwrapped** | Use GUID `pkOrderID`, not numeric |
-| `Orders/GetOrdersById` | POST | `{"pkOrderIds":["guid",...]}` **unwrapped** | Bulk order detail; response includes `CustomerInfo.Address.EmailAddress`, `CustomerInfo.Address.FullName`, `CustomerInfo.ChannelBuyerName` |
+| `Orders/GetOrdersById` | POST | `{"pkOrderIds":["guid",...]}` **unwrapped** | Bulk order detail; response includes `CustomerInfo.Address.EmailAddress`, `CustomerInfo.Address.FullName`, `CustomerInfo.ChannelBuyerName`; `OrderItem.RowId` = `OrderItemRowId` used by refund tools; `FulfilmentLocationId` used by `cancel_order` |
 | `Orders/GetOrderDetailsByNumOrderId` | GET | `?orderId=<numeric>` | Single order by human-facing number |
 | `Inventory/GetInventoryItem` | POST | `{"sku":"..."}` or `{"stockItemId":"..."}` **unwrapped** | Exact match only; returns `StockItemId` |
 | `Stock/GetStockLevel_Batch` | POST | `{"request":{"StockItemIds":["guid",...]}}` | Returns all location rows |
@@ -126,6 +129,10 @@ Rule types seen in practice: `Orders` (fires on incoming orders), `Test` (sandbo
 | `ImportExport/GetImport` | GET | `?id=<int>` | Config only — `ImportStatus` is null even for erroring imports |
 | `ImportExport/GetExport` | GET | `?id=<int>` | Config only |
 | `OpenOrders/SearchOrders` | POST | `{"request":{"LocationId":"...","SearchTerm":"...","IncludeProcessed":false}}` | Searches by ReferenceNum, ExternalReference, and related fields; response: `{"OpenOrders":[{"OrderIds":["guid",...]}],"ProcessedOrders":["guid",...]}` — open orders grouped in view objects, processed orders as flat GUID list; **confirmed in public OpenAPI spec, not yet live-tested on this tenant (May 2026)** |
+| `Orders/CancelOrder` | POST | `{"orderId":"guid","fulfilmentCenter":"guid","note":"..."}` **unwrapped** | Cancels an open order; `fulfilmentCenter` = `FulfilmentLocationId` from order detail; optional `refund` (double) field for attached refund amount; returns a string |
+| `ReturnsRefunds/GetRefundOptions` | POST | `{"request":{"OrderId":"guid"}}` | Returns `RefundOptions` including `CanRefund`, `CannotRefundReason` enum; **spec-based, not yet live-tested on this tenant** |
+| `ReturnsRefunds/CreateRefund` | POST | `{"request":{"OrderId":"guid","ChannelInitiated":false,"RefundLines":[{"OrderItemRowId":"guid","RefundedUnit":"Item","Amount":10.00,"FreeTextOrNote":"..."},{"RefundedUnit":"Shipping","Amount":5.00}]}}` | Creates a refund record; `OrderItemRowId` = `OrderItem.RowId` from `GetOrdersById`; omit `OrderItemRowId` for Shipping/Additional lines; returns `{RefundHeaderId, RefundReference, Status, CannotRefundReason, Errors}`; **spec-based, not yet live-tested** |
+| `ReturnsRefunds/ActionRefund` | POST | `{"request":{"RefundHeaderId":42,"OrderId":"guid"}}` | Pushes an approved refund to the sales channel (Shopify/Amazon/eBay); returns `{SuccessfullyActioned, Status, Errors}`; **spec-based, not yet live-tested** |
 | `Orders/GetOrderNotes` | GET | `?orderId=<guid>` | Returns a plain JSON array of `OrderNote` objects; **canonical fields per OpenAPI spec (confirmed May 2026)**: `OrderNoteId`, `OrderId`, `NoteDate`, `Internal` (bool, no `Is` prefix), `Note`, `CreatedBy`, `NoteTypeId`; **GUID required** — numeric IDs must be resolved first; **previously documented field names `pkOrderNoteId`/`IsInternal`/`NoteCreatedOn` were wrong** (fixed in issue #7) |
 | `Orders/AddOrdersNote` | POST | `{"OrderIds":["guid",...],"NoteText":"...","IsInternal":true,"IsProcessingNote":false}` **unwrapped** | Accepts a list of order GUIDs; works on both open and processed orders |
 | `ProcessedOrders/DeleteOrderNote` | POST | `{"pkOrderNoteId":"guid"}` **unwrapped** | Deletes a single note by its GUID; works on both open and processed orders; **no UpdateOrderNote endpoint exists** — use delete+add via `update_order_note` instead |

@@ -9,7 +9,7 @@ See README.md for setup instructions.
 """
 from __future__ import annotations
 
-__version__ = "1.8.1"
+__version__ = "1.9.0"
 
 import os
 import sys
@@ -271,10 +271,13 @@ def _format_order_detail(raw: dict) -> dict:
     address = customer.get("Address") or {}
     billing = customer.get("BillingAddress") or {}
     items = raw.get("Items") or []
+    totals_raw = raw.get("TotalsInfo") or {}
     return {
         "order_id": raw.get("OrderId"),
         "num_order_id": raw.get("NumOrderId"),
         "processed": raw.get("Processed"),
+        # FulfilmentLocationId is required by cancel_order (passed as fulfilmentCenter)
+        "fulfilment_location_id": raw.get("FulfilmentLocationId"),
         "received_date": general.get("ReceivedDate"),
         "status": general.get("Status"),
         "is_parked": general.get("IsParked"),
@@ -316,12 +319,26 @@ def _format_order_detail(raw: dict) -> dict:
             "phone": billing.get("PhoneNumber"),
             "email": billing.get("EmailAddress"),
         },
+        # Order totals — used by refund tools to compute refund amounts
+        "totals": {
+            "subtotal":  totals_raw.get("Subtotal"),
+            "postage":   totals_raw.get("PostageCost"),
+            "tax":       totals_raw.get("Tax"),
+            "total":     totals_raw.get("TotalCharge"),
+            "currency":  totals_raw.get("Currency"),
+            "discount":  totals_raw.get("TotalDiscount"),
+        },
         "items": [
             {
-                "StockItemId": i.get("StockItemId"),
-                "SKU": i.get("SKU"),
-                "Title": i.get("Title"),
-                "Quantity": i.get("Quantity"),
+                "StockItemId":    i.get("StockItemId"),
+                "SKU":            i.get("SKU"),
+                "Title":          i.get("Title"),
+                "Quantity":       i.get("Quantity"),
+                # row_id is the OrderItemRowId required by refund_order_lines
+                "row_id":         i.get("RowId"),
+                "price_per_unit": i.get("PricePerUnit"),
+                # cost_inc_tax is the total line cost including tax (all units)
+                "cost_inc_tax":   i.get("CostIncTax"),
             }
             for i in items
         ],
@@ -1514,6 +1531,482 @@ def find_orders_by_reference(
         "match_count": len(orders),
         "orders": orders,
     }
+
+
+# ---------- Order cancellation and refunds ----------
+
+def _get_refund_options(order_guid: str) -> dict:
+    """Call ReturnsRefunds/GetRefundOptions for the given order GUID."""
+    return call_linnworks(
+        "ReturnsRefunds/GetRefundOptions",
+        {"request": {"OrderId": order_guid}},
+    )
+
+
+@mcp.tool()
+def cancel_order(
+    order_id: str,
+    note: Optional[str] = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Cancel an open (unprocessed) Linnworks order.
+
+    Reads the order first to confirm it is open, then cancels it via
+    Orders/CancelOrder. Only open orders can be cancelled this way — if the
+    order is already processed (dispatched), this tool will refuse.
+
+    Note: The Linnworks CancelOrder API does not expose a return_to_stock flag.
+    Stock management on cancellation is controlled by your Linnworks workspace
+    settings.
+
+    IMPORTANT: dry_run defaults to True. Set dry_run=False only when you are
+    sure the cancellation is correct — confirm with the user before doing so.
+    Cancellations cannot be reversed via the API.
+
+    Args:
+        order_id: The order to cancel. Accepts a GUID pkOrderID or a numeric
+            order number (e.g. "596475").
+        note: Optional note to attach to the cancellation.
+        dry_run: If True (default), shows what would be cancelled without
+            actually cancelling. Set to False to execute.
+
+    Returns:
+        A dict with:
+          - dry_run:       whether this was a dry run
+          - order_id:      the GUID
+          - num_order_id:  the numeric order number
+          - customer_name: customer name
+          - items:         list of items in the order
+          - status:        "would_cancel" (dry run) or "cancelled"
+    """
+    try:
+        guid, raw = _resolve_order_guid(order_id)
+    except RuntimeError as exc:
+        return {"error": str(exc)}
+
+    fmt = _format_order_detail(raw)
+
+    if fmt.get("processed"):
+        return {
+            "error": (
+                "This order is already processed (dispatched). "
+                "Only open orders can be cancelled via this tool."
+            ),
+            "order_id": fmt.get("order_id"),
+            "num_order_id": fmt.get("num_order_id"),
+        }
+
+    summary = {
+        "order_id":           fmt.get("order_id"),
+        "num_order_id":       fmt.get("num_order_id"),
+        "customer_name":      fmt.get("customer_name"),
+        "customer_email":     fmt.get("customer_email"),
+        "reference_num":      fmt.get("reference_num"),
+        "external_reference": fmt.get("external_reference"),
+        "source":             fmt.get("source"),
+        "items":              fmt.get("items", []),
+        "note":               note,
+    }
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "status": "would_cancel",
+            "message": "Set dry_run=False to execute this cancellation.",
+            **summary,
+        }
+
+    # Live cancellation
+    fulfilment_location_id = (
+        raw.get("FulfilmentLocationId") or DEFAULT_LOCATION_ID
+    )
+    payload = {
+        "orderId": guid,
+        "fulfilmentCenter": fulfilment_location_id,
+        "note": note or "",
+    }
+    result = call_linnworks("Orders/CancelOrder", payload)
+
+    return {
+        "dry_run": False,
+        "status": "cancelled",
+        "linnworks_response": result,
+        **summary,
+    }
+
+
+@mcp.tool()
+def refund_order(
+    order_id: str,
+    note: Optional[str] = None,
+    push_to_channel: bool = True,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Issue a full refund for a processed Linnworks order.
+
+    Refunds all items and postage. The order must already be processed
+    (dispatched). For open orders, use cancel_order instead.
+
+    Flow when dry_run=False:
+      1. Fetches the order to get items, totals, and OrderItemRowIds.
+      2. Calls GetRefundOptions to confirm the order can be refunded.
+      3. Creates a refund record via ReturnsRefunds/CreateRefund.
+      4. If push_to_channel=True, actions the refund via ReturnsRefunds/ActionRefund,
+         which pushes the refund to the sales channel (Shopify, Amazon, eBay, etc.).
+
+    NOTE: The refund endpoints (ReturnsRefunds/CreateRefund, ActionRefund) are
+    implemented from the Linnworks OpenAPI spec but have not been live-tested
+    against this tenant. Run with dry_run=True first to confirm order data,
+    then dry_run=False when ready. Any Linnworks API errors are surfaced verbatim.
+
+    IMPORTANT: dry_run defaults to True. Refunds move real customer money —
+    always confirm the order and refund amounts before setting dry_run=False.
+
+    Args:
+        order_id: Order to refund. Accepts a GUID pkOrderID or numeric order number.
+        note: Optional note/reason to include with the refund.
+        push_to_channel: If True (default), also submits the refund to the sales
+            channel (Shopify, Amazon, etc.). If False, records the refund in
+            Linnworks only.
+        dry_run: If True (default), shows the refund that would be created
+            without creating it. Set to False to execute.
+
+    Returns:
+        A dict with order details, per-line refund amounts, total refund, and
+        if live: the refund header ID, status, and action result.
+    """
+    try:
+        guid, raw = _resolve_order_guid(order_id)
+    except RuntimeError as exc:
+        return {"error": str(exc)}
+
+    fmt = _format_order_detail(raw)
+
+    if not fmt.get("processed"):
+        return {
+            "error": (
+                "This order is not yet processed. "
+                "Use cancel_order for open (unprocessed) orders."
+            ),
+            "order_id": fmt.get("order_id"),
+            "num_order_id": fmt.get("num_order_id"),
+        }
+
+    # Build refund lines for every item
+    refund_lines: list[dict] = []
+    for item in (raw.get("Items") or []):
+        row_id = item.get("RowId")
+        if not row_id:
+            continue
+        line: dict = {
+            "OrderItemRowId": row_id,
+            "RefundedUnit": "Item",
+            "Amount": float(item.get("CostIncTax") or 0.0),
+        }
+        if note:
+            line["FreeTextOrNote"] = note
+        refund_lines.append(line)
+
+    # Add shipping line if postage > 0
+    totals_raw = raw.get("TotalsInfo") or {}
+    postage = float(totals_raw.get("PostageCost") or 0.0)
+    if postage > 0:
+        shipping_line: dict = {"RefundedUnit": "Shipping", "Amount": postage}
+        if note:
+            shipping_line["FreeTextOrNote"] = note
+        refund_lines.append(shipping_line)
+
+    total_refund = sum(rl["Amount"] for rl in refund_lines)
+    currency = totals_raw.get("Currency")
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "order_id": fmt.get("order_id"),
+            "num_order_id": fmt.get("num_order_id"),
+            "customer_name": fmt.get("customer_name"),
+            "customer_email": fmt.get("customer_email"),
+            "reference_num": fmt.get("reference_num"),
+            "external_reference": fmt.get("external_reference"),
+            "total_refund": total_refund,
+            "currency": currency,
+            "push_to_channel": push_to_channel,
+            "refund_lines": [
+                {
+                    "unit":              rl.get("RefundedUnit"),
+                    "amount":            rl.get("Amount"),
+                    "order_item_row_id": rl.get("OrderItemRowId"),
+                }
+                for rl in refund_lines
+            ],
+            "note": note,
+            "message": "Set dry_run=False to execute this full refund.",
+        }
+
+    # Check refund eligibility
+    options_resp = _get_refund_options(guid)
+    options = options_resp.get("RefundOptions") or {}
+    cannot_reason = options.get("CannotRefundReason") or "None"
+    if cannot_reason != "None":
+        return {
+            "error": f"Linnworks cannot refund this order: {cannot_reason}",
+            "order_id": guid,
+            "num_order_id": fmt.get("num_order_id"),
+        }
+
+    # Create refund
+    create_resp = call_linnworks(
+        "ReturnsRefunds/CreateRefund",
+        {
+            "request": {
+                "OrderId": guid,
+                "ChannelInitiated": False,
+                "RefundLines": refund_lines,
+            }
+        },
+    )
+    refund_header_id = create_resp.get("RefundHeaderId")
+    create_errors = create_resp.get("Errors") or []
+    cannot = create_resp.get("CannotRefundReason") or "None"
+
+    if cannot != "None" or create_errors:
+        return {
+            "error": (
+                f"Refund creation failed. "
+                f"Reason: {cannot}. Errors: {create_errors}"
+            ),
+            "order_id": guid,
+            "create_response": create_resp,
+        }
+
+    result: dict = {
+        "dry_run": False,
+        "order_id": guid,
+        "num_order_id": fmt.get("num_order_id"),
+        "customer_name": fmt.get("customer_name"),
+        "refund_header_id": refund_header_id,
+        "refund_reference": create_resp.get("RefundReference"),
+        "total_refund": total_refund,
+        "currency": currency,
+        "status": (create_resp.get("Status") or {}),
+        "push_to_channel": push_to_channel,
+        "actioned": False,
+    }
+
+    # Action refund (push to channel)
+    if push_to_channel and refund_header_id is not None:
+        action_resp = call_linnworks(
+            "ReturnsRefunds/ActionRefund",
+            {"request": {"RefundHeaderId": refund_header_id, "OrderId": guid}},
+        )
+        result["actioned"] = action_resp.get("SuccessfullyActioned", False)
+        result["action_status"] = (action_resp.get("Status") or {})
+        result["action_errors"] = action_resp.get("Errors") or []
+
+    return result
+
+
+@mcp.tool()
+def refund_order_lines(
+    order_id: str,
+    lines: list,
+    refund_postage: bool = False,
+    note: Optional[str] = None,
+    push_to_channel: bool = True,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Issue a partial refund for specific line items on a processed Linnworks order.
+
+    Each entry in `lines` must include `row_id` (the OrderItemRowId from get_order's
+    items list). Optionally supply `amount` to override the full line cost, or
+    `quantity` when the refund is part of a return.
+
+    Use get_order() first to see the order's items including their `row_id` values,
+    then call this tool with only the lines you want to refund.
+
+    NOTE: The refund endpoints (ReturnsRefunds/CreateRefund, ActionRefund) are
+    implemented from the Linnworks OpenAPI spec but have not been live-tested
+    against this tenant. Run dry_run=True first to verify, then dry_run=False.
+
+    IMPORTANT: dry_run defaults to True. Refunds move real customer money.
+
+    Args:
+        order_id: Order to partially refund. Accepts GUID or numeric order number.
+        lines: List of dicts, each with:
+            - row_id (str, required): OrderItemRowId from get_order items.
+            - amount (float, optional): Amount to refund for this line. Defaults
+              to the full cost_inc_tax of the matched item.
+            - quantity (int, optional): Quantity being refunded.
+        refund_postage: If True, also refund the postage/shipping cost.
+        note: Optional note/reason to include with the refund.
+        push_to_channel: If True (default), submits the refund to the sales
+            channel. If False, records in Linnworks only.
+        dry_run: If True (default), shows what would be refunded without doing it.
+
+    Returns:
+        A dict with the refund summary and, if live, the result from Linnworks.
+    """
+    try:
+        guid, raw = _resolve_order_guid(order_id)
+    except RuntimeError as exc:
+        return {"error": str(exc)}
+
+    fmt = _format_order_detail(raw)
+
+    if not fmt.get("processed"):
+        return {
+            "error": (
+                "This order is not yet processed. "
+                "Use cancel_order for open (unprocessed) orders."
+            ),
+            "order_id": fmt.get("order_id"),
+            "num_order_id": fmt.get("num_order_id"),
+        }
+
+    # Build lookup of RowId → raw item for amount defaults
+    item_by_row_id: dict[str, dict] = {
+        i["RowId"]: i
+        for i in (raw.get("Items") or [])
+        if i.get("RowId")
+    }
+
+    refund_lines: list[dict] = []
+    unknown_row_ids: list[str] = []
+
+    for ln in (lines or []):
+        row_id = ln.get("row_id")
+        if not row_id:
+            return {"error": "Each entry in 'lines' must have a 'row_id' field."}
+        item = item_by_row_id.get(row_id)
+        if item is None:
+            unknown_row_ids.append(row_id)
+            continue
+        amount = float(ln["amount"]) if ln.get("amount") is not None else float(
+            item.get("CostIncTax") or 0.0
+        )
+        rl: dict = {
+            "OrderItemRowId": row_id,
+            "RefundedUnit": "Item",
+            "Amount": amount,
+        }
+        if ln.get("quantity") is not None:
+            rl["Quantity"] = int(ln["quantity"])
+        if note:
+            rl["FreeTextOrNote"] = note
+        refund_lines.append(rl)
+
+    if unknown_row_ids:
+        return {
+            "error": (
+                f"row_id(s) not found in order items: {unknown_row_ids}. "
+                "Use get_order() to list valid row_ids for this order."
+            ),
+            "order_id": guid,
+        }
+
+    # Optionally add shipping line
+    totals_raw = raw.get("TotalsInfo") or {}
+    postage = float(totals_raw.get("PostageCost") or 0.0)
+    if refund_postage and postage > 0:
+        shipping_line: dict = {"RefundedUnit": "Shipping", "Amount": postage}
+        if note:
+            shipping_line["FreeTextOrNote"] = note
+        refund_lines.append(shipping_line)
+
+    if not refund_lines:
+        return {"error": "No valid refund lines to process."}
+
+    total_refund = sum(rl["Amount"] for rl in refund_lines)
+    currency = totals_raw.get("Currency")
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "order_id": fmt.get("order_id"),
+            "num_order_id": fmt.get("num_order_id"),
+            "customer_name": fmt.get("customer_name"),
+            "customer_email": fmt.get("customer_email"),
+            "reference_num": fmt.get("reference_num"),
+            "external_reference": fmt.get("external_reference"),
+            "total_refund": total_refund,
+            "currency": currency,
+            "push_to_channel": push_to_channel,
+            "refund_lines": [
+                {
+                    "unit":              rl.get("RefundedUnit"),
+                    "amount":            rl.get("Amount"),
+                    "order_item_row_id": rl.get("OrderItemRowId"),
+                    "quantity":          rl.get("Quantity"),
+                }
+                for rl in refund_lines
+            ],
+            "note": note,
+            "message": "Set dry_run=False to execute this partial refund.",
+        }
+
+    # Check refund eligibility
+    options_resp = _get_refund_options(guid)
+    options = options_resp.get("RefundOptions") or {}
+    cannot_reason = options.get("CannotRefundReason") or "None"
+    if cannot_reason != "None":
+        return {
+            "error": f"Linnworks cannot refund this order: {cannot_reason}",
+            "order_id": guid,
+            "num_order_id": fmt.get("num_order_id"),
+        }
+
+    # Create refund
+    create_resp = call_linnworks(
+        "ReturnsRefunds/CreateRefund",
+        {
+            "request": {
+                "OrderId": guid,
+                "ChannelInitiated": False,
+                "RefundLines": refund_lines,
+            }
+        },
+    )
+    refund_header_id = create_resp.get("RefundHeaderId")
+    create_errors = create_resp.get("Errors") or []
+    cannot = create_resp.get("CannotRefundReason") or "None"
+
+    if cannot != "None" or create_errors:
+        return {
+            "error": (
+                f"Refund creation failed. "
+                f"Reason: {cannot}. Errors: {create_errors}"
+            ),
+            "order_id": guid,
+            "create_response": create_resp,
+        }
+
+    result: dict = {
+        "dry_run": False,
+        "order_id": guid,
+        "num_order_id": fmt.get("num_order_id"),
+        "customer_name": fmt.get("customer_name"),
+        "refund_header_id": refund_header_id,
+        "refund_reference": create_resp.get("RefundReference"),
+        "total_refund": total_refund,
+        "currency": currency,
+        "status": (create_resp.get("Status") or {}),
+        "push_to_channel": push_to_channel,
+        "actioned": False,
+    }
+
+    if push_to_channel and refund_header_id is not None:
+        action_resp = call_linnworks(
+            "ReturnsRefunds/ActionRefund",
+            {"request": {"RefundHeaderId": refund_header_id, "OrderId": guid}},
+        )
+        result["actioned"] = action_resp.get("SuccessfullyActioned", False)
+        result["action_status"] = (action_resp.get("Status") or {})
+        result["action_errors"] = action_resp.get("Errors") or []
+
+    return result
 
 
 @mcp.tool()
