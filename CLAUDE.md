@@ -131,12 +131,31 @@ Rule types seen in practice: `Orders` (fires on incoming orders), `Test` (sandbo
 | `ImportExport/GetExport` | GET | `?id=<int>` | Config only |
 | `OpenOrders/SearchOrders` | POST | `{"request":{"LocationId":"...","SearchTerm":"...","IncludeProcessed":false}}` | Searches by ReferenceNum, ExternalReference, and related fields; response: `{"OpenOrders":[{"OrderIds":["guid",...]}],"ProcessedOrders":["guid",...]}` — open orders grouped in view objects, processed orders as flat GUID list; **confirmed in public OpenAPI spec, not yet live-tested on this tenant (May 2026)** |
 | `Orders/CancelOrder` | POST | `{"orderId":"guid","fulfilmentCenter":"guid","note":"..."}` **unwrapped** | Cancels an open order; `fulfilmentCenter` = `FulfilmentLocationId` from order detail; optional `refund` (double) field for attached refund amount; returns a string |
-| `ReturnsRefunds/GetRefundOptions` | POST | `{"request":{"OrderId":"guid"}}` | Returns `RefundOptions` including `CanRefund`, `CannotRefundReason` enum; **spec-based, not yet live-tested on this tenant** |
-| `ReturnsRefunds/CreateRefund` | POST | `{"request":{"OrderId":"guid","ChannelInitiated":false,"RefundLines":[{"OrderItemRowId":"guid","RefundedUnit":"Item","Amount":10.00,"FreeTextOrNote":"..."},{"RefundedUnit":"Shipping","Amount":5.00}]}}` | Creates a refund record; `OrderItemRowId` = `OrderItem.RowId` from `GetOrdersById`; omit `OrderItemRowId` for Shipping/Additional lines; returns `{RefundHeaderId, RefundReference, Status, CannotRefundReason, Errors}`; **spec-based, not yet live-tested** |
-| `ReturnsRefunds/ActionRefund` | POST | `{"request":{"RefundHeaderId":42,"OrderId":"guid"}}` | Pushes an approved refund to the sales channel (Shopify/Amazon/eBay); returns `{SuccessfullyActioned, Status, Errors}`; **spec-based, not yet live-tested** |
+| `ReturnsRefunds/GetRefundOptions` | POST | `{"request":{"OrderId":"guid"}}` | Returns `RefundOptions` including `CanRefund`, `CannotRefundReason` enum; use as pre-flight check before CreateRefund; **spec-based, not yet live-tested on this tenant** |
+| `ReturnsRefunds/GetRefundHeadersByOrderId` | POST | `{"request":{"OrderId":"guid"}}` | Returns all existing refund headers for an order — useful to audit whether an order has already been (partially) refunded before calling CreateRefund; **spec-based, not yet live-tested** |
+| `ReturnsRefunds/CreateRefund` | POST | `{"request":{"OrderId":"guid","ChannelInitiated":false,"RefundLines":[{"OrderItemRowId":"guid","RefundedUnit":"Item","Amount":10.00,"FreeTextOrNote":"..."},{"RefundedUnit":"Shipping","Amount":5.00}]}}` | Creates a refund record; `OrderItemRowId` = `OrderItem.RowId` from `GetOrdersById`; omit `OrderItemRowId` for Shipping/Additional lines; `RefundedUnit` enum: `Item`, `Shipping`, `Service`, `Additional`; returns `{RefundHeaderId, RefundReference, Status, CannotRefundReason, Errors}`; **spec-based, not yet live-tested** |
+| `ReturnsRefunds/ActionRefund` | POST | `{"request":{"RefundHeaderId":42,"OrderId":"guid"}}` | Pushes an approved refund to the sales channel (Shopify/Amazon/eBay); returns `{SuccessfullyActioned, Status, Errors}`; note: `SuccessfullyActioned` can be true while individual `Errors` still exist — check both; **spec-based, not yet live-tested** |
 | `Orders/GetOrderNotes` | GET | `?orderId=<guid>` | Returns a plain JSON array of `OrderNote` objects; **canonical fields per OpenAPI spec (confirmed May 2026)**: `OrderNoteId`, `OrderId`, `NoteDate`, `Internal` (bool, no `Is` prefix), `Note`, `CreatedBy`, `NoteTypeId`; **GUID required** — numeric IDs must be resolved first; **previously documented field names `pkOrderNoteId`/`IsInternal`/`NoteCreatedOn` were wrong** (fixed in issue #7) |
 | `Orders/AddOrdersNote` | POST | `{"OrderIds":["guid",...],"NoteText":"...","IsInternal":true,"IsProcessingNote":false}` **unwrapped** | Accepts a list of order GUIDs; works on both open and processed orders |
 | `ProcessedOrders/DeleteOrderNote` | POST | `{"pkOrderNoteId":"guid"}` **unwrapped** | Deletes a single note by its GUID; works on both open and processed orders; **no UpdateOrderNote endpoint exists** — use delete+add via `update_order_note` instead |
+
+---
+
+## ReturnsRefunds — `CannotRefundReason` enum reference
+
+Both `GetRefundOptions` and `CreateRefund` return a `CannotRefundReason` field. `"None"` means no problem. Any other value means the refund cannot proceed:
+
+| Value | Meaning | Action |
+|---|---|---|
+| `None` | No problem — refund can proceed | Proceed |
+| `OpenOrderInLinnworks` | Order isn't processed yet | Use `cancel_order` instead |
+| `OrderIsFullyRefundedInLinnworks` | Already fully refunded | Check with `GetRefundHeadersByOrderId` |
+| `NotImplemented` | Channel doesn't support API-initiated refunds | Refund manually in the channel |
+| `DisabledInConfig` | Refunds disabled in Linnworks workspace settings | Check workspace settings |
+| `MissingOrderInLinnworks` | Order GUID doesn't exist in Linnworks | Verify the GUID |
+| `Other` | Unclassified error | Surface the `Errors[]` array for details |
+
+`PostSaleStatus.StatusHeader` enum (returned on refund lines): `OPEN`, `PENDING`, `PROCESSED`, `ERROR`, `ERROR_ACKED`.
 
 ---
 
@@ -260,7 +279,7 @@ gh issue edit N --repo josephgurney/linnworks-mcp --add-label "built" --remove-l
 ### Important notes for CLI builds
 - The Linnworks MCP is **not connected** in the CLI session — you cannot call Linnworks tools directly to test. Use `--check-auth` to verify the server loads, and note in your commit that live testing should be done via Claude Desktop.
 - Do not ask the user for confirmation between steps — execute the full workflow and report back at the end.
-- If an endpoint is unknown, check `https://apidocs.linnworks.net` or `https://raw.githubusercontent.com/LinnSystems/PublicApiSpecs/master/1.0/` before guessing.
+- If an endpoint is unknown, check `https://apidocs.linnworks.net` or fetch the relevant spec file from `https://raw.githubusercontent.com/LinnSystems/PublicApiSpecs/master/1.0/<name>.json` before guessing. Key spec files: `orders.json`, `openorders.json`, `returnsrefunds.json`, `purchaseorder.json`, `inventory.json`, `stock.json`, `processedorders.json`, `importexport.json`, `rulesengine.json`.
 
 ---
 
