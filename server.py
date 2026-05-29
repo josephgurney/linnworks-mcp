@@ -9,12 +9,12 @@ See README.md for setup instructions.
 """
 from __future__ import annotations
 
-__version__ = "1.9.0"
+__version__ = "1.9.1"
 
 import os
 import sys
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 import re
 
@@ -1297,6 +1297,150 @@ def delete_order_note(
         "deleted_note": note_text,
         "note_count_after": len(raw_after),
     }
+
+
+@mcp.tool()
+def delete_order_notes_by_text(
+    order_id: str,
+    text: str,
+    match: Literal["exact", "contains", "starts_with"] = "exact",
+    case_sensitive: bool = False,
+    max_to_delete: Optional[int] = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Delete order notes that match a text pattern, without needing to know
+    their note_id in advance.
+
+    Fetches all notes on the order, filters by the search text and match mode,
+    then deletes each match. Useful for removing test notes, boilerplate, or
+    notes identified by their content rather than an opaque GUID.
+
+    Zero matches is not an error — returns success with deleted=0.
+
+    The max_to_delete guard prevents accidental bulk deletion: if more notes
+    match than the limit, the tool refuses and lists the matches so you can
+    re-scope the search.
+
+    IMPORTANT: dry_run defaults to True. Dry-run output lists every note that
+    would be deleted — review it carefully before setting dry_run=False.
+
+    Args:
+        order_id: GUID pkOrderID or numeric order number (e.g. "596475").
+        text: Text to search for in note content.
+        match: How to match the text against each note:
+            - "exact" (default): note text must equal search text exactly
+            - "contains": note text must contain the search text
+            - "starts_with": note text must start with the search text
+        case_sensitive: If False (default), comparison is case-insensitive.
+        max_to_delete: Safety cap. If more than this many notes match, refuse
+            and return the matches so the caller can re-scope. None = no cap.
+        dry_run: If True (default), lists what would be deleted without
+            deleting anything. Set to False to execute.
+
+    Returns:
+        A dict with:
+          - dry_run:         whether this was a dry run
+          - success:         True (even on zero matches)
+          - matched_count:   number of notes that matched
+          - deleted:         number actually deleted (0 on dry run)
+          - matched:         list of matched notes (note_id, note, created_on, created_by)
+          - note_count_after: remaining notes after deletion (live run only)
+    """
+    order_id = order_id.strip()
+
+    # Resolve to GUID
+    if _UUID_RE.match(order_id):
+        order_guid = order_id
+    else:
+        try:
+            order_guid, _ = _resolve_order_guid(order_id)
+        except RuntimeError as exc:
+            return {"error": str(exc)}
+
+    # Fetch all notes on the order
+    raw_notes = call_linnworks_get("Orders/GetOrderNotes", params={"orderId": order_guid})
+    if not isinstance(raw_notes, list):
+        raw_notes = raw_notes.get("Notes") or [] if isinstance(raw_notes, dict) else []
+
+    # Build comparison strings
+    needle = text if case_sensitive else text.lower()
+
+    def _matches(raw_note: dict) -> bool:
+        note_text = raw_note.get("Note") or raw_note.get("NoteText") or ""
+        haystack = note_text if case_sensitive else note_text.lower()
+        if match == "exact":
+            return haystack == needle
+        elif match == "contains":
+            return needle in haystack
+        elif match == "starts_with":
+            return haystack.startswith(needle)
+        return False
+
+    matched_raw = [n for n in raw_notes if _matches(n)]
+
+    # Format matched notes for output
+    matched_formatted = [_format_order_note(n) for n in matched_raw]
+
+    # max_to_delete guard
+    if max_to_delete is not None and len(matched_raw) > max_to_delete:
+        return {
+            "success": False,
+            "error": (
+                f"{len(matched_raw)} notes matched but max_to_delete={max_to_delete}. "
+                "Re-scope your search or increase max_to_delete."
+            ),
+            "matched_count": len(matched_raw),
+            "matched": matched_formatted,
+        }
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "success": True,
+            "matched_count": len(matched_raw),
+            "deleted": 0,
+            "matched": matched_formatted,
+            "message": (
+                "No changes written. Set dry_run=False to delete these notes."
+                if matched_raw
+                else "No notes matched. Nothing to delete."
+            ),
+        }
+
+    # Live deletion — delete each matched note
+    deleted = 0
+    errors: list[str] = []
+    for raw_note in matched_raw:
+        note_id = _note_id_of(raw_note)
+        if not note_id:
+            errors.append("Skipped a note with no note_id.")
+            continue
+        try:
+            call_linnworks(
+                "ProcessedOrders/DeleteOrderNote",
+                {"pkOrderNoteId": note_id},
+            )
+            deleted += 1
+        except Exception as exc:
+            errors.append(f"Failed to delete note {note_id}: {exc}")
+
+    # Read back to confirm remaining count
+    raw_after = call_linnworks_get("Orders/GetOrderNotes", params={"orderId": order_guid})
+    if not isinstance(raw_after, list):
+        raw_after = raw_after.get("Notes") or [] if isinstance(raw_after, dict) else []
+
+    result: dict = {
+        "dry_run": False,
+        "success": deleted == len(matched_raw),
+        "matched_count": len(matched_raw),
+        "deleted": deleted,
+        "matched": matched_formatted,
+        "note_count_after": len(raw_after),
+    }
+    if errors:
+        result["errors"] = errors
+    return result
 
 
 @mcp.tool()

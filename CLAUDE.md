@@ -1,6 +1,6 @@
 # Linnworks MCP Server — Claude context
 
-**Current version: 1.9.0** — 41 tools. See `pyproject.toml` for full metadata.
+**Current version: 1.9.1** — 42 tools. See `pyproject.toml` for full metadata.
 
 A local stdio MCP server that exposes Linnworks data to Claude Desktop. This is **Phase 1** of a two-phase plan:
 
@@ -39,6 +39,7 @@ A local stdio MCP server that exposes Linnworks data to Claude Desktop. This is 
 | `add_order_note(order_id, note, internal=True, dry_run=True)` | `Orders/AddOrdersNote` | Add a note to any order; internal=True by default (staff-only); dry_run default; works on open and processed orders |
 | `update_order_note(order_id, note_id, note, internal=None, dry_run=True)` | `ProcessedOrders/DeleteOrderNote` + `Orders/AddOrdersNote` | No dedicated update endpoint — deletes old note then adds replacement; preserves internal flag if not supplied; before/after diff |
 | `delete_order_note(order_id, note_id, dry_run=True)` | `ProcessedOrders/DeleteOrderNote` | Permanently removes a note; read-before-write confirms existence and captures text; dry_run default |
+| `delete_order_notes_by_text(order_id, text, match, case_sensitive, max_to_delete, dry_run=True)` | `Orders/GetOrderNotes` + `ProcessedOrders/DeleteOrderNote` | Delete notes by content match — no note_id needed; match modes: exact (default), contains, starts_with; case_insensitive by default; max_to_delete guard prevents accidental bulk deletion; zero matches = success |
 | `find_open_orders_for_sku(sku, location_id)` | `GetOrdersLowFidelity` + `GetOrdersById` | Finds all open orders containing a SKU; searches composite children too; enriches with customer name + email; use for "who's waiting on this item?" |
 | `find_orders_by_reference(reference, include_processed=False, location_id)` | `OpenOrders/SearchOrders` + `GetOrdersById` | Look up orders by channel reference (Shopify "#11177274", Amazon "202-...", eBay etc.); strips leading #; returns customer name + email + external_reference; include_processed=True extends to dispatched orders; **SearchOrders not yet live-tested on this tenant (May 2026)** |
 | `cancel_order(order_id, note=None, dry_run=True)` | `Orders/CancelOrder` | Cancel an open (unprocessed) order; refuses if already processed; dry_run shows items that would be cancelled; `fulfilmentCenter` taken from `FulfilmentLocationId` on the order; no `return_to_stock` param in API — controlled by workspace settings |
