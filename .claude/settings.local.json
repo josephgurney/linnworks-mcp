@@ -1,5 +1,43 @@
 {
   "permissions": {
-    "allow": []
+    "allow": [
+      "Bash(gh issue *)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('server.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('server.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python3 server.py --check-auth)",
+      "Bash(.venv/bin/python3 server.py --check-auth)",
+      "Bash(.venv/bin/python3 -c \"import ast; ast.parse\\(open\\('server.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(git add *)",
+      "Bash(git commit -m 'Add add/update/remove purchase order item tools \\(closes #2\\) *)",
+      "Bash(git push *)",
+      "Bash(git commit -m 'Update CLAUDE.md: document 3 new PO item tools \\(v1.4.0\\) *)",
+      "WebSearch",
+      "WebFetch(domain:apidocs.linnworks.net)",
+      "Bash(git commit -m 'Add set_order_address tool + expose delivery_address in get_order \\(closes #3\\) *)",
+      "Skill(schedule)",
+      "Skill(schedule:*)",
+      "Bash(.venv/bin/python3 -m pytest tests/test_update_order_shipping_address.py -v)",
+      "Bash(.venv/bin/pip install *)",
+      "Bash(python3 -c \"import json,sys; print\\(json.load\\(sys.stdin\\)['body']\\)\")",
+      "Bash(python -m pytest tests/test_order_notes.py -v)",
+      "Bash(python3 -m pytest tests/test_order_notes.py -v)",
+      "Bash(pytest --version)",
+      "Read(//usr/local/bin/**)",
+      "Read(//usr/**)",
+      "Bash(.venv/bin/python3 -m pytest tests/test_order_notes.py -v)",
+      "Bash(.venv/bin/python3 -m pytest tests/ -v)",
+      "Read(//Users/Joseph/Documents/Linnworks Apps/**)",
+      "Bash(curl -s https://raw.githubusercontent.com/LinnSystems/PublicApiSpecs/master/1.0/openorders.json)",
+      "Bash(python3 -m json.tool)",
+      "Bash(.venv/bin/python3 -m pytest tests/ -q)",
+      "Bash(curl -s \"https://raw.githubusercontent.com/LinnSystems/PublicApiSpecs/master/1.0/processedorders.json\")",
+      "Bash(python3 -c ' *)",
+      "Bash(curl -s \"https://raw.githubusercontent.com/LinnSystems/PublicApiSpecs/master/1.0/orders.json\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/LinnSystems/PublicApiSpecs/master/1.0/\")",
+      "Bash(curl -s \"https://api.github.com/repos/LinnSystems/PublicApiSpecs/contents/1.0\")",
+      "Bash(curl -Ls \"https://api.github.com/repos/LinnSystems/PublicApiSpecs/contents/1.0\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/LinnSystems/PublicApiSpecs/master/1.0/returnsrefunds.json\")"
+    ]
   }
 }
