@@ -26,6 +26,70 @@ A local stdio MCP server that exposes Linnworks data to Claude Desktop. This is 
 
 ---
 
+## Write-safety framework
+
+Every bulk write tool (any tool that takes a list of items) must use two shared helpers defined near the top of `server.py`:
+
+### `_write_guard(operation, items, confirmed_count, dry_run, threshold=None)`
+
+Staged-manifest gate. Call this at the top of any write tool before touching the Linnworks API.
+
+- **Batch ≤ threshold** → returns `None`; standard `dry_run` logic applies.
+- **Batch > threshold, `confirmed_count` is None** → returns a blocking dict with `staged=True`. The caller should build the per-item manifest preview and merge it into this dict before returning. No writes happen.
+- **Batch > threshold, `confirmed_count` ≠ `len(items)`** → returns an error dict. Prevents injection from bypassing staging by guessing a wrong count.
+- **Batch > threshold, `confirmed_count` == `len(items)`** → returns `None`; execution proceeds.
+
+The `confirmed_count` echo-back is the key protection: an injected instruction can't predict the exact count without first seeing the manifest.
+
+Thresholds (defined in `WRITE_THRESHOLDS`):
+
+| Operation | Threshold | Reason |
+|---|---|---|
+| `set_stock_levels` | 25 | Immediate channel availability impact |
+| `set_inventory_item_prices` | 25 | Immediate channel price impact |
+| `create_or_update_inventory_item` | 50 | Channel sync is async |
+| `set_extended_properties` | 50 | Metadata, lower blast radius |
+| `set_inventory_item_descriptions` | 50 | Content, lower blast radius |
+| `add_inventory_item_images` | 100 | Additive only, no overwrites |
+| `default` | 25 | Fallback for unlisted operations |
+
+There is **no hard cap** — any batch size works once confirmed. The threshold is a staging gate, not a refusal.
+
+### `_check_injection(field_name, value)`
+
+Last-resort prompt injection tripwire. Call this on every free-text write parameter (titles, descriptions, notes, extended property values) before forwarding to Linnworks.
+
+Raises `ValueError` naming the offending field if the value matches a known injection signature (e.g. `"ignore previous instructions"`, `"system:"` prefix, `[INST]` tags, `<|im_start|>` markers, `"act as"`, `"forget everything"`, etc.).
+
+**This is not a comprehensive defence** — it fails loudly on obvious attacks and passes everything else. The primary safety nets remain `dry_run=True` default, read-before-write, and per-item result reporting.
+
+### Usage pattern for a bulk write tool
+
+```python
+@mcp.tool()
+def set_stock_levels(updates: list[dict], confirmed_count: int | None = None, dry_run: bool = True) -> dict:
+    # 1. Injection check on all text fields
+    for u in updates:
+        _check_injection("note", u.get("note", ""))
+
+    # 2. Build manifest (always — needed for both staging and dry_run)
+    manifest = [_preview_stock_change(u) for u in updates]
+
+    # 3. Write guard — may return a blocking staged dict
+    guard = _write_guard("set_stock_levels", updates, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, "manifest": manifest}  # merge in the preview
+
+    if dry_run:
+        return {"dry_run": True, "item_count": len(updates), "manifest": manifest}
+
+    # 4. Execute in chunks of 25, collect per-item results
+    results = _execute_in_chunks(updates, chunk_size=25)
+    return {"dry_run": False, "item_count": len(updates), "results": results}
+```
+
+---
+
 ## Conventions
 
 - **Python 3.10+**, type hints throughout. Tool docstrings become the descriptions Claude sees — write them carefully, that's the UX.

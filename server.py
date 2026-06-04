@@ -268,6 +268,173 @@ def call_linnworks_get(method_path: str, params: dict | None = None) -> any:
     return response.json()
 
 
+# ---------- Write-safety framework ----------
+#
+# Two shared utilities used by every bulk write tool:
+#
+#   _write_guard()   — staged-manifest gate for large batches
+#   _check_injection() — last-resort tripwire for obvious prompt injection
+#
+# Design intent
+# ─────────────
+# Neither utility is a comprehensive security system.  _write_guard prevents
+# accidental large-scale writes by forcing the caller to review a manifest
+# before executing.  _check_injection raises loudly on obvious adversarial
+# patterns embedded in Linnworks data that has flowed into tool parameters —
+# it is not an LLM alignment layer.
+#
+# The primary safety net for all write tools remains:
+#   1. dry_run=True default
+#   2. read-before-write + read-back-after
+#   3. per-item result reporting so every change is visible
+
+import re as _re
+
+# Patterns that suggest injected instructions rather than product/order data.
+# Matched case-insensitively against the stripped start (or anywhere for markers).
+_INJECTION_PATTERNS: list[str] = [
+    r"(?i)^ignore\s+(previous|all|above|prior)",
+    r"(?i)^(system|assistant|user)\s*:",
+    r"(?i)<\|.*?\|>",                           # <|im_start|> style markers
+    r"(?i)\[/?INST\]",                          # LLaMA instruction tags
+    r"(?i)###\s*(instruction|system|prompt)",
+    r"(?i)^you are now\b",
+    r"(?i)^forget\s+(everything|all|previous|prior)",
+    r"(?i)^new\s+instruction",
+    r"(?i)^act as\b",
+    r"(?i)^disregard\s+(all|previous|prior|above)",
+    r"---+\s*(system|instructions?|prompt)\b",  # separator + label pattern
+]
+
+# Per-operation staging thresholds.  Batches at or below the threshold proceed
+# normally (dry_run default still applies).  Batches above require a staged
+# manifest pass followed by confirmed_count echo-back.
+WRITE_THRESHOLDS: dict[str, int] = {
+    "set_stock_levels":               25,   # immediate channel availability impact
+    "set_inventory_item_prices":      25,   # immediate channel price impact
+    "create_or_update_inventory_item": 50,  # channel sync is async, less instant
+    "set_extended_properties":        50,   # metadata, lower blast radius
+    "set_inventory_item_descriptions": 50,  # content, lower blast radius
+    "add_inventory_item_images":      100,  # additive-only, no overwrites
+    "default":                        25,   # fallback for any unlisted operation
+}
+
+
+def _write_guard(
+    operation: str,
+    items: list,
+    confirmed_count: int | None,
+    dry_run: bool,
+    threshold: int | None = None,
+) -> dict | None:
+    """
+    Safety gate for bulk write operations.
+
+    Call this at the top of any write tool that takes a list of items.
+    Returns None when execution should proceed normally.
+    Returns a blocking dict when execution must be halted — the caller
+    should return that dict immediately without performing any writes.
+
+    Behaviour
+    ─────────
+    batch ≤ threshold
+        Standard dry_run logic applies; this function returns None.
+
+    batch > threshold, confirmed_count is None
+        Forced staging: returns a manifest-prompt dict regardless of
+        dry_run.  The caller is responsible for building and including
+        the per-item preview in the returned dict.
+
+    batch > threshold, confirmed_count ≠ len(items)
+        Count mismatch: returns an error dict.  Prevents an injection
+        from bypassing staging by guessing a wrong count.
+
+    batch > threshold, confirmed_count == len(items)
+        Human explicitly acknowledged the manifest; returns None so
+        execution proceeds.
+
+    Args:
+        operation:       Name of the calling tool (used in messages and
+                         to look up threshold from WRITE_THRESHOLDS).
+        items:           The list of items to be written.
+        confirmed_count: Value passed by the caller; None means "not yet
+                         confirmed".
+        dry_run:         The tool's dry_run flag (used in messages only;
+                         the guard does not itself enforce dry_run).
+        threshold:       Override the default threshold for this operation.
+                         If None, looks up WRITE_THRESHOLDS[operation] then
+                         WRITE_THRESHOLDS["default"].
+    """
+    if threshold is None:
+        threshold = WRITE_THRESHOLDS.get(operation, WRITE_THRESHOLDS["default"])
+
+    count = len(items)
+
+    if count <= threshold:
+        return None  # small batch — proceed normally
+
+    if confirmed_count is None:
+        return {
+            "staged": True,
+            "success": False,
+            "operation": operation,
+            "item_count": count,
+            "threshold": threshold,
+            "confirmed_count": None,
+            "message": (
+                f"Batch of {count} items exceeds the {threshold}-item staging "
+                f"threshold for '{operation}'. Review the manifest below, then "
+                f"call again with confirmed_count={count} to execute."
+            ),
+        }
+
+    if confirmed_count != count:
+        return {
+            "staged": False,
+            "success": False,
+            "operation": operation,
+            "item_count": count,
+            "threshold": threshold,
+            "confirmed_count": confirmed_count,
+            "message": (
+                f"confirmed_count={confirmed_count} does not match batch "
+                f"size={count}. Call again with confirmed_count={count} to proceed."
+            ),
+        }
+
+    return None  # confirmed — proceed
+
+
+def _check_injection(field_name: str, value: str) -> None:
+    """
+    Scan a write parameter for obvious prompt injection patterns.
+
+    Raises ValueError with the field name and a clear message if the value
+    matches a known injection signature.  Intended as a last-resort server-
+    side tripwire — not a comprehensive defence.
+
+    Call this for every free-text write parameter (titles, descriptions,
+    notes, extended property values) before forwarding to the Linnworks API.
+
+    Args:
+        field_name: Human-readable name for the parameter (used in the error).
+        value:      The string value to check.
+
+    Raises:
+        ValueError if the value matches an injection pattern.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return
+    for pattern in _INJECTION_PATTERNS:
+        if _re.search(pattern, value.strip()):
+            raise ValueError(
+                f"Parameter '{field_name}' contains a pattern that looks like "
+                f"an injected instruction rather than legitimate product data "
+                f"(matched: {pattern!r}). If this is genuine data, rephrase it "
+                f"to avoid instruction-like prefixes."
+            )
+
+
 def _format_order_note(n: dict) -> dict:
     """
     Normalise a single Linnworks OrderNote into the MCP-facing shape.
