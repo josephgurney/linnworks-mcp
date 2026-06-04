@@ -1,6 +1,23 @@
 # Linnworks MCP Server — Claude context
 
-**Current version: 1.9.1** — 42 tools. See `pyproject.toml` for full metadata.
+**Current version: 1.10.0** — 44 tools. See `pyproject.toml` for full metadata.
+
+---
+
+## Brain — load at session start
+
+This project has a private `.brain/` intelligence layer that tracks change history
+and known patterns. Load it at the start of every session:
+
+1. Read `.brain/HOOK_LOG.md` — recent commit annotations (what changed, why it matters, risk flags)
+2. Read `.brain/BRAIN.md` — known fragile areas, patterns, decisions, carry-forwards
+
+Confirm both are loaded before writing any code. If either file is missing, note it and continue.
+
+**At version release:** follow the rollup instructions in `.brain/rollup.md` to update
+`BRAIN.md` from the log, then write the version marker into `HOOK_LOG.md`.
+
+---
 
 A local stdio MCP server that exposes Linnworks data to Claude Desktop. This is **Phase 1** of a two-phase plan:
 
@@ -94,6 +111,8 @@ Rule types seen in practice: `Orders` (fires on incoming orders), `Test` (sandbo
 | `get_export_list()` | Same shape as import list |
 | `get_import(import_id)` | Config inspection only (feed URL, column mappings, schedule) — `ImportStatus` returns `null` even for erroring imports |
 | `get_export(export_id)` | Config inspection for exports |
+| `run_import(import_id, dry_run=True)` | Queue an import for immediate execution; read-before-run shows config preview; refuses if already executing/queued; spec-based, not yet live-tested |
+| `run_export(export_id, dry_run=True)` | Queue an export for immediate execution; same pattern as `run_import`; spec-based, not yet live-tested |
 
 ---
 
@@ -129,6 +148,8 @@ Rule types seen in practice: `Orders` (fires on incoming orders), `Test` (sandbo
 | `ImportExport/GetExportList` | GET | — | Same shape as import list |
 | `ImportExport/GetImport` | GET | `?id=<int>` | Config only — `ImportStatus` is null even for erroring imports |
 | `ImportExport/GetExport` | GET | `?id=<int>` | Config only |
+| `ImportExport/RunNowImport` | POST | `{"importId": <int>}` **unwrapped** | Returns **204 No Content** — use `call_linnworks_void`, not `call_linnworks`; puts import in queue immediately; not yet live-tested |
+| `ImportExport/RunNowExport` | POST | `{"exportId": <int>}` **unwrapped** | Returns **204 No Content** — same pattern; not yet live-tested |
 | `OpenOrders/SearchOrders` | POST | `{"request":{"LocationId":"...","SearchTerm":"...","IncludeProcessed":false}}` | Searches by ReferenceNum, ExternalReference, and related fields; response: `{"OpenOrders":[{"OrderIds":["guid",...]}],"ProcessedOrders":["guid",...]}` — open orders grouped in view objects, processed orders as flat GUID list; **confirmed in public OpenAPI spec, not yet live-tested on this tenant (May 2026)** |
 | `Orders/CancelOrder` | POST | `{"orderId":"guid","fulfilmentCenter":"guid","note":"..."}` **unwrapped** | Cancels an open order; `fulfilmentCenter` = `FulfilmentLocationId` from order detail; optional `refund` (double) field for attached refund amount; returns a string |
 | `ReturnsRefunds/GetRefundOptions` | POST | `{"request":{"OrderId":"guid"}}` | Returns `RefundOptions` including `CanRefund`, `CannotRefundReason` enum; use as pre-flight check before CreateRefund; **spec-based, not yet live-tested on this tenant** |

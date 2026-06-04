@@ -9,7 +9,7 @@ See README.md for setup instructions.
 """
 from __future__ import annotations
 
-__version__ = "1.9.1"
+__version__ = "1.10.0"
 
 import os
 import sys
@@ -193,6 +193,42 @@ def call_linnworks(method_path: str, payload: dict) -> dict:
         )
 
     return response.json()
+
+
+def call_linnworks_void(method_path: str, payload: dict) -> None:
+    """
+    POST a Linnworks API call that returns 204 No Content (no response body).
+
+    Used for endpoints like ImportExport/RunNowImport that signal success
+    purely via HTTP 204. Raises RuntimeError on any non-2xx response.
+    """
+    global _token, _server
+    token, server = ensure_auth()
+    url = f"{server.rstrip('/')}/api/{method_path}"
+
+    response = _session.post(
+        url,
+        json=payload,
+        headers={"Authorization": token},
+        timeout=60,
+    )
+
+    if response.status_code == 401:
+        _token, _server = None, None
+        token, server = ensure_auth()
+        url = f"{server.rstrip('/')}/api/{method_path}"
+        response = _session.post(
+            url,
+            json=payload,
+            headers={"Authorization": token},
+            timeout=60,
+        )
+
+    if not response.ok:
+        raise RuntimeError(
+            f"Linnworks {method_path} failed: HTTP {response.status_code} — {response.text}"
+        )
+    # 204 No Content — success, nothing to return
 
 
 def call_linnworks_get(method_path: str, params: dict | None = None) -> any:
@@ -4821,6 +4857,234 @@ def get_export(export_id: int) -> dict:
             for s in schedules
         ],
         "specification": spec,
+    }
+
+
+@mcp.tool()
+def run_import(import_id: int, dry_run: bool = True) -> dict:
+    """
+    Trigger an existing Linnworks import profile to run immediately.
+
+    Puts the import into the queue — Linnworks picks it up within seconds.
+    Use this to manually fire an import that would otherwise wait for its
+    next scheduled run, or to run an import on demand (e.g. after uploading
+    a new supplier catalogue CSV).
+
+    Always reads the import configuration first so you can confirm exactly
+    which import will run, what feed URL it reads from, and what type of
+    Linnworks data it updates — before anything is triggered.
+
+    Refuses to queue if the import is already executing or already queued,
+    preventing accidental double-runs.
+
+    Args:
+        import_id: Integer ID of the import to trigger (from get_import_list).
+        dry_run:   If True (default), shows the full import config and what
+                   would be triggered — without actually queuing it.
+                   Set to False to queue the import for immediate execution.
+
+    Returns:
+        A dict with:
+          - dry_run:        whether this was a preview only
+          - import_id:      the ID queried
+          - friendly_name:  human-readable import name
+          - type:           the import type (e.g. "Inventory", "StockLevel")
+          - feed_url:       source file URL the import reads from
+          - enabled:        whether the import is enabled in Linnworks
+          - was_executing:  whether it was already running at read time
+          - was_queued:     whether it was already queued at read time
+          - queued:         True if successfully queued (live run only)
+          - now_executing:  post-trigger executing state (live run only)
+          - now_queued:     post-trigger queued state (live run only)
+          - message:        human-readable status summary
+    """
+    # ── Read before run ───────────────────────────────────────────────────────
+    response = call_linnworks_get("ImportExport/GetImport", params={"id": import_id})
+    register = response.get("Register") or {}
+    spec     = response.get("Specification") or {}
+    feed     = spec.get("Feed") or {}
+
+    friendly_name = register.get("FriendlyName") or f"Import {import_id}"
+    import_type   = register.get("Type")
+    enabled       = register.get("Enabled", False)
+    was_executing = register.get("Executing", False)
+    was_queued    = register.get("IsQueued", False)
+    feed_url      = feed.get("Url") or feed.get("FileUrl") or feed.get("FeedUrl")
+
+    base = {
+        "import_id":     import_id,
+        "friendly_name": friendly_name,
+        "type":          import_type,
+        "feed_url":      feed_url,
+        "enabled":       enabled,
+        "was_executing": was_executing,
+        "was_queued":    was_queued,
+    }
+
+    # ── Guards ────────────────────────────────────────────────────────────────
+    if was_executing:
+        return {
+            **base, "dry_run": dry_run, "queued": False,
+            "message": (
+                f"Import '{friendly_name}' is already executing — "
+                f"not queued again to avoid a double-run."
+            ),
+        }
+
+    if was_queued:
+        return {
+            **base, "dry_run": dry_run, "queued": False,
+            "message": (
+                f"Import '{friendly_name}' is already queued — "
+                f"not queued again to avoid a double-run."
+            ),
+        }
+
+    if dry_run:
+        return {
+            **base, "dry_run": True, "queued": False,
+            "message": (
+                f"Dry run — would queue import '{friendly_name}' "
+                f"(type: {import_type}, feed: {feed_url or 'not configured'}). "
+                f"Set dry_run=False to trigger."
+            ),
+        }
+
+    # ── Live: queue the import ────────────────────────────────────────────────
+    call_linnworks_void("ImportExport/RunNowImport", {"importId": import_id})
+
+    # Read back to confirm state
+    readback    = call_linnworks_get("ImportExport/GetImport", params={"id": import_id})
+    rb_register = readback.get("Register") or {}
+    now_queued    = rb_register.get("IsQueued", False)
+    now_executing = rb_register.get("Executing", False)
+
+    return {
+        **base,
+        "dry_run":       False,
+        "queued":        now_queued or now_executing,
+        "now_executing": now_executing,
+        "now_queued":    now_queued,
+        "message": (
+            f"Import '{friendly_name}' queued successfully — "
+            f"Linnworks will execute it momentarily."
+            if (now_queued or now_executing)
+            else (
+                f"Import '{friendly_name}' triggered (RunNowImport accepted). "
+                f"Read-back shows not yet queued — Linnworks may have picked it "
+                f"up instantly or there may be a brief delay before state updates."
+            )
+        ),
+    }
+
+
+@mcp.tool()
+def run_export(export_id: int, dry_run: bool = True) -> dict:
+    """
+    Trigger an existing Linnworks export profile to run immediately.
+
+    Puts the export into the queue — Linnworks picks it up within seconds.
+    Use this to manually fire an export that would otherwise wait for its
+    next scheduled run, or to produce an on-demand data extract.
+
+    Always reads the export configuration first so you can confirm exactly
+    which export will run and what it produces — before anything is triggered.
+
+    Refuses to queue if the export is already executing or already queued,
+    preventing accidental double-runs.
+
+    Args:
+        export_id: Integer ID of the export to trigger (from get_export_list).
+        dry_run:   If True (default), shows the export config and what would
+                   be triggered — without actually queuing it.
+                   Set to False to queue the export for immediate execution.
+
+    Returns:
+        A dict with:
+          - dry_run:        whether this was a preview only
+          - export_id:      the ID queried
+          - friendly_name:  human-readable export name
+          - type:           the export type
+          - enabled:        whether the export is enabled in Linnworks
+          - was_executing:  whether it was already running at read time
+          - was_queued:     whether it was already queued at read time
+          - queued:         True if successfully queued (live run only)
+          - now_executing:  post-trigger executing state (live run only)
+          - now_queued:     post-trigger queued state (live run only)
+          - message:        human-readable status summary
+    """
+    # ── Read before run ───────────────────────────────────────────────────────
+    response = call_linnworks_get("ImportExport/GetExport", params={"id": export_id})
+    register = response.get("Register") or {}
+
+    friendly_name = register.get("FriendlyName") or f"Export {export_id}"
+    export_type   = register.get("Type")
+    enabled       = register.get("Enabled", False)
+    was_executing = register.get("Executing", False)
+    was_queued    = register.get("IsQueued", False)
+
+    base = {
+        "export_id":     export_id,
+        "friendly_name": friendly_name,
+        "type":          export_type,
+        "enabled":       enabled,
+        "was_executing": was_executing,
+        "was_queued":    was_queued,
+    }
+
+    # ── Guards ────────────────────────────────────────────────────────────────
+    if was_executing:
+        return {
+            **base, "dry_run": dry_run, "queued": False,
+            "message": (
+                f"Export '{friendly_name}' is already executing — "
+                f"not queued again to avoid a double-run."
+            ),
+        }
+
+    if was_queued:
+        return {
+            **base, "dry_run": dry_run, "queued": False,
+            "message": (
+                f"Export '{friendly_name}' is already queued — "
+                f"not queued again to avoid a double-run."
+            ),
+        }
+
+    if dry_run:
+        return {
+            **base, "dry_run": True, "queued": False,
+            "message": (
+                f"Dry run — would queue export '{friendly_name}' "
+                f"(type: {export_type}). "
+                f"Set dry_run=False to trigger."
+            ),
+        }
+
+    # ── Live: queue the export ─────────────────────────────────────────────────
+    call_linnworks_void("ImportExport/RunNowExport", {"exportId": export_id})
+
+    readback    = call_linnworks_get("ImportExport/GetExport", params={"id": export_id})
+    rb_register = readback.get("Register") or {}
+    now_queued    = rb_register.get("IsQueued", False)
+    now_executing = rb_register.get("Executing", False)
+
+    return {
+        **base,
+        "dry_run":       False,
+        "queued":        now_queued or now_executing,
+        "now_executing": now_executing,
+        "now_queued":    now_queued,
+        "message": (
+            f"Export '{friendly_name}' queued successfully — "
+            f"Linnworks will execute it momentarily."
+            if (now_queued or now_executing)
+            else (
+                f"Export '{friendly_name}' triggered (RunNowExport accepted). "
+                f"Read-back shows not yet queued — Linnworks may have picked it "
+                f"up instantly or there may be a brief delay before state updates."
+            )
+        ),
     }
 
 
