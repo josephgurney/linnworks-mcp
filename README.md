@@ -1,6 +1,6 @@
 # Linnworks MCP Server
 
-![Version](https://img.shields.io/badge/version-1.5.0-blue)
+![Version](https://img.shields.io/badge/version-1.11.0-blue)
 
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
 
@@ -12,19 +12,51 @@ This is a **single-tenant stdio server**: it runs on your machine, connects to y
 
 Once installed, Claude gets access to these tools:
 
-**Orders & stock**
+**Orders (read)**
 
 | Tool | What it does |
 |---|---|
 | `get_open_orders` | List current open (unprocessed) orders — count, SKUs, dispatch deadlines, overdue flag |
-| `get_processed_orders` | Search dispatched orders by date range — volume, sources, tracking |
-| `get_processed_order_items` | Processed orders **with full line items** — top-selling SKUs, sold-together analysis, revenue by product |
-| `get_order` | Full detail on a single order by numeric ID or GUID — includes customer name and email |
-| `find_open_orders_for_sku` | Find all open orders containing a specific SKU — returns customer name, email, and dispatch deadline for each |
-| `get_stock_level` | Current stock level for a SKU across all locations |
+| `get_processed_orders` | Search dispatched orders by date range |
+| `get_processed_order_items` | Processed orders with full line items — sold-together analysis, revenue by product |
+| `get_order` | Full detail on a single order by numeric ID or GUID — customer name, email, address, notes, totals |
+| `find_open_orders_for_sku` | Find all open orders containing a specific SKU — customer name, email, dispatch deadline |
+| `find_orders_by_reference` | Look up orders by channel reference number (Shopify, Amazon, eBay) |
+| `get_order_notes` | Fetch all notes on an order |
+
+**Orders (write — all default to dry_run=True)**
+
+| Tool | What it does |
+|---|---|
+| `set_order_address` | Update the delivery address on an open order |
+| `add_order_note` | Add a note to any order (internal or customer-facing) |
+| `update_order_note` | Replace the text of an existing note |
+| `delete_order_note` | Remove a specific note by ID |
+| `delete_order_notes_by_text` | Remove notes matching a text pattern |
+| `cancel_order` | Cancel an open (unprocessed) order |
+| `refund_order` | Full refund on a processed order |
+| `refund_order_lines` | Partial refund of specific line items |
+
+**Inventory (read)**
+
+| Tool | What it does |
+|---|---|
 | `find_inventory_item` | Look up an inventory item by exact SKU |
+| `get_stock_level` | Current stock level for a SKU across all locations |
 | `get_extended_properties` | Fetch custom metadata (extended properties) for a product |
 | `get_locations` | List all warehouse and fulfilment locations with their GUIDs |
+
+**Inventory (write — all default to dry_run=True)**
+
+| Tool | What it does |
+|---|---|
+| `create_or_update_inventory_item` | Create a new item or update an existing one by SKU — title, barcode, prices, category, dimensions |
+| `set_stock_levels` | Set absolute stock levels for one or more SKUs (threshold: 25 items before staging) |
+| `set_inventory_item_prices` | Set or update channel prices per SKU — supports Source/SubSource per channel |
+| `set_extended_properties` | Create or update extended property key/value pairs on items |
+| `set_inventory_item_descriptions` | Create or update channel-specific descriptions on items |
+| `add_inventory_item_images` | Attach images to items by URL |
+| `create_variation_group` | Link a parent item to its variant children (e.g. sizes/colours) |
 
 **Reporting**
 
@@ -43,10 +75,13 @@ Once installed, Claude gets access to these tools:
 | `search_purchase_orders` | Search POs by status, date range, or keyword |
 | `get_purchase_order` | Full detail for a single PO — header, line items, delivery records |
 | `get_suppliers` | List all suppliers with their GUIDs |
-| `create_purchase_order` | Create a new PO and add line items (dry-run by default) |
-| `update_purchase_order_header` | Edit PO header fields — supplier, reference, dates, currency (dry-run by default) |
-| `open_purchase_order` | Move a PO from PENDING → OPEN status (dry-run by default) |
-| `deliver_purchase_order` | Record delivery of all outstanding items on an OPEN PO (dry-run by default) |
+| `create_purchase_order` | Create a new PO and add line items |
+| `update_purchase_order_header` | Edit PO header fields — supplier, reference, dates, currency |
+| `add_purchase_order_item` | Add a line item to an existing PO |
+| `update_purchase_order_item` | Edit quantity, cost, or tax rate on a PO line |
+| `remove_purchase_order_item` | Delete a line item from a PO |
+| `open_purchase_order` | Move a PO from PENDING → OPEN status |
+| `deliver_purchase_order` | Record delivery of all outstanding items on an OPEN PO |
 | `add_purchase_order_note` | Add a text note to a PO (e.g. tracking number, expected arrival) |
 
 **Rules Engine**
@@ -56,7 +91,7 @@ Once installed, Claude gets access to these tools:
 | `get_rules` | List all Rules Engine rules — name, type, enabled state, run order, draft status |
 | `get_rule` | Full IF/THEN condition tree for a single rule — every condition clause and action with nested subrules |
 
-**Import / Export monitoring**
+**Import / Export**
 
 | Tool | What it does |
 |---|---|
@@ -64,6 +99,8 @@ Once installed, Claude gets access to these tools:
 | `get_export_list` | List all configured export tasks — same fields plus last export success/fail |
 | `get_import` | Full detail for one import — feed URL, column mappings, schedule config |
 | `get_export` | Full detail for one export — destination, filters, schedule config |
+| `run_import` | Queue an import for immediate execution |
+| `run_export` | Queue an export for immediate execution |
 
 Example questions you can ask:
 
@@ -75,14 +112,12 @@ Example questions you can ask:
 > Which of our locations hold inventory?
 > How does this month's revenue compare to last month?
 > Which suppliers drove the most revenue last month?
-> What are the top selling SKUs from supplier Shiner this quarter?
 > Which customers have open orders waiting on SKU ABC-123?
 > Show me order 596475 — what's the customer's email address?
 > Which imports are currently in error?
-> When did the stock level import last run, and what's its feed URL?
-> Show me all purchase orders from this supplier that are currently open.
-> Which rules are currently enabled, and in what order do they run?
-> What does the "Nathan Shipping Rules" rule actually do — show me the full conditions and actions.
+> Set the stock level for SKU VEN-DECK-80-SKU to 15 at the Default location.
+> Create a new inventory item with SKU NEW-001 and title "Test Board 8.0".
+> Update the retail price for SKU ABC-123 to £29.99.
 
 ---
 
@@ -99,7 +134,7 @@ Example questions you can ask:
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/linnworks-mcp.git
+git clone https://github.com/josephgurney/linnworks-mcp.git
 cd linnworks-mcp
 python -m venv .venv
 source .venv/bin/activate        # macOS / Linux
@@ -177,10 +212,27 @@ Restart Claude Desktop. Open a new chat — you should see `linnworks` listed in
 How many open orders do I have right now?
 Which open orders are overdue?
 What were my top 10 selling SKUs last week?
-Which products were bought together most often in May?
 What's the stock level for SKU ABC-123?
-What extended properties does SKU XYZ have?
 ```
+
+---
+
+## Write tools and safety
+
+All write tools default to `dry_run=True` — they will describe what they would do without making any changes. Set `dry_run=False` only after reviewing the output.
+
+**Large batch protection:** inventory write tools have per-operation staging thresholds. If you ask Claude to update more items than the threshold in one go, the tool will return a manifest preview and ask you to confirm before executing. This prevents accidental large-scale changes.
+
+| Tool | Threshold |
+|---|---|
+| `set_stock_levels` | 25 items |
+| `set_inventory_item_prices` | 25 items |
+| `create_or_update_inventory_item` | 50 items |
+| `set_extended_properties` | 50 items |
+| `set_inventory_item_descriptions` | 50 items |
+| `add_inventory_item_images` | 100 items |
+
+There is no hard cap — any batch size works once confirmed. The threshold is a staging gate, not a refusal.
 
 ---
 
@@ -204,7 +256,8 @@ The most common causes are wrong absolute paths in the config, or Python below 3
 
 - Credentials go directly from your machine to Linnworks. Nothing is hosted or proxied.
 - `.env` is gitignored. Never commit it.
-- Write tools (`create_purchase_order`, `update_purchase_order_header`, `open_purchase_order`, `deliver_purchase_order`) all default to `dry_run=True` and will not modify data unless you explicitly confirm.
+- All write tools default to `dry_run=True` and will not modify data unless you explicitly confirm.
+- Large batches are staged before execution — the tool shows you a manifest and waits for your `confirmed_count` before writing.
 
 ---
 
@@ -216,5 +269,6 @@ linnworks-mcp/
 ├── requirements.txt   # mcp, requests, python-dotenv
 ├── .env.example       # Credential template (copy to .env, never commit .env)
 ├── .gitignore
-└── README.md
+├── README.md
+└── tests/             # Automated tests (pytest)
 ```
