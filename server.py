@@ -9,7 +9,7 @@ See README.md for setup instructions.
 """
 from __future__ import annotations
 
-__version__ = "1.10.0"
+__version__ = "1.11.0"
 
 import os
 import sys
@@ -5251,6 +5251,1158 @@ def run_export(export_id: int, dry_run: bool = True) -> dict:
                 f"Read-back shows not yet queued — Linnworks may have picked it "
                 f"up instantly or there may be a brief delay before state updates."
             )
+        ),
+    }
+
+
+# ---------- Inventory write helpers ----------
+
+def _resolve_sku_to_id(sku: str, cache: dict | None = None) -> str:
+    """
+    Resolve a SKU string to its Linnworks StockItemId (GUID).
+
+    Uses Inventory/GetInventoryItem (exact SKU match only — no fuzzy search).
+    Raises ValueError if the SKU is not found.
+
+    Args:
+        sku:   The exact SKU / item number.
+        cache: Optional dict for within-call deduplication.  If provided,
+               already-resolved SKUs are returned from cache without an API call.
+    """
+    if cache is not None and sku in cache:
+        return cache[sku]
+    try:
+        item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+    except RuntimeError as exc:
+        raise ValueError(f"SKU '{sku}' not found in Linnworks: {exc}") from exc
+    stock_item_id = item.get("StockItemId")
+    if not stock_item_id:
+        raise ValueError(f"SKU '{sku}' was found but returned no StockItemId.")
+    if cache is not None:
+        cache[sku] = stock_item_id
+    return stock_item_id
+
+
+# ---------- Inventory write tools ----------
+
+
+@mcp.tool()
+def create_or_update_inventory_item(
+    items: list[dict],
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Create or update inventory items in Linnworks (upsert by SKU).
+
+    Each item is looked up by its SKU.  If the SKU already exists the item is
+    updated (UpdateInventoryItem); if it does not exist it is created
+    (AddInventoryItem).  Only the fields you supply are changed on updates —
+    but because the Linnworks UpdateInventoryItem endpoint requires a full
+    payload, all existing field values are read first and merged with your
+    changes so that unsupplied fields are preserved.
+
+    For batches larger than 50 items this tool enters a staging mode: it returns
+    a manifest preview and asks you to confirm with confirmed_count=<N> before
+    executing.  This prevents accidental large-scale inventory changes.
+
+    Args:
+        items: List of dicts.  Required key: "sku".  Optional keys:
+            - title (str):          ItemTitle
+            - barcode (str):        BarcodeNumber
+            - retail_price (float): RetailPrice
+            - purchase_price (float): PurchasePrice
+            - tax_rate (float):     TaxRate (e.g. 20.0 for 20%)
+            - category_name (str):  CategoryName (Linnworks auto-resolves to ID)
+            - weight (float):       Weight in kg
+            - height (float):       Height in cm
+            - width (float):        Width in cm
+            - depth (float):        Depth in cm
+            - metadata (str):       MetaData free-text field
+            - barcode (str):        BarcodeNumber
+        confirmed_count: For batches > 50 items, pass len(items) here after
+            reviewing the manifest to confirm the write.
+        dry_run: If True (default), returns the manifest without writing.
+            Set to False to execute.
+
+    Returns:
+        A dict with:
+          - dry_run:      whether this was a dry run
+          - item_count:   number of items in the batch
+          - manifest:     per-item preview (always present)
+          - results:      per-item outcome (live run only)
+          - created:      count of newly created items (live run only)
+          - updated:      count of updated items (live run only)
+          - errors:       count of failed items (live run only)
+    """
+    # ── Injection check on all free-text fields ───────────────────────────────
+    for entry in items:
+        _check_injection("title",     entry.get("title", ""))
+        _check_injection("barcode",   entry.get("barcode", ""))
+        _check_injection("metadata",  entry.get("metadata", ""))
+
+    # ── Build manifest preview ────────────────────────────────────────────────
+    manifest = [
+        {
+            "sku":            entry.get("sku"),
+            "title":          entry.get("title"),
+            "barcode":        entry.get("barcode"),
+            "retail_price":   entry.get("retail_price"),
+            "purchase_price": entry.get("purchase_price"),
+            "tax_rate":       entry.get("tax_rate"),
+            "category_name":  entry.get("category_name"),
+            "weight":         entry.get("weight"),
+            "height":         entry.get("height"),
+            "width":          entry.get("width"),
+            "depth":          entry.get("depth"),
+            "metadata":       entry.get("metadata"),
+        }
+        for entry in items
+    ]
+
+    # ── Write guard ───────────────────────────────────────────────────────────
+    guard = _write_guard("create_or_update_inventory_item", items, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, "manifest": manifest}
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "item_count": len(items),
+            "manifest": manifest,
+            "message": "Dry run — no changes written. Set dry_run=False to execute.",
+        }
+
+    # ── Live execution ─────────────────────────────────────────────────────────
+    sku_cache: dict[str, str] = {}
+    results = []
+    created = 0
+    updated = 0
+    errors  = 0
+
+    for entry in items:
+        sku = (entry.get("sku") or "").strip()
+        if not sku:
+            results.append({"sku": "", "action": "error", "error": "Missing 'sku' field."})
+            errors += 1
+            continue
+
+        try:
+            # Probe whether the item exists.
+            try:
+                existing = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+                stock_item_id = existing.get("StockItemId")
+                action = "update"
+            except RuntimeError:
+                existing = None
+                stock_item_id = None
+                action = "create"
+
+            if action == "update":
+                # Merge: start from the existing item, overlay supplied fields.
+                item_payload = {
+                    "StockItemId":            stock_item_id,
+                    "ItemNumber":             existing.get("ItemNumber", sku),
+                    "ItemTitle":              entry.get("title")          or existing.get("ItemTitle", ""),
+                    "BarcodeNumber":          entry.get("barcode")        or existing.get("BarcodeNumber", ""),
+                    "RetailPrice":            entry.get("retail_price")   if entry.get("retail_price") is not None else existing.get("RetailPrice"),
+                    "PurchasePrice":          entry.get("purchase_price") if entry.get("purchase_price") is not None else existing.get("PurchasePrice"),
+                    "TaxRate":                entry.get("tax_rate")       if entry.get("tax_rate") is not None else existing.get("TaxRate"),
+                    "CategoryName":           entry.get("category_name")  or existing.get("CategoryName", ""),
+                    "CategoryId":             existing.get("CategoryId", ""),
+                    "Weight":                 entry.get("weight")         if entry.get("weight") is not None else existing.get("Weight"),
+                    "Height":                 entry.get("height")         if entry.get("height") is not None else existing.get("Height"),
+                    "Width":                  entry.get("width")          if entry.get("width") is not None else existing.get("Width"),
+                    "Depth":                  entry.get("depth")          if entry.get("depth") is not None else existing.get("Depth"),
+                    "MetaData":               entry.get("metadata")       or existing.get("MetaData", ""),
+                    "IsCompositeParent":      existing.get("IsCompositeParent", False),
+                    "ShippedSeparately":      existing.get("ShippedSeparately", False),
+                    "IsVariationParent":      existing.get("IsVariationParent", False),
+                    "isBatchedStockType":     existing.get("isBatchedStockType", False),
+                    "PostalServiceId":        existing.get("PostalServiceId", ""),
+                    "PostalServiceName":      existing.get("PostalServiceName", ""),
+                    "PackageGroupId":         existing.get("PackageGroupId", ""),
+                    "PackageGroupName":       existing.get("PackageGroupName", ""),
+                    "InventoryTrackingType":  existing.get("InventoryTrackingType", 0),
+                    "BatchNumberScanRequired":existing.get("BatchNumberScanRequired", False),
+                    "SerialNumberScanRequired":existing.get("SerialNumberScanRequired", False),
+                }
+                call_linnworks("Inventory/UpdateInventoryItem", {"inventoryItem": item_payload})
+                updated += 1
+                results.append({
+                    "sku": sku, "action": "updated", "stock_item_id": stock_item_id,
+                    "title": item_payload["ItemTitle"],
+                })
+
+            else:
+                # Create path — only the fields we have.
+                item_payload = {
+                    "ItemNumber":    sku,
+                    "ItemTitle":     entry.get("title", ""),
+                    "BarcodeNumber": entry.get("barcode", ""),
+                    "RetailPrice":   entry.get("retail_price", 0.0),
+                    "PurchasePrice": entry.get("purchase_price", 0.0),
+                    "TaxRate":       entry.get("tax_rate", 0.0),
+                    "CategoryName":  entry.get("category_name", ""),
+                    "Weight":        entry.get("weight", 0.0),
+                    "Height":        entry.get("height", 0.0),
+                    "Width":         entry.get("width", 0.0),
+                    "Depth":         entry.get("depth", 0.0),
+                    "MetaData":      entry.get("metadata", ""),
+                }
+                resp = call_linnworks("Inventory/AddInventoryItem", {"inventoryItem": item_payload})
+                new_id = resp.get("fkStockItemId") or resp.get("StockItemId") or ""
+                created += 1
+                results.append({
+                    "sku": sku, "action": "created", "stock_item_id": new_id,
+                    "title": item_payload["ItemTitle"],
+                })
+
+        except Exception as exc:
+            errors += 1
+            results.append({"sku": sku, "action": "error", "error": str(exc)})
+
+    return {
+        "dry_run":    False,
+        "item_count": len(items),
+        "created":    created,
+        "updated":    updated,
+        "errors":     errors,
+        "results":    results,
+    }
+
+
+@mcp.tool()
+def set_stock_levels(
+    updates: list[dict],
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Set absolute stock levels for one or more SKUs in Linnworks.
+
+    WARNING: This overwrites live stock figures immediately and affects
+    channel availability (Amazon, eBay, Shopify) in near-real-time.
+    Always use dry_run=True first to review the changes.
+
+    For batches larger than 25 items this tool enters a staging mode: it
+    returns a manifest showing current → new stock levels and asks you to
+    confirm with confirmed_count=<N> before executing.
+
+    Uses Stock/UpdateStockLevelsBulk which returns per-item errors so every
+    line can be individually reported.
+
+    Args:
+        updates: List of dicts, each with:
+            - sku (str):         The item's SKU / ItemNumber  [required]
+            - stock_level (int): The new absolute stock level  [required]
+            - location_id (str): Linnworks location UUID.
+                                 Defaults to the Default location.
+        confirmed_count: For batches > 25, pass len(updates) here after
+            reviewing the manifest to confirm the write.
+        dry_run: If True (default), returns a before/after manifest without
+            writing. Set to False to execute.
+
+    Returns:
+        A dict with:
+          - dry_run:     whether this was a dry run
+          - item_count:  number of SKUs in the batch
+          - manifest:    per-item before/after preview (always present)
+          - results:     per-item outcome with errors (live run only)
+          - errors:      count of SKUs that failed (live run only)
+    """
+    # ── Collect SKUs ──────────────────────────────────────────────────────────
+    skus = [(u.get("sku") or "").strip() for u in updates]
+    for i, s in enumerate(skus):
+        if not s:
+            raise ValueError(f"updates[{i}] is missing 'sku'.")
+    for u in updates:
+        if u.get("stock_level") is None:
+            raise ValueError(f"updates entry for SKU '{u.get('sku')}' is missing 'stock_level'.")
+
+    # ── Read current stock levels (read-before-write diff) ────────────────────
+    sku_cache: dict[str, str] = {}
+    current_levels: dict[str, int | None] = {}
+
+    for sku in skus:
+        try:
+            stock_item_id = _resolve_sku_to_id(sku, sku_cache)
+            levels_resp = call_linnworks(
+                "Stock/GetStockLevel_Batch",
+                {"request": {"StockItemIds": [stock_item_id]}},
+            )
+            # Response is a list of location rows per item
+            rows = levels_resp if isinstance(levels_resp, list) else (levels_resp.get("StockItemLevels") or [])
+            # Find the matching location row
+            for u in updates:
+                if (u.get("sku") or "").strip() == sku:
+                    target_loc = u.get("location_id", DEFAULT_LOCATION_ID)
+            loc_level = None
+            for row_group in rows:
+                for row in (row_group if isinstance(row_group, list) else [row_group]):
+                    if row.get("Location", {}).get("StockLocationId") == target_loc:
+                        loc_level = row.get("StockLevel")
+                        break
+            current_levels[sku] = loc_level
+        except (ValueError, RuntimeError):
+            current_levels[sku] = None
+
+    # ── Build manifest ────────────────────────────────────────────────────────
+    manifest = []
+    for u in updates:
+        sku = (u.get("sku") or "").strip()
+        new_level = u.get("stock_level")
+        loc_id = u.get("location_id", DEFAULT_LOCATION_ID)
+        current = current_levels.get(sku)
+        delta = None if current is None else (new_level - current)
+        manifest.append({
+            "sku":              sku,
+            "location_id":      loc_id,
+            "current_level":    current,
+            "new_level":        new_level,
+            "delta":            delta,
+        })
+
+    # ── Write guard ───────────────────────────────────────────────────────────
+    guard = _write_guard("set_stock_levels", updates, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, "manifest": manifest}
+
+    if dry_run:
+        return {
+            "dry_run":     True,
+            "item_count":  len(updates),
+            "manifest":    manifest,
+            "message": (
+                "Dry run — no stock levels changed. "
+                "Review the manifest and set dry_run=False to execute."
+            ),
+        }
+
+    # ── Live execution ─────────────────────────────────────────────────────────
+    bulk_items = []
+    for u in updates:
+        sku = (u.get("sku") or "").strip()
+        try:
+            stock_item_id = _resolve_sku_to_id(sku, sku_cache)
+        except ValueError:
+            stock_item_id = ""
+        bulk_items.append({
+            "SKU":             sku,
+            "StockItemId":     stock_item_id,
+            "StockLocationId": u.get("location_id", DEFAULT_LOCATION_ID),
+            "StockLevel":      u.get("stock_level"),
+        })
+
+    response = call_linnworks("Stock/UpdateStockLevelsBulk", {"Items": bulk_items})
+    response_items = response.get("Items") or []
+
+    results = []
+    errors = 0
+    for idx, item in enumerate(response_items):
+        errs = item.get("Errors") or []
+        ok = len(errs) == 0
+        if not ok:
+            errors += 1
+        results.append({
+            "sku":         item.get("SKU"),
+            "location_id": item.get("StockLocationId"),
+            "new_level":   item.get("StockLevel"),
+            "success":     ok,
+            "errors":      errs,
+        })
+
+    return {
+        "dry_run":    False,
+        "item_count": len(updates),
+        "errors":     errors,
+        "results":    results,
+        "manifest":   manifest,
+    }
+
+
+@mcp.tool()
+def set_inventory_item_prices(
+    prices: list[dict],
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Set or update channel prices for one or more inventory items in Linnworks.
+
+    Prices in Linnworks are keyed by (StockItemId, Source, SubSource).  This
+    tool reads existing price rows for each SKU, then creates or updates rows
+    as needed.  Pass source="" and sub_source="" to set the default price row.
+
+    WARNING: Price changes are pushed to connected sales channels
+    (Amazon, eBay, Shopify) in near-real-time.  Always use dry_run=True
+    first to review the manifest.
+
+    For batches larger than 25 items this tool requires confirmed_count=<N>.
+
+    Args:
+        prices: List of dicts, each with:
+            - sku (str):         Item SKU  [required]
+            - price (float):     The new price  [required]
+            - source (str):      Channel source (e.g. "AMAZON", "EBAY", "").
+                                 Defaults to "" (default price row).
+            - sub_source (str):  Channel sub-source (e.g. "DEFAULT").
+                                 Defaults to "".
+        confirmed_count: For batches > 25, pass len(prices) here.
+        dry_run: If True (default), returns a before/after manifest without
+            writing. Set to False to execute.
+
+    Returns:
+        A dict with:
+          - dry_run:     whether this was a dry run
+          - item_count:  number of price rows in the batch
+          - manifest:    per-item before/after preview (always present)
+          - results:     per-item outcome (live run only)
+          - created:     new rows created (live run only)
+          - updated:     existing rows updated (live run only)
+          - errors:      rows that failed (live run only)
+    """
+    # ── Validate ──────────────────────────────────────────────────────────────
+    for i, p in enumerate(prices):
+        if not p.get("sku"):
+            raise ValueError(f"prices[{i}] is missing 'sku'.")
+        if p.get("price") is None:
+            raise ValueError(f"prices[{i}] (SKU '{p.get('sku')}') is missing 'price'.")
+
+    sku_cache: dict[str, str] = {}
+
+    # ── Read current prices + build manifest ──────────────────────────────────
+    manifest = []
+    # {stock_item_id: [existing price rows]}
+    existing_prices: dict[str, list] = {}
+
+    for p in prices:
+        sku        = p["sku"].strip()
+        source     = p.get("source", "")
+        sub_source = p.get("sub_source", "")
+        new_price  = p["price"]
+
+        try:
+            stock_item_id = _resolve_sku_to_id(sku, sku_cache)
+        except ValueError as exc:
+            manifest.append({
+                "sku": sku, "source": source, "sub_source": sub_source,
+                "new_price": new_price, "current_price": None, "error": str(exc),
+            })
+            continue
+
+        if stock_item_id not in existing_prices:
+            rows = call_linnworks_get(
+                "Inventory/GetInventoryItemPrices",
+                params={"inventoryItemId": stock_item_id},
+            )
+            existing_prices[stock_item_id] = rows if isinstance(rows, list) else []
+
+        # Find matching row
+        match = next(
+            (r for r in existing_prices[stock_item_id]
+             if r.get("Source", "") == source and r.get("SubSource", "") == sub_source),
+            None,
+        )
+        manifest.append({
+            "sku":           sku,
+            "stock_item_id": stock_item_id,
+            "source":        source,
+            "sub_source":    sub_source,
+            "current_price": match.get("Price") if match else None,
+            "new_price":     new_price,
+            "action":        "update" if match else "create",
+            "pk_row_id":     match.get("pkRowId") if match else None,
+        })
+
+    # ── Write guard ───────────────────────────────────────────────────────────
+    guard = _write_guard("set_inventory_item_prices", prices, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, "manifest": manifest}
+
+    if dry_run:
+        return {
+            "dry_run":    True,
+            "item_count": len(prices),
+            "manifest":   manifest,
+            "message":    "Dry run — no prices changed. Set dry_run=False to execute.",
+        }
+
+    # ── Live execution ─────────────────────────────────────────────────────────
+    to_create = [m for m in manifest if m.get("action") == "create" and not m.get("error")]
+    to_update = [m for m in manifest if m.get("action") == "update" and not m.get("error")]
+    error_rows = [m for m in manifest if m.get("error")]
+
+    results   = []
+    created   = 0
+    updated   = 0
+    errors    = len(error_rows)
+
+    if to_create:
+        create_payload = [
+            {
+                "StockItemId": m["stock_item_id"],
+                "Source":      m["source"],
+                "SubSource":   m["sub_source"],
+                "Price":       m["new_price"],
+            }
+            for m in to_create
+        ]
+        call_linnworks(
+            "Inventory/CreateInventoryItemPrices",
+            {"inventoryItemPrices": create_payload},
+        )
+        for m in to_create:
+            created += 1
+            results.append({
+                "sku": m["sku"], "action": "created",
+                "source": m["source"], "sub_source": m["sub_source"],
+                "new_price": m["new_price"],
+            })
+
+    if to_update:
+        update_payload = [
+            {
+                "StockItemId": m["stock_item_id"],
+                "pkRowId":     m["pk_row_id"],
+                "Source":      m["source"],
+                "SubSource":   m["sub_source"],
+                "Price":       m["new_price"],
+            }
+            for m in to_update
+        ]
+        call_linnworks(
+            "Inventory/UpdateInventoryItemPrices",
+            {"inventoryItemPrices": update_payload},
+        )
+        for m in to_update:
+            updated += 1
+            results.append({
+                "sku": m["sku"], "action": "updated",
+                "source": m["source"], "sub_source": m["sub_source"],
+                "old_price": m["current_price"], "new_price": m["new_price"],
+            })
+
+    for m in error_rows:
+        results.append({"sku": m["sku"], "action": "error", "error": m["error"]})
+
+    return {
+        "dry_run":    False,
+        "item_count": len(prices),
+        "created":    created,
+        "updated":    updated,
+        "errors":     errors,
+        "results":    results,
+        "manifest":   manifest,
+    }
+
+
+@mcp.tool()
+def set_extended_properties(
+    properties: list[dict],
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Create or update extended properties on Linnworks inventory items.
+
+    Extended properties are key/value metadata pairs attached to a stock item
+    (e.g. "Colour": "Red", "Material": "Maple").  This tool upserts each
+    property: if a property with the given name already exists on the item it
+    is updated; if not, it is created.
+
+    Note: The Linnworks API has a confirmed typo in the field name — "ProperyName"
+    (one 't') — which this tool handles transparently.
+
+    For batches larger than 50 items this tool requires confirmed_count=<N>.
+
+    Args:
+        properties: List of dicts, each with:
+            - sku (str):            Item SKU  [required]
+            - property_name (str):  Name of the extended property  [required]
+            - property_value (str): Value to set  [required]
+            - property_type (str):  Property type label (e.g. "Attribute",
+                                    "Specification"). Defaults to "Attribute".
+        confirmed_count: For batches > 50, pass len(properties) here.
+        dry_run: If True (default), returns a manifest without writing.
+            Set to False to execute.
+
+    Returns:
+        A dict with:
+          - dry_run:     whether this was a dry run
+          - item_count:  number of property rows in the batch
+          - manifest:    per-item preview (always present)
+          - results:     per-item outcome (live run only)
+          - created:     new properties created (live run only)
+          - updated:     existing properties updated (live run only)
+          - errors:      rows that failed (live run only)
+    """
+    # ── Injection check ───────────────────────────────────────────────────────
+    for p in properties:
+        _check_injection("property_name",  p.get("property_name", ""))
+        _check_injection("property_value", p.get("property_value", ""))
+
+    # ── Validate ──────────────────────────────────────────────────────────────
+    for i, p in enumerate(properties):
+        if not p.get("sku"):
+            raise ValueError(f"properties[{i}] is missing 'sku'.")
+        if not p.get("property_name"):
+            raise ValueError(f"properties[{i}] (SKU '{p.get('sku')}') is missing 'property_name'.")
+        if p.get("property_value") is None:
+            raise ValueError(f"properties[{i}] (SKU '{p.get('sku')}') is missing 'property_value'.")
+
+    sku_cache: dict[str, str] = {}
+    # {stock_item_id: [existing property rows]}
+    existing_props: dict[str, list] = {}
+
+    # ── Read current props + build manifest ───────────────────────────────────
+    manifest = []
+    for p in properties:
+        sku      = p["sku"].strip()
+        prop_name = p["property_name"]
+        prop_val  = str(p["property_value"])
+        prop_type = p.get("property_type", "Attribute")
+
+        try:
+            stock_item_id = _resolve_sku_to_id(sku, sku_cache)
+        except ValueError as exc:
+            manifest.append({
+                "sku": sku, "property_name": prop_name,
+                "property_value": prop_val, "error": str(exc),
+            })
+            continue
+
+        if stock_item_id not in existing_props:
+            rows = call_linnworks(
+                "Inventory/GetInventoryItemExtendedProperties",
+                {"inventoryItemId": stock_item_id},
+            )
+            existing_props[stock_item_id] = rows if isinstance(rows, list) else []
+
+        # Note the confirmed API typo: "ProperyName" not "PropertyName"
+        match = next(
+            (r for r in existing_props[stock_item_id] if r.get("ProperyName") == prop_name),
+            None,
+        )
+        manifest.append({
+            "sku":             sku,
+            "stock_item_id":   stock_item_id,
+            "property_name":   prop_name,
+            "old_value":       match.get("PropertyValue") if match else None,
+            "new_value":       prop_val,
+            "property_type":   prop_type,
+            "action":          "update" if match else "create",
+            "pk_row_id":       match.get("pkRowId") if match else None,
+        })
+
+    # ── Write guard ───────────────────────────────────────────────────────────
+    guard = _write_guard("set_extended_properties", properties, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, "manifest": manifest}
+
+    if dry_run:
+        return {
+            "dry_run":    True,
+            "item_count": len(properties),
+            "manifest":   manifest,
+            "message":    "Dry run — no properties changed. Set dry_run=False to execute.",
+        }
+
+    # ── Live execution — batch creates and updates separately ─────────────────
+    to_create = [m for m in manifest if m.get("action") == "create" and not m.get("error")]
+    to_update = [m for m in manifest if m.get("action") == "update" and not m.get("error")]
+    error_rows = [m for m in manifest if m.get("error")]
+
+    results = []
+    created = 0
+    updated = 0
+    errors  = len(error_rows)
+
+    if to_create:
+        create_payload = [
+            {
+                "fkStockItemId": m["stock_item_id"],
+                "SKU":           m["sku"],
+                "ProperyName":   m["property_name"],   # deliberate API typo
+                "PropertyValue": m["new_value"],
+                "PropertyType":  m["property_type"],
+            }
+            for m in to_create
+        ]
+        call_linnworks(
+            "Inventory/CreateInventoryItemExtendedProperties",
+            {"inventoryItemExtendedProperties": create_payload},
+        )
+        for m in to_create:
+            created += 1
+            results.append({
+                "sku": m["sku"], "action": "created",
+                "property_name": m["property_name"], "value": m["new_value"],
+            })
+
+    if to_update:
+        update_payload = [
+            {
+                "fkStockItemId": m["stock_item_id"],
+                "pkRowId":       m["pk_row_id"],
+                "ProperyName":   m["property_name"],   # deliberate API typo
+                "PropertyValue": m["new_value"],
+                "PropertyType":  m["property_type"],
+            }
+            for m in to_update
+        ]
+        call_linnworks(
+            "Inventory/UpdateInventoryItemExtendedProperties",
+            {"inventoryItemExtendedProperties": update_payload},
+        )
+        for m in to_update:
+            updated += 1
+            results.append({
+                "sku": m["sku"], "action": "updated",
+                "property_name": m["property_name"],
+                "old_value": m["old_value"], "new_value": m["new_value"],
+            })
+
+    for m in error_rows:
+        results.append({"sku": m["sku"], "action": "error", "error": m["error"]})
+
+    return {
+        "dry_run":    False,
+        "item_count": len(properties),
+        "created":    created,
+        "updated":    updated,
+        "errors":     errors,
+        "results":    results,
+        "manifest":   manifest,
+    }
+
+
+@mcp.tool()
+def set_inventory_item_descriptions(
+    descriptions: list[dict],
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Create or update channel-specific descriptions on Linnworks inventory items.
+
+    Descriptions in Linnworks are keyed by (StockItemId, Source, SubSource),
+    allowing different description text per channel.  Pass source="" and
+    sub_source="" to set the default description.
+
+    For batches larger than 50 items this tool requires confirmed_count=<N>.
+
+    Args:
+        descriptions: List of dicts, each with:
+            - sku (str):         Item SKU  [required]
+            - description (str): The description text  [required]
+            - source (str):      Channel source (e.g. "AMAZON"). Defaults to "".
+            - sub_source (str):  Channel sub-source. Defaults to "".
+        confirmed_count: For batches > 50, pass len(descriptions) here.
+        dry_run: If True (default), returns a manifest without writing.
+            Set to False to execute.
+
+    Returns:
+        A dict with:
+          - dry_run:     whether this was a dry run
+          - item_count:  number of description rows in the batch
+          - manifest:    per-item preview (always present)
+          - results:     per-item outcome (live run only)
+          - created:     new rows created (live run only)
+          - updated:     existing rows updated (live run only)
+          - errors:      rows that failed (live run only)
+    """
+    # ── Injection check ───────────────────────────────────────────────────────
+    for d in descriptions:
+        _check_injection("description", d.get("description", ""))
+
+    # ── Validate ──────────────────────────────────────────────────────────────
+    for i, d in enumerate(descriptions):
+        if not d.get("sku"):
+            raise ValueError(f"descriptions[{i}] is missing 'sku'.")
+        if d.get("description") is None:
+            raise ValueError(f"descriptions[{i}] (SKU '{d.get('sku')}') is missing 'description'.")
+
+    sku_cache: dict[str, str] = {}
+    existing_descs: dict[str, list] = {}
+
+    # ── Read existing + build manifest ────────────────────────────────────────
+    manifest = []
+    for d in descriptions:
+        sku        = d["sku"].strip()
+        source     = d.get("source", "")
+        sub_source = d.get("sub_source", "")
+        new_desc   = d["description"]
+
+        try:
+            stock_item_id = _resolve_sku_to_id(sku, sku_cache)
+        except ValueError as exc:
+            manifest.append({
+                "sku": sku, "source": source, "sub_source": sub_source,
+                "description": new_desc, "error": str(exc),
+            })
+            continue
+
+        if stock_item_id not in existing_descs:
+            rows = call_linnworks_get(
+                "Inventory/GetInventoryItemDescriptions",
+                params={"inventoryItemId": stock_item_id},
+            )
+            existing_descs[stock_item_id] = rows if isinstance(rows, list) else []
+
+        match = next(
+            (r for r in existing_descs[stock_item_id]
+             if r.get("Source", "") == source and r.get("SubSource", "") == sub_source),
+            None,
+        )
+        manifest.append({
+            "sku":             sku,
+            "stock_item_id":   stock_item_id,
+            "source":          source,
+            "sub_source":      sub_source,
+            "old_description": match.get("Description") if match else None,
+            "new_description": new_desc,
+            "action":          "update" if match else "create",
+            "pk_row_id":       match.get("pkRowId") if match else None,
+        })
+
+    # ── Write guard ───────────────────────────────────────────────────────────
+    guard = _write_guard("set_inventory_item_descriptions", descriptions, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, "manifest": manifest}
+
+    if dry_run:
+        return {
+            "dry_run":    True,
+            "item_count": len(descriptions),
+            "manifest":   manifest,
+            "message":    "Dry run — no descriptions changed. Set dry_run=False to execute.",
+        }
+
+    # ── Live execution ─────────────────────────────────────────────────────────
+    to_create  = [m for m in manifest if m.get("action") == "create" and not m.get("error")]
+    to_update  = [m for m in manifest if m.get("action") == "update" and not m.get("error")]
+    error_rows = [m for m in manifest if m.get("error")]
+
+    results = []
+    created = 0
+    updated = 0
+    errors  = len(error_rows)
+
+    if to_create:
+        create_payload = [
+            {
+                "StockItemId": m["stock_item_id"],
+                "Source":      m["source"],
+                "SubSource":   m["sub_source"],
+                "Description": m["new_description"],
+            }
+            for m in to_create
+        ]
+        call_linnworks(
+            "Inventory/CreateInventoryItemDescriptions",
+            {"inventoryItemDescriptions": create_payload},
+        )
+        for m in to_create:
+            created += 1
+            results.append({
+                "sku": m["sku"], "action": "created",
+                "source": m["source"], "sub_source": m["sub_source"],
+            })
+
+    if to_update:
+        update_payload = [
+            {
+                "StockItemId": m["stock_item_id"],
+                "pkRowId":     m["pk_row_id"],
+                "Source":      m["source"],
+                "SubSource":   m["sub_source"],
+                "Description": m["new_description"],
+            }
+            for m in to_update
+        ]
+        call_linnworks(
+            "Inventory/UpdateInventoryItemDescriptions",
+            {"inventoryItemDescriptions": update_payload},
+        )
+        for m in to_update:
+            updated += 1
+            results.append({
+                "sku": m["sku"], "action": "updated",
+                "source": m["source"], "sub_source": m["sub_source"],
+                "old_description": m["old_description"],
+                "new_description": m["new_description"],
+            })
+
+    for m in error_rows:
+        results.append({"sku": m["sku"], "action": "error", "error": m["error"]})
+
+    return {
+        "dry_run":    False,
+        "item_count": len(descriptions),
+        "created":    created,
+        "updated":    updated,
+        "errors":     errors,
+        "results":    results,
+        "manifest":   manifest,
+    }
+
+
+@mcp.tool()
+def add_inventory_item_images(
+    images: list[dict],
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Add images to Linnworks inventory items by URL.
+
+    Each entry attaches one image URL to a stock item.  Images are additive —
+    existing images are not removed.  Use is_main=True to set the uploaded
+    image as the item's primary image.
+
+    For batches larger than 100 items this tool requires confirmed_count=<N>.
+
+    Args:
+        images: List of dicts, each with:
+            - sku (str):        Item SKU  [required]
+            - image_url (str):  Publicly accessible URL of the image  [required]
+            - is_main (bool):   Set as the main product image. Defaults to False.
+        confirmed_count: For batches > 100, pass len(images) here.
+        dry_run: If True (default), returns a manifest without writing.
+            Set to False to execute.
+
+    Returns:
+        A dict with:
+          - dry_run:     whether this was a dry run
+          - item_count:  number of image rows in the batch
+          - manifest:    per-item preview (always present)
+          - results:     per-item outcome (live run only)
+          - added:       images successfully added (live run only)
+          - errors:      images that failed (live run only)
+    """
+    # ── Injection check ───────────────────────────────────────────────────────
+    for img in images:
+        _check_injection("image_url", img.get("image_url", ""))
+
+    # ── Validate ──────────────────────────────────────────────────────────────
+    for i, img in enumerate(images):
+        if not img.get("sku"):
+            raise ValueError(f"images[{i}] is missing 'sku'.")
+        if not img.get("image_url"):
+            raise ValueError(f"images[{i}] (SKU '{img.get('sku')}') is missing 'image_url'.")
+
+    sku_cache: dict[str, str] = {}
+
+    # ── Build manifest ────────────────────────────────────────────────────────
+    manifest = []
+    for img in images:
+        sku = img["sku"].strip()
+        try:
+            stock_item_id = _resolve_sku_to_id(sku, sku_cache)
+            manifest.append({
+                "sku":           sku,
+                "stock_item_id": stock_item_id,
+                "image_url":     img["image_url"],
+                "is_main":       img.get("is_main", False),
+            })
+        except ValueError as exc:
+            manifest.append({
+                "sku": sku, "image_url": img.get("image_url"),
+                "is_main": img.get("is_main", False), "error": str(exc),
+            })
+
+    # ── Write guard ───────────────────────────────────────────────────────────
+    guard = _write_guard("add_inventory_item_images", images, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, "manifest": manifest}
+
+    if dry_run:
+        return {
+            "dry_run":    True,
+            "item_count": len(images),
+            "manifest":   manifest,
+            "message":    "Dry run — no images added. Set dry_run=False to execute.",
+        }
+
+    # ── Live execution (one call per image — no bulk endpoint) ────────────────
+    results = []
+    added  = 0
+    errors = 0
+
+    for m in manifest:
+        if m.get("error"):
+            errors += 1
+            results.append({"sku": m["sku"], "action": "error", "error": m["error"]})
+            continue
+        try:
+            call_linnworks(
+                "Inventory/AddImageToInventoryItem",
+                {
+                    "request": {
+                        "StockItemId": m["stock_item_id"],
+                        "ImageUrl":    m["image_url"],
+                        "IsMain":      m["is_main"],
+                    }
+                },
+            )
+            added += 1
+            results.append({
+                "sku": m["sku"], "action": "added",
+                "image_url": m["image_url"], "is_main": m["is_main"],
+            })
+        except Exception as exc:
+            errors += 1
+            results.append({"sku": m["sku"], "action": "error", "error": str(exc)})
+
+    return {
+        "dry_run":    False,
+        "item_count": len(images),
+        "added":      added,
+        "errors":     errors,
+        "results":    results,
+        "manifest":   manifest,
+    }
+
+
+@mcp.tool()
+def create_variation_group(
+    group_name: str,
+    parent_sku: str,
+    child_skus: list[str],
+    dry_run: bool = True,
+) -> dict:
+    """
+    Create a variation group in Linnworks, linking a parent item to its children.
+
+    A variation group connects items that are variants of the same product
+    (e.g. a T-shirt in different sizes/colours).  The parent item becomes the
+    variation template; child SKUs are the individual sellable variants.
+
+    All SKUs must already exist in Linnworks before creating the group.
+    If a group with the same name already exists this tool reports it and
+    does not create a duplicate.
+
+    Args:
+        group_name: The name for the variation group.  [required]
+        parent_sku: SKU of the item that will be the variation parent.  [required]
+        child_skus: List of SKUs that are children (variants) of the parent.
+            The parent SKU should NOT be included here.  [required]
+        dry_run: If True (default), validates all SKUs and shows what would be
+            created without writing. Set to False to execute.
+
+    Returns:
+        A dict with:
+          - dry_run:          whether this was a dry run
+          - group_name:       the requested group name
+          - parent_sku:       the parent SKU
+          - child_skus:       the child SKUs
+          - parent_id:        resolved parent StockItemId
+          - child_ids:        resolved child StockItemIds
+          - status:           "dry_run", "created", "already_exists", or "error"
+          - message:          human-readable outcome
+    """
+    _check_injection("group_name", group_name)
+
+    # ── Resolve all SKUs ──────────────────────────────────────────────────────
+    sku_cache: dict[str, str] = {}
+    try:
+        parent_id = _resolve_sku_to_id(parent_sku, sku_cache)
+    except ValueError as exc:
+        return {
+            "dry_run": dry_run, "group_name": group_name,
+            "parent_sku": parent_sku, "status": "error",
+            "message": f"Parent SKU resolution failed: {exc}",
+        }
+
+    child_ids = []
+    child_errors = []
+    for sku in child_skus:
+        try:
+            child_ids.append(_resolve_sku_to_id(sku, sku_cache))
+        except ValueError as exc:
+            child_errors.append({"sku": sku, "error": str(exc)})
+
+    if child_errors:
+        return {
+            "dry_run": dry_run, "group_name": group_name,
+            "parent_sku": parent_sku, "child_skus": child_skus,
+            "status": "error",
+            "message": f"{len(child_errors)} child SKU(s) could not be resolved.",
+            "child_errors": child_errors,
+        }
+
+    # ── Check if group already exists ─────────────────────────────────────────
+    try:
+        existing_group = call_linnworks_get(
+            "Stock/GetVariationGroupByName",
+            params={"variationGroupName": group_name},
+        )
+        if existing_group and existing_group.get("VariationGroupName"):
+            return {
+                "dry_run":    dry_run,
+                "group_name": group_name,
+                "parent_sku": parent_sku,
+                "child_skus": child_skus,
+                "status":     "already_exists",
+                "message": (
+                    f"A variation group named '{group_name}' already exists "
+                    f"in Linnworks. No new group was created."
+                ),
+                "existing_group": existing_group,
+            }
+    except RuntimeError:
+        pass  # 404 or similar means the group does not exist — proceed
+
+    base = {
+        "dry_run":    dry_run,
+        "group_name": group_name,
+        "parent_sku": parent_sku,
+        "child_skus": child_skus,
+        "parent_id":  parent_id,
+        "child_ids":  child_ids,
+    }
+
+    if dry_run:
+        return {
+            **base,
+            "status":  "dry_run",
+            "message": (
+                f"Dry run — would create variation group '{group_name}' "
+                f"with parent '{parent_sku}' and {len(child_skus)} child(ren). "
+                f"Set dry_run=False to create."
+            ),
+        }
+
+    # ── Create the group ──────────────────────────────────────────────────────
+    call_linnworks(
+        "Stock/CreateVariationGroup",
+        {
+            "template": {
+                "VariationGroupName": group_name,
+                "ParentSKU":          parent_sku,
+                "ParentStockItemId":  parent_id,
+                "VariationItemIds":   child_ids,
+            }
+        },
+    )
+
+    # Read back to confirm
+    try:
+        confirmed = call_linnworks_get(
+            "Stock/GetVariationGroupByName",
+            params={"variationGroupName": group_name},
+        )
+    except RuntimeError:
+        confirmed = None
+
+    return {
+        **base,
+        "status":         "created",
+        "confirmed_group": confirmed,
+        "message": (
+            f"Variation group '{group_name}' created with parent '{parent_sku}' "
+            f"and {len(child_ids)} child item(s)."
         ),
     }
 

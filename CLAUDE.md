@@ -1,6 +1,6 @@
 # Linnworks MCP Server — Claude context
 
-**Current version: 1.10.0** — 44 tools. See `pyproject.toml` for full metadata.
+**Current version: 1.11.0** — 51 tools. See `pyproject.toml` for full metadata.
 
 ---
 
@@ -104,8 +104,12 @@ def set_stock_levels(updates: list[dict], confirmed_count: int | None = None, dr
 
 ## Tools
 
-32 tools (27 original + 3 in v1.4.0 + 1 in v1.5.0), all live-tested. See `server.py` for full docstrings and parameter details.
+51 tools (44 in v1.10.0 + 7 in v1.11.0). See `server.py` for full docstrings and parameter details.
 
+> **v1.11.0:** Inventory write suite — `create_or_update_inventory_item`, `set_stock_levels`, `set_inventory_item_prices`, `set_extended_properties`, `set_inventory_item_descriptions`, `add_inventory_item_images`, `create_variation_group`. All protected by `_write_guard` + `_check_injection`. Spec-based; not yet live-tested.
+>
+> **v1.10.0:** Write-safety framework (`_write_guard`, `_check_injection`, `WRITE_THRESHOLDS`). `run_import` and `run_export`.
+>
 > **v1.5.0:** `get_order` now returns `delivery_address` and `billing_address` dicts with all address fields. New `set_order_address` write tool.
 
 ### Orders & stock (read)
@@ -178,6 +182,22 @@ Rule types seen in practice: `Orders` (fires on incoming orders), `Test` (sandbo
 | `run_import(import_id, dry_run=True)` | Queue an import for immediate execution; read-before-run shows config preview; refuses if already executing/queued; spec-based, not yet live-tested |
 | `run_export(export_id, dry_run=True)` | Queue an export for immediate execution; same pattern as `run_import`; spec-based, not yet live-tested |
 
+### Inventory writes (v1.11.0 — spec-based, not yet live-tested)
+
+All write tools use `_write_guard` (staged-manifest gate) and `_check_injection` (injection tripwire). All default to `dry_run=True`. See the **Write-safety framework** section above for the protection design.
+
+The helper `_resolve_sku_to_id(sku, cache)` is shared across all write tools — it resolves SKU → StockItemId GUID via `Inventory/GetInventoryItem`. Results are cached within a single tool call to avoid redundant API calls for the same SKU.
+
+| Tool | Endpoint(s) | Threshold | Notes |
+|---|---|---|---|
+| `create_or_update_inventory_item(items, confirmed_count, dry_run=True)` | `Inventory/AddInventoryItem` / `Inventory/UpdateInventoryItem` | 50 | Upsert by SKU — probes existence with GetInventoryItem, then creates or updates. On update, reads existing fields and merges so unsupplied fields are preserved. Returns per-item action (created/updated/error). Fields: sku, title, barcode, retail_price, purchase_price, tax_rate, category_name, weight, height, width, depth, metadata. |
+| `set_stock_levels(updates, confirmed_count, dry_run=True)` | `Stock/UpdateStockLevelsBulk` | 25 | Absolute stock level overwrite. Read-before-write captures current levels for diff. Per-item `Errors[]` in response reported individually. Fields: sku, stock_level, location_id. |
+| `set_inventory_item_prices(prices, confirmed_count, dry_run=True)` | `Inventory/CreateInventoryItemPrices` / `Inventory/UpdateInventoryItemPrices` | 25 | Price upsert keyed by (StockItemId, Source, SubSource). Reads existing price rows first; creates new rows or updates existing by pkRowId. Fields: sku, price, source, sub_source. |
+| `set_extended_properties(properties, confirmed_count, dry_run=True)` | `Inventory/CreateInventoryItemExtendedProperties` / `Inventory/UpdateInventoryItemExtendedProperties` | 50 | Property upsert keyed by ProperyName (deliberate API typo). Reads existing props first; creates or updates. `_check_injection` on property_name and property_value. Fields: sku, property_name, property_value, property_type. |
+| `set_inventory_item_descriptions(descriptions, confirmed_count, dry_run=True)` | `Inventory/CreateInventoryItemDescriptions` / `Inventory/UpdateInventoryItemDescriptions` | 50 | Description upsert keyed by (StockItemId, Source, SubSource). `_check_injection` on description. Fields: sku, description, source, sub_source. |
+| `add_inventory_item_images(images, confirmed_count, dry_run=True)` | `Inventory/AddImageToInventoryItem` | 100 | Additive only — existing images not removed. One API call per image (no bulk endpoint). `_check_injection` on image_url. Fields: sku, image_url, is_main. |
+| `create_variation_group(group_name, parent_sku, child_skus, dry_run=True)` | `Stock/CreateVariationGroup` | — (single op) | Checks for existing group first (GetVariationGroupByName). Resolves all SKUs to GUIDs. Read-back confirms creation. `_check_injection` on group_name. |
+
 ---
 
 ## Confirmed working endpoints
@@ -223,6 +243,20 @@ Rule types seen in practice: `Orders` (fires on incoming orders), `Test` (sandbo
 | `Orders/GetOrderNotes` | GET | `?orderId=<guid>` | Returns a plain JSON array of `OrderNote` objects; **canonical fields per OpenAPI spec (confirmed May 2026)**: `OrderNoteId`, `OrderId`, `NoteDate`, `Internal` (bool, no `Is` prefix), `Note`, `CreatedBy`, `NoteTypeId`; **GUID required** — numeric IDs must be resolved first; **previously documented field names `pkOrderNoteId`/`IsInternal`/`NoteCreatedOn` were wrong** (fixed in issue #7) |
 | `Orders/AddOrdersNote` | POST | `{"OrderIds":["guid",...],"NoteText":"...","IsInternal":true,"IsProcessingNote":false}` **unwrapped** | Accepts a list of order GUIDs; works on both open and processed orders |
 | `ProcessedOrders/DeleteOrderNote` | POST | `{"pkOrderNoteId":"guid"}` **unwrapped** | Deletes a single note by its GUID; works on both open and processed orders; **no UpdateOrderNote endpoint exists** — use delete+add via `update_order_note` instead |
+| `Inventory/AddInventoryItem` | POST | `{"inventoryItem": {ItemNumber, ItemTitle, BarcodeNumber, RetailPrice, PurchasePrice, TaxRate, CategoryName, Weight, Height, Width, Depth, MetaData, ...}}` **unwrapped** | Creates a new inventory item; response includes `fkStockItemId` (the new GUID); **spec-based, not yet live-tested** |
+| `Inventory/UpdateInventoryItem` | POST | `{"inventoryItem": {StockItemId, ItemNumber, ItemTitle, ...all fields...}}` **unwrapped** | Updates an existing item; must carry ALL fields (nulls clear values — same gotcha as PO header update); **spec-based, not yet live-tested** |
+| `Inventory/GetInventoryItemPrices` | GET | `?inventoryItemId=<guid>` | Returns array of price rows `[{pkRowId, Source, SubSource, Price, Tag, ...}]`; used as read-before-write for `set_inventory_item_prices`; **spec-based, not yet live-tested** |
+| `Inventory/CreateInventoryItemPrices` | POST | `{"inventoryItemPrices": [{StockItemId, Source, SubSource, Price}]}` | Creates new price rows (no pkRowId needed); **spec-based, not yet live-tested** |
+| `Inventory/UpdateInventoryItemPrices` | POST | `{"inventoryItemPrices": [{StockItemId, pkRowId, Source, SubSource, Price}]}` | Updates existing price rows by pkRowId; **spec-based, not yet live-tested** |
+| `Inventory/GetInventoryItemDescriptions` | GET | `?inventoryItemId=<guid>` | Returns array of description rows; used as read-before-write for `set_inventory_item_descriptions`; **spec-based, not yet live-tested** |
+| `Inventory/CreateInventoryItemDescriptions` | POST | `{"inventoryItemDescriptions": [{StockItemId, Source, SubSource, Description}]}` | Creates new description rows; **spec-based, not yet live-tested** |
+| `Inventory/UpdateInventoryItemDescriptions` | POST | `{"inventoryItemDescriptions": [{StockItemId, pkRowId, Source, SubSource, Description}]}` | Updates existing description rows by pkRowId; **spec-based, not yet live-tested** |
+| `Inventory/CreateInventoryItemExtendedProperties` | POST | `{"inventoryItemExtendedProperties": [{fkStockItemId, SKU, ProperyName, PropertyValue, PropertyType}]}` | Creates new extended property rows; note deliberate API typo `ProperyName`; **spec-based, not yet live-tested** |
+| `Inventory/UpdateInventoryItemExtendedProperties` | POST | `{"inventoryItemExtendedProperties": [{fkStockItemId, pkRowId, ProperyName, PropertyValue, PropertyType}]}` | Updates existing property rows by pkRowId; note deliberate API typo; **spec-based, not yet live-tested** |
+| `Inventory/AddImageToInventoryItem` | POST | `{"request": {StockItemId, ImageUrl, IsMain}}` | Adds a single image by URL; no bulk equivalent — iterate per item; **spec-based, not yet live-tested** |
+| `Stock/UpdateStockLevelsBulk` | POST | `{"Items": [{SKU, StockItemId, StockLocationId, StockLevel}]}` | Sets absolute stock levels; response mirrors request shape plus per-item `Errors[]` array; **spec-based, not yet live-tested** |
+| `Stock/CreateVariationGroup` | POST | `{"template": {VariationGroupName, ParentSKU, ParentStockItemId, VariationItemIds: [guid]}}` | Creates a new variation group; all child GUIDs must resolve to existing items; **spec-based, not yet live-tested** |
+| `Stock/GetVariationGroupByName` | GET | `?variationGroupName=<string>` | Returns the variation group matching the name, or 404 if not found; used as pre-flight check in `create_variation_group`; **spec-based, not yet live-tested** |
 
 ---
 
