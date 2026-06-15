@@ -344,6 +344,7 @@ WRITE_THRESHOLDS: dict[str, int] = {
     "set_extended_properties":        50,   # metadata, lower blast radius
     "set_inventory_item_descriptions": 50,  # content, lower blast radius
     "add_inventory_item_images":      100,  # additive-only, no overwrites
+    "delete_inventory_item":          10,   # IRREVERSIBLE — lowest threshold of all
     "default":                        25,   # fallback for any unlisted operation
 }
 
@@ -6660,6 +6661,213 @@ def create_variation_group(
             f"and {len(child_ids)} child item(s)."
         ),
     }
+
+
+@mcp.tool()
+def delete_inventory_item(
+    skus: list[str],
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    PERMANENTLY delete one or more inventory items from Linnworks by SKU.
+
+    ⚠️  IRREVERSIBLE.  Deleted items CANNOT be restored via the API — their
+    stock levels, prices, descriptions, extended properties, images, and
+    listing links are all destroyed.  The dry-run manifest and the staging
+    gate are the main safety nets.  Always run dry_run=True first and read
+    the manifest carefully before setting dry_run=False.
+
+    Deleting a composite parent, a variation parent, or an item that is on an
+    active channel listing may have side effects — any Linnworks error is
+    surfaced verbatim per item.
+
+    For batches larger than 10 items this tool enters a staging mode: it
+    returns a manifest of exactly what would be destroyed and asks you to
+    confirm with confirmed_count=<N> before executing.
+
+    Uses Inventory/DeleteInventoryItems (payload sent UNWRAPPED — empty 2xx
+    body on success; confirmed live 15 Jun 2026).
+
+    Args:
+        skus: List of exact SKUs / ItemNumbers to delete.  Each is resolved to
+            its StockItemId before deletion.  A SKU that does not resolve is
+            reported as an error row and does NOT abort the rest of the batch.
+        confirmed_count: For batches > 10, pass len(skus) here after reviewing
+            the manifest to confirm the destruction.
+        dry_run: If True (default), returns the manifest of what would be
+            deleted without writing. Set to False to execute.
+
+    Returns:
+        A dict with:
+          - dry_run:     whether this was a dry run
+          - item_count:  number of SKUs in the batch
+          - manifest:    per-item preview (sku, stock_item_id, title,
+                         current_stock, resolved/error) — always present
+          - results:     per-item outcome with deleted flag (live run only)
+          - deleted:     count of items confirmed gone (live run only)
+          - errors:      count of SKUs that failed to resolve or delete
+    """
+    if not skus:
+        raise ValueError("skus must contain at least one SKU.")
+
+    # ── Read-before-write: resolve each SKU + capture title and stock ─────────
+    sku_cache: dict[str, str] = {}
+    manifest: list[dict] = []
+
+    for sku in skus:
+        sku = (sku or "").strip()
+        if not sku:
+            manifest.append({
+                "sku": sku, "stock_item_id": None, "title": None,
+                "current_stock": None, "resolved": False,
+                "error": "empty SKU",
+            })
+            continue
+        try:
+            item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+        except RuntimeError as exc:
+            manifest.append({
+                "sku": sku, "stock_item_id": None, "title": None,
+                "current_stock": None, "resolved": False,
+                "error": f"not found: {exc}",
+            })
+            continue
+
+        stock_item_id = item.get("StockItemId")
+        if not stock_item_id:
+            manifest.append({
+                "sku": sku, "stock_item_id": None,
+                "title": item.get("ItemTitle"),
+                "current_stock": None, "resolved": False,
+                "error": "found but returned no StockItemId",
+            })
+            continue
+
+        sku_cache[sku] = stock_item_id
+
+        # Total current stock across all locations (best-effort, informational)
+        current_stock: int | None = None
+        try:
+            levels_resp = call_linnworks(
+                "Stock/GetStockLevel_Batch",
+                {"request": {"StockItemIds": [stock_item_id]}},
+            )
+            rows = levels_resp if isinstance(levels_resp, list) else (
+                levels_resp.get("StockItemLevels") or []
+            )
+            total = 0
+            for row_group in rows:
+                for row in (row_group if isinstance(row_group, list) else [row_group]):
+                    lvl = row.get("StockLevel")
+                    if isinstance(lvl, (int, float)):
+                        total += lvl
+            current_stock = total
+        except (ValueError, RuntimeError):
+            current_stock = None
+
+        manifest.append({
+            "sku":           sku,
+            "stock_item_id": stock_item_id,
+            "title":         item.get("ItemTitle"),
+            "current_stock": current_stock,
+            "resolved":      True,
+        })
+
+    resolved_rows = [m for m in manifest if m.get("resolved")]
+    resolve_errors = [m for m in manifest if not m.get("resolved")]
+
+    # ── Write guard (threshold 10) ────────────────────────────────────────────
+    guard = _write_guard("delete_inventory_item", skus, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, "manifest": manifest}
+
+    if dry_run:
+        return {
+            "dry_run":    True,
+            "item_count": len(skus),
+            "manifest":   manifest,
+            "message": (
+                f"Dry run — nothing deleted. {len(resolved_rows)} item(s) would be "
+                f"PERMANENTLY deleted, {len(resolve_errors)} could not be resolved. "
+                "Review the manifest, then set dry_run=False to execute. "
+                "This cannot be undone."
+            ),
+        }
+
+    if not resolved_rows:
+        return {
+            "dry_run":    False,
+            "item_count": len(skus),
+            "deleted":    0,
+            "errors":     len(resolve_errors),
+            "results":    [],
+            "manifest":   manifest,
+            "message":    "No SKUs resolved to a StockItemId; nothing was deleted.",
+        }
+
+    # ── Live execution ─────────────────────────────────────────────────────────
+    ids_to_delete = [m["stock_item_id"] for m in resolved_rows]
+    delete_error: str | None = None
+    try:
+        call_linnworks(
+            "Inventory/DeleteInventoryItems",
+            {"inventoryItemIds": ids_to_delete},
+        )
+    except RuntimeError as exc:
+        # Surface the Linnworks error verbatim; read-back below still runs so we
+        # can report which items (if any) actually went.
+        delete_error = str(exc)
+
+    # ── Read-back: probe each resolved SKU; gone => deleted ───────────────────
+    results = []
+    deleted = 0
+    errors = len(resolve_errors)
+    for m in resolved_rows:
+        sku = m["sku"]
+        gone = False
+        probe_note = None
+        try:
+            call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+            gone = False  # still exists
+        except RuntimeError:
+            gone = True   # not found => deleted
+        if gone:
+            deleted += 1
+        else:
+            errors += 1
+            probe_note = "still exists after delete call"
+        results.append({
+            "sku":           sku,
+            "stock_item_id": m["stock_item_id"],
+            "title":         m.get("title"),
+            "deleted":       gone,
+            **({"note": probe_note} if probe_note else {}),
+        })
+
+    for m in resolve_errors:
+        results.append({
+            "sku":           m["sku"],
+            "stock_item_id": None,
+            "deleted":       False,
+            "error":         m.get("error"),
+        })
+
+    out = {
+        "dry_run":    False,
+        "item_count": len(skus),
+        "deleted":    deleted,
+        "errors":     errors,
+        "results":    results,
+        "manifest":   manifest,
+    }
+    if delete_error is not None:
+        out["delete_error"] = delete_error
+        out["message"] = (
+            "Linnworks returned an error on DeleteInventoryItems (surfaced in "
+            "delete_error). Per-item read-back results show what actually got deleted."
+        )
+    return out
 
 
 # ---------- Entrypoint ----------

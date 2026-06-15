@@ -1,6 +1,6 @@
 # Linnworks MCP Server — Claude context
 
-**Current version: 1.13.0** — 52 tools. See `pyproject.toml` for full metadata.
+**Current version: 1.14.0** — 53 tools. See `pyproject.toml` for full metadata.
 
 ---
 
@@ -205,6 +205,7 @@ The helper `_resolve_sku_to_id(sku, cache)` is shared across all write tools —
 | `set_inventory_item_descriptions(descriptions, confirmed_count, dry_run=True)` | `Inventory/CreateInventoryItemDescriptions` / `Inventory/UpdateInventoryItemDescriptions` | 50 | Description upsert keyed by (StockItemId, Source, SubSource). `_check_injection` on description. Fields: sku, description, source, sub_source. |
 | `add_inventory_item_images(images, confirmed_count, dry_run=True)` | `Inventory/AddImageToInventoryItem` | 100 | Additive only — existing images not removed. One API call per image (no bulk endpoint). `_check_injection` on image_url. Fields: sku, image_url, is_main. |
 | `create_variation_group(group_name, parent_sku, child_skus, dry_run=True)` | `Stock/CreateVariationGroup` | — (single op) | Checks for existing group first (GetVariationGroupByName). Resolves all SKUs to GUIDs. Read-back confirms creation. `_check_injection` on group_name. |
+| `delete_inventory_item(skus, confirmed_count, dry_run=True)` | `Inventory/DeleteInventoryItems` | 10 | **IRREVERSIBLE.** Read-before-write resolves each SKU → StockItemId and captures title + total stock into the manifest; unresolvable SKUs become error rows (don't abort the batch). Lowest staging threshold of the suite (10). Single delete call with the resolved GUID list; per-SKU read-back via GetInventoryItem confirms each is gone (`deleted: true/false`). Any Linnworks delete error surfaced verbatim in `delete_error`. **Live-tested 15 Jun 2026** — create → dry-run → delete → confirm-gone cycle verified against a throwaway `ZZZ-MCP-TEST-*` SKU (closes #12). |
 
 ---
 
@@ -253,7 +254,7 @@ The helper `_resolve_sku_to_id(sku, cache)` is shared across all write tools —
 | `ProcessedOrders/DeleteOrderNote` | POST | `{"pkOrderNoteId":"guid"}` **unwrapped** | Deletes a single note by its GUID; works on both open and processed orders; **no UpdateOrderNote endpoint exists** — use delete+add via `update_order_note` instead |
 | `Inventory/AddInventoryItem` | POST | `{"inventoryItem": {StockItemId, ItemNumber, ItemTitle, BarcodeNumber, RetailPrice, ...}}` **unwrapped** | Creates a new inventory item; **`StockItemId` is REQUIRED and must be a client-generated GUID** (`uuid.uuid4()`) — omitting it returns HTTP 400 "StockItem StockItemId could not be empty"; returns an empty 2xx body on success (the generated GUID is the new item ID); **live-tested 15 Jun 2026** |
 | `Inventory/UpdateInventoryItem` | POST | `{"inventoryItem": {StockItemId, ItemNumber, ItemTitle, ...all fields...}}` **unwrapped** | Updates an existing item; must carry ALL fields (nulls clear values — same gotcha as PO header update); empty 2xx body on success; **live-tested 15 Jun 2026** |
-| `Inventory/DeleteInventoryItems` | POST | `{"inventoryItemIds": ["guid",...]}` **unwrapped** | Permanently deletes items by StockItemId GUID; empty 2xx body on success; not wrapped in a tool yet (no delete tool in the suite) but **confirmed working 15 Jun 2026** (used to clean up test items) — candidate for a future `delete_inventory_item` tool |
+| `Inventory/DeleteInventoryItems` | POST | `{"inventoryItemIds": ["guid",...]}` **unwrapped** | Permanently deletes items by StockItemId GUID; empty 2xx body on success; wrapped by the `delete_inventory_item` tool (v1.14.0); **live-tested 15 Jun 2026** — create → delete → read-back-gone cycle confirmed |
 | `Inventory/GetInventoryItemPrices` | GET | `?inventoryItemId=<guid>` | Returns array of price rows `[{pkRowId, Source, SubSource, Price, Tag, ...}]`; used as read-before-write for `set_inventory_item_prices`; **read confirmed live 15 Jun 2026** (one row per Source/SubSource channel) |
 | `Inventory/CreateInventoryItemPrices` | POST | `{"inventoryItemPrices": [{pkRowId, StockItemId, Source, SubSource, Price}]}` | Creates new channel price rows; **`pkRowId` must be a client-generated GUID** (omitting it → PK collision on zero-GUID); empty 2xx body; **only for genuine channel rows** — the default price (empty Source+SubSource) is the implicit zero-GUID row not returned by the GET, so set it via Update (pkRowId `00000000-...`) instead; **live-tested 15 Jun 2026** |
 | `Inventory/UpdateInventoryItemPrices` | POST | `{"inventoryItemPrices": [{StockItemId, pkRowId, Source, SubSource, Price}]}` | Updates existing price rows by pkRowId; **spec-based, not yet live-tested** |
