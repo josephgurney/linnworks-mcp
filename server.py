@@ -1820,15 +1820,18 @@ def find_orders_by_reference(
 
     # --- Step 1: API-native search ---
     # SearchOrders returns GUIDs grouped into OpenOrders views and ProcessedOrders.
-    # Payload uses the {"request": {...}} wrapper consistent with other OpenOrders endpoints.
+    # Payload must be sent UNWRAPPED (no {"request": {...}} wrapper) — despite the
+    # OpenAPI spec naming the body parameter "request" exactly like
+    # GetOrdersLowFidelity (which DOES need the wrapper). Live-tested 15 Jun 2026:
+    # the wrapped form returns HTTP 400 "Must provide a search term." (the SearchTerm
+    # gets buried), while the unwrapped form returns HTTP 200. Same surprise as
+    # PurchaseOrder/Search_PurchaseOrders2.
     resp = call_linnworks(
         "OpenOrders/SearchOrders",
         {
-            "request": {
-                "LocationId": location_id,
-                "SearchTerm": reference,
-                "IncludeProcessed": include_processed,
-            }
+            "LocationId": location_id,
+            "SearchTerm": reference,
+            "IncludeProcessed": include_processed,
         },
     )
 
