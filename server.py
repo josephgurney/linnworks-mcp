@@ -211,7 +211,16 @@ def call_linnworks(method_path: str, payload: dict) -> dict:
     if not response.text.strip():
         return {}
 
-    return response.json()
+    # Some write endpoints return a 2xx with a NON-empty, NON-JSON body on
+    # success — e.g. Create/UpdateInventoryItemExtendedProperties return a
+    # plain-text body that json() rejects with "Expecting value: line 1
+    # column 1 (char 0)". A non-raising 2xx already means the write succeeded,
+    # so fall back to wrapping the raw text instead of mis-reporting it as a
+    # failure. Confirmed 15 Jun 2026 (issue #13).
+    try:
+        return response.json()
+    except ValueError:
+        return {"raw": response.text}
 
 
 def call_linnworks_void(method_path: str, payload: dict) -> None:
