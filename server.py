@@ -13,6 +13,7 @@ __version__ = "1.11.0"
 
 import os
 import sys
+import uuid
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
@@ -201,6 +202,14 @@ def call_linnworks(method_path: str, payload: dict) -> dict:
         raise RuntimeError(
             f"Linnworks {method_path} failed: HTTP {response.status_code} — {response.text}"
         )
+
+    # Several write endpoints (AddInventoryItem, UpdateInventoryItem,
+    # CreateInventoryItemPrices, UpdateStockLevelsBulk, etc.) return a 2xx with
+    # an EMPTY body on success. response.json() raises on empty text, which
+    # would mis-report a successful write as an error — so treat an empty 2xx
+    # body as a successful no-content result. Confirmed live 15 Jun 2026.
+    if not response.text.strip():
+        return {}
 
     return response.json()
 
@@ -5628,7 +5637,14 @@ def create_or_update_inventory_item(
 
             else:
                 # Create path — only the fields we have.
+                # Linnworks AddInventoryItem requires a client-generated
+                # StockItemId GUID even for new items; omitting it returns
+                # HTTP 400 "StockItem StockItemId could not be empty"
+                # (confirmed live 15 Jun 2026). Generate one and reuse it as
+                # the new item's ID.
+                new_guid = str(uuid.uuid4())
                 item_payload = {
+                    "StockItemId":   new_guid,
                     "ItemNumber":    sku,
                     "ItemTitle":     entry.get("title", ""),
                     "BarcodeNumber": entry.get("barcode", ""),
@@ -5643,7 +5659,7 @@ def create_or_update_inventory_item(
                     "MetaData":      entry.get("metadata", ""),
                 }
                 resp = call_linnworks("Inventory/AddInventoryItem", {"inventoryItem": item_payload})
-                new_id = resp.get("fkStockItemId") or resp.get("StockItemId") or ""
+                new_id = (resp.get("fkStockItemId") if isinstance(resp, dict) else None) or new_guid
                 created += 1
                 results.append({
                     "sku": sku, "action": "created", "stock_item_id": new_id,
@@ -5791,6 +5807,29 @@ def set_stock_levels(
 
     results = []
     errors = 0
+
+    # UpdateStockLevelsBulk returns a 2xx with an EMPTY body on success on this
+    # tenant — it does NOT echo the Items array (confirmed live 15 Jun 2026). When
+    # nothing is echoed, treat every submitted line as applied (a non-2xx would
+    # have raised in call_linnworks). Read back with get_stock_level to verify.
+    if not response_items:
+        for bi in bulk_items:
+            results.append({
+                "sku":         bi.get("SKU"),
+                "location_id": bi.get("StockLocationId"),
+                "new_level":   bi.get("StockLevel"),
+                "success":     True,
+                "errors":      [],
+                "note":        "API returned no content; success inferred from 2xx. Verify with get_stock_level.",
+            })
+        return {
+            "dry_run":    False,
+            "item_count": len(updates),
+            "errors":     errors,
+            "results":    results,
+            "manifest":   manifest,
+        }
+
     for idx, item in enumerate(response_items):
         errs = item.get("Errors") or []
         ok = len(errs) == 0
@@ -5896,6 +5935,18 @@ def set_inventory_item_prices(
              if r.get("Source", "") == source and r.get("SubSource", "") == sub_source),
             None,
         )
+        # Decide create vs update. The DEFAULT price row (empty Source+SubSource)
+        # exists implicitly with the zero GUID but is NOT returned by
+        # GetInventoryItemPrices — so creating it collides on PK_StockItem_Pricing.
+        # Update the zero-GUID row instead. Channel rows that genuinely don't
+        # exist are created (with a fresh pkRowId — see live-execution block).
+        # Confirmed live 15 Jun 2026.
+        if match:
+            action, pk_row_id = "update", match.get("pkRowId")
+        elif source == "" and sub_source == "":
+            action, pk_row_id = "update", "00000000-0000-0000-0000-000000000000"
+        else:
+            action, pk_row_id = "create", None
         manifest.append({
             "sku":           sku,
             "stock_item_id": stock_item_id,
@@ -5903,8 +5954,8 @@ def set_inventory_item_prices(
             "sub_source":    sub_source,
             "current_price": match.get("Price") if match else None,
             "new_price":     new_price,
-            "action":        "update" if match else "create",
-            "pk_row_id":     match.get("pkRowId") if match else None,
+            "action":        action,
+            "pk_row_id":     pk_row_id,
         })
 
     # ── Write guard ───────────────────────────────────────────────────────────
@@ -5933,6 +5984,7 @@ def set_inventory_item_prices(
     if to_create:
         create_payload = [
             {
+                "pkRowId":     str(uuid.uuid4()),  # Linnworks needs a client-supplied GUID
                 "StockItemId": m["stock_item_id"],
                 "Source":      m["source"],
                 "SubSource":   m["sub_source"],
@@ -6113,6 +6165,7 @@ def set_extended_properties(
     if to_create:
         create_payload = [
             {
+                "pkRowId":       str(uuid.uuid4()),  # Linnworks needs a client-supplied GUID
                 "fkStockItemId": m["stock_item_id"],
                 "SKU":           m["sku"],
                 "ProperyName":   m["property_name"],   # deliberate API typo
@@ -6284,6 +6337,7 @@ def set_inventory_item_descriptions(
     if to_create:
         create_payload = [
             {
+                "pkRowId":     str(uuid.uuid4()),  # Linnworks needs a client-supplied GUID
                 "StockItemId": m["stock_item_id"],
                 "Source":      m["source"],
                 "SubSource":   m["sub_source"],

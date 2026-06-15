@@ -1,6 +1,6 @@
 # Linnworks MCP Server — Claude context
 
-**Current version: 1.12.0** — 52 tools. See `pyproject.toml` for full metadata.
+**Current version: 1.13.0** — 52 tools. See `pyproject.toml` for full metadata.
 
 ---
 
@@ -106,7 +106,7 @@ def set_stock_levels(updates: list[dict], confirmed_count: int | None = None, dr
 
 51 tools (44 in v1.10.0 + 7 in v1.11.0). See `server.py` for full docstrings and parameter details.
 
-> **v1.11.0:** Inventory write suite — `create_or_update_inventory_item`, `set_stock_levels`, `set_inventory_item_prices`, `set_extended_properties`, `set_inventory_item_descriptions`, `add_inventory_item_images`, `create_variation_group`. All protected by `_write_guard` + `_check_injection`. Spec-based; not yet live-tested.
+> **v1.11.0:** Inventory write suite — `create_or_update_inventory_item`, `set_stock_levels`, `set_inventory_item_prices`, `set_extended_properties`, `set_inventory_item_descriptions`, `add_inventory_item_images`, `create_variation_group`. All protected by `_write_guard` + `_check_injection`. **Live-tested 15 Jun 2026** against an isolated test SKU (create/update/stock/price/description/extended-property all verified by read-back) — this surfaced and fixed the `StockItemId`/`pkRowId`/empty-body/default-price gotchas; see the Inventory writes section. `add_inventory_item_images` and `create_variation_group` not yet exercised live.
 >
 > **v1.10.0:** Write-safety framework (`_write_guard`, `_check_injection`, `WRITE_THRESHOLDS`). `run_import` and `run_export`.
 >
@@ -183,7 +183,13 @@ Rule types seen in practice: `Orders` (fires on incoming orders), `Test` (sandbo
 | `run_import(import_id, dry_run=True)` | Queue an import for immediate execution; read-before-run shows config preview; refuses if already executing/queued; spec-based, not yet live-tested |
 | `run_export(export_id, dry_run=True)` | Queue an export for immediate execution; same pattern as `run_import`; spec-based, not yet live-tested |
 
-### Inventory writes (v1.11.0 — spec-based, not yet live-tested)
+### Inventory writes (v1.11.0 — **live-tested 15 Jun 2026** against an isolated test SKU)
+
+> **Write-endpoint gotchas confirmed live 15 Jun 2026** (all now handled in code):
+> - **`AddInventoryItem` needs a client-generated `StockItemId` GUID** — omitting it returns HTTP 400 "StockItem StockItemId could not be empty". The tool generates one with `uuid.uuid4()`.
+> - **`Create*` sub-entity endpoints (prices, descriptions, extended properties) need a client-generated `pkRowId` GUID** — omitting it collides on the table PK (HTTP 400 "Violation of PRIMARY KEY ... duplicate key (00000000-...)"). The tools generate one per create row.
+> - **The default price row (empty Source+SubSource) exists implicitly as the zero-GUID row but is NOT returned by `GetInventoryItemPrices`** — so a default-price write must UPDATE pkRowId `00000000-...`, not create. `set_inventory_item_prices` special-cases this; genuine channel rows are created with a fresh `pkRowId`.
+> - **Most write endpoints return a 2xx with an EMPTY body on success** (AddInventoryItem, UpdateInventoryItem, the Create/Update sub-entity calls, UpdateStockLevelsBulk). `call_linnworks` now treats an empty 2xx body as `{}` instead of raising a JSON-decode error. `UpdateStockLevelsBulk` does not echo `Items`, so `set_stock_levels` infers per-item success from the 2xx and recommends a `get_stock_level` read-back.
 
 All write tools use `_write_guard` (staged-manifest gate) and `_check_injection` (injection tripwire). All default to `dry_run=True`. See the **Write-safety framework** section above for the protection design.
 
@@ -244,18 +250,19 @@ The helper `_resolve_sku_to_id(sku, cache)` is shared across all write tools —
 | `Orders/GetOrderNotes` | GET | `?orderId=<guid>` | Returns a plain JSON array of `OrderNote` objects; **canonical fields per OpenAPI spec (confirmed May 2026)**: `OrderNoteId`, `OrderId`, `NoteDate`, `Internal` (bool, no `Is` prefix), `Note`, `CreatedBy`, `NoteTypeId`; **GUID required** — numeric IDs must be resolved first; **previously documented field names `pkOrderNoteId`/`IsInternal`/`NoteCreatedOn` were wrong** (fixed in issue #7) |
 | `Orders/AddOrdersNote` | POST | `{"OrderIds":["guid",...],"NoteText":"...","IsInternal":true,"IsProcessingNote":false}` **unwrapped** | Accepts a list of order GUIDs; works on both open and processed orders |
 | `ProcessedOrders/DeleteOrderNote` | POST | `{"pkOrderNoteId":"guid"}` **unwrapped** | Deletes a single note by its GUID; works on both open and processed orders; **no UpdateOrderNote endpoint exists** — use delete+add via `update_order_note` instead |
-| `Inventory/AddInventoryItem` | POST | `{"inventoryItem": {ItemNumber, ItemTitle, BarcodeNumber, RetailPrice, PurchasePrice, TaxRate, CategoryName, Weight, Height, Width, Depth, MetaData, ...}}` **unwrapped** | Creates a new inventory item; response includes `fkStockItemId` (the new GUID); **spec-based, not yet live-tested** |
-| `Inventory/UpdateInventoryItem` | POST | `{"inventoryItem": {StockItemId, ItemNumber, ItemTitle, ...all fields...}}` **unwrapped** | Updates an existing item; must carry ALL fields (nulls clear values — same gotcha as PO header update); **spec-based, not yet live-tested** |
+| `Inventory/AddInventoryItem` | POST | `{"inventoryItem": {StockItemId, ItemNumber, ItemTitle, BarcodeNumber, RetailPrice, ...}}` **unwrapped** | Creates a new inventory item; **`StockItemId` is REQUIRED and must be a client-generated GUID** (`uuid.uuid4()`) — omitting it returns HTTP 400 "StockItem StockItemId could not be empty"; returns an empty 2xx body on success (the generated GUID is the new item ID); **live-tested 15 Jun 2026** |
+| `Inventory/UpdateInventoryItem` | POST | `{"inventoryItem": {StockItemId, ItemNumber, ItemTitle, ...all fields...}}` **unwrapped** | Updates an existing item; must carry ALL fields (nulls clear values — same gotcha as PO header update); empty 2xx body on success; **live-tested 15 Jun 2026** |
+| `Inventory/DeleteInventoryItems` | POST | `{"inventoryItemIds": ["guid",...]}` **unwrapped** | Permanently deletes items by StockItemId GUID; empty 2xx body on success; not wrapped in a tool yet (no delete tool in the suite) but **confirmed working 15 Jun 2026** (used to clean up test items) — candidate for a future `delete_inventory_item` tool |
 | `Inventory/GetInventoryItemPrices` | GET | `?inventoryItemId=<guid>` | Returns array of price rows `[{pkRowId, Source, SubSource, Price, Tag, ...}]`; used as read-before-write for `set_inventory_item_prices`; **read confirmed live 15 Jun 2026** (one row per Source/SubSource channel) |
-| `Inventory/CreateInventoryItemPrices` | POST | `{"inventoryItemPrices": [{StockItemId, Source, SubSource, Price}]}` | Creates new price rows (no pkRowId needed); **spec-based, not yet live-tested** |
+| `Inventory/CreateInventoryItemPrices` | POST | `{"inventoryItemPrices": [{pkRowId, StockItemId, Source, SubSource, Price}]}` | Creates new channel price rows; **`pkRowId` must be a client-generated GUID** (omitting it → PK collision on zero-GUID); empty 2xx body; **only for genuine channel rows** — the default price (empty Source+SubSource) is the implicit zero-GUID row not returned by the GET, so set it via Update (pkRowId `00000000-...`) instead; **live-tested 15 Jun 2026** |
 | `Inventory/UpdateInventoryItemPrices` | POST | `{"inventoryItemPrices": [{StockItemId, pkRowId, Source, SubSource, Price}]}` | Updates existing price rows by pkRowId; **spec-based, not yet live-tested** |
 | `Inventory/GetInventoryItemDescriptions` | GET | `?inventoryItemId=<guid>` | Returns array of description rows `[{pkRowId, Source, SubSource, Description}]`; used as read-before-write for `set_inventory_item_descriptions`; **read confirmed live 15 Jun 2026** |
-| `Inventory/CreateInventoryItemDescriptions` | POST | `{"inventoryItemDescriptions": [{StockItemId, Source, SubSource, Description}]}` | Creates new description rows; **spec-based, not yet live-tested** |
+| `Inventory/CreateInventoryItemDescriptions` | POST | `{"inventoryItemDescriptions": [{pkRowId, StockItemId, Source, SubSource, Description}]}` | Creates new description rows; **`pkRowId` must be a client-generated GUID**; empty 2xx body; no implicit default row (unlike prices); **live-tested 15 Jun 2026** |
 | `Inventory/UpdateInventoryItemDescriptions` | POST | `{"inventoryItemDescriptions": [{StockItemId, pkRowId, Source, SubSource, Description}]}` | Updates existing description rows by pkRowId; **spec-based, not yet live-tested** |
-| `Inventory/CreateInventoryItemExtendedProperties` | POST | `{"inventoryItemExtendedProperties": [{fkStockItemId, SKU, ProperyName, PropertyValue, PropertyType}]}` | Creates new extended property rows; note deliberate API typo `ProperyName`; **spec-based, not yet live-tested** |
+| `Inventory/CreateInventoryItemExtendedProperties` | POST | `{"inventoryItemExtendedProperties": [{pkRowId, fkStockItemId, SKU, ProperyName, PropertyValue, PropertyType}]}` | Creates new extended property rows; **`pkRowId` must be a client-generated GUID**; note deliberate API typo `ProperyName`; empty 2xx body; **live-tested 15 Jun 2026** |
 | `Inventory/UpdateInventoryItemExtendedProperties` | POST | `{"inventoryItemExtendedProperties": [{fkStockItemId, pkRowId, ProperyName, PropertyValue, PropertyType}]}` | Updates existing property rows by pkRowId; note deliberate API typo; **spec-based, not yet live-tested** |
 | `Inventory/AddImageToInventoryItem` | POST | `{"request": {StockItemId, ImageUrl, IsMain}}` | Adds a single image by URL; no bulk equivalent — iterate per item; **spec-based, not yet live-tested** |
-| `Stock/UpdateStockLevelsBulk` | POST | `{"Items": [{SKU, StockItemId, StockLocationId, StockLevel}]}` | Sets absolute stock levels; response mirrors request shape plus per-item `Errors[]` array; **spec-based, not yet live-tested** |
+| `Stock/UpdateStockLevelsBulk` | POST | `{"Items": [{SKU, StockItemId, StockLocationId, StockLevel}]}` | Sets absolute stock levels; **returns an empty 2xx body — does NOT echo `Items`** on this tenant, so per-item success is inferred from the 2xx (verify with `get_stock_level`); **live-tested 15 Jun 2026** |
 | `Stock/CreateVariationGroup` | POST | `{"template": {VariationGroupName, ParentSKU, ParentStockItemId, VariationItemIds: [guid]}}` | Creates a new variation group; all child GUIDs must resolve to existing items; **spec-based, not yet live-tested** |
 | `Stock/GetVariationGroupByName` | GET | `?variationGroupName=<string>` | Returns the matching variation group, or **`null`** (HTTP 200, not a 404) if the name doesn't exist; used as pre-flight check in `create_variation_group` — the code guards with `if existing_group and existing_group.get("VariationGroupName")`, so null is handled; **read confirmed live 15 Jun 2026** |
 
