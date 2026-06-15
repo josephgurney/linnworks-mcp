@@ -1,6 +1,6 @@
 # Linnworks MCP Server — Claude context
 
-**Current version: 1.11.0** — 51 tools. See `pyproject.toml` for full metadata.
+**Current version: 1.12.0** — 52 tools. See `pyproject.toml` for full metadata.
 
 ---
 
@@ -145,6 +145,7 @@ def set_stock_levels(updates: list[dict], confirmed_count: int | None = None, dr
 | `get_category_report(from_date, to_date, date_field, top_n)` | Revenue + units by product category |
 | `get_period_comparison(current_from, current_to, prior_from, prior_to, date_field)` | Side-by-side totals with % deltas for orders, revenue, AOV |
 | `get_sales_by_supplier(from_date, to_date, date_field, top_n, rank_by)` | Aggregates revenue, units, orders, SKU count by supplier |
+| `get_component_sales(from_date, to_date, date_field, top_n, sku)` | **Units only.** Explodes composite order lines (bundles, custom completes, multipacks, option/linking SKUs) to component (child) level so hidden component demand becomes measurable. Each row splits `composite_units` vs `standalone_units` + `from_composite` flag. Optional `sku` restricts to the children of one composite parent. Relies on `CompositeSubItems` (processed-order detail), **not** `CompositeChild` (open orders only). Child `Quantity` is already resolved — never multiply by parent qty. Confirmed against tenant 13 Jun 2026 |
 
 ### Purchase orders
 
@@ -207,7 +208,7 @@ The helper `_resolve_sku_to_id(sku, cache)` is shared across all write tools —
 | `Auth/AuthorizeByApplication` | POST | `{"ApplicationId","ApplicationSecret","Token"}` JSON body | Returns session `Token` + `Server` URL |
 | `OpenOrders/GetOrdersLowFidelity` | POST | `{"request":{"LocationId":"..."}}` | Primary open-orders list |
 | `OpenOrders/GetOpenOrdersDetails` | POST | `{"OrderIds":["pkOrderID-guid",...]}` **unwrapped** | Use GUID `pkOrderID`, not numeric |
-| `Orders/GetOrdersById` | POST | `{"pkOrderIds":["guid",...]}` **unwrapped** | Bulk order detail; response includes `CustomerInfo.Address.EmailAddress`, `CustomerInfo.Address.FullName`, `CustomerInfo.ChannelBuyerName`; `OrderItem.RowId` = `OrderItemRowId` used by refund tools; `FulfilmentLocationId` used by `cancel_order` |
+| `Orders/GetOrdersById` | POST | `{"pkOrderIds":["guid",...]}` **unwrapped** | Bulk order detail; response includes `CustomerInfo.Address.EmailAddress`, `CustomerInfo.Address.FullName`, `CustomerInfo.ChannelBuyerName`; `OrderItem.RowId` = `OrderItemRowId` used by refund tools; `FulfilmentLocationId` used by `cancel_order`; **composite components nest under `OrderItem.CompositeSubItems`** (NOT `CompositeChild` — that field exists only on open orders via `GetOrdersLowFidelity`). Child `Quantity` is the resolved line total (e.g. 5 packs × 10 = 50) — **do not multiply by parent qty**. Children's `PricePerUnit`/`Cost` are `0.0` (money is on the parent line); `Level` is `0` on both parent and child, so detect composites by non-empty `CompositeSubItems`, not `Level`. `_batch_order_items` / `_flatten_order_item` preserve this nested array under `composite_sub_items`; `get_component_sales` consumes it. Confirmed 13 Jun 2026 |
 | `Orders/GetOrderDetailsByNumOrderId` | GET | `?orderId=<numeric>` | Single order by human-facing number |
 | `Inventory/GetInventoryItem` | POST | `{"sku":"..."}` or `{"stockItemId":"..."}` **unwrapped** | Exact match only; returns `StockItemId` |
 | `Stock/GetStockLevel_Batch` | POST | `{"request":{"StockItemIds":["guid",...]}}` | Returns all location rows |
@@ -303,7 +304,7 @@ These have been probed and confirmed broken — don't waste time retrying them:
 
 These tools make hundreds of API calls internally (autopaginating + batched line-item fetches):
 
-`get_top_skus` · `get_sales_by_supplier` · `get_category_report` · `get_revenue_summary` · `get_period_comparison`
+`get_top_skus` · `get_sales_by_supplier` · `get_category_report` · `get_revenue_summary` · `get_period_comparison` · `get_component_sales`
 
 **Never fire two of these in parallel.** Concurrent calls hit Linnworks rate limits and the second call times out. Run them sequentially — wait for one to return before calling the next.
 

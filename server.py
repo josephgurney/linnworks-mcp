@@ -2633,10 +2633,45 @@ def get_extended_properties(sku: str) -> dict:
 
 # ---------- Processed orders with line items ----------
 
+def _flatten_order_item(i: dict) -> dict:
+    """
+    Flatten a single Orders/GetOrdersById line item into our internal shape.
+
+    Composite components are nested under `composite_sub_items` (the field is
+    `CompositeSubItems` on processed-order detail — note this differs from
+    open orders, where children live under `CompositeChild`). Sub-items are
+    flattened recursively with the same shape so callers can explode composites
+    to component (child) level. Most consumers ignore this key and read the
+    top-level fields unchanged.
+
+    Child rows carry `Quantity` already resolved to the total child units for
+    the whole line (e.g. 5 packs × 10 = 50) — do NOT multiply by the parent
+    quantity. Children's `StockItemId` may instead arrive as `ItemId`.
+    """
+    sub = i.get("CompositeSubItems") or []
+    return {
+        "sku": i.get("SKU"),
+        "title": i.get("Title"),
+        "quantity": i.get("Quantity"),
+        "price_per_unit": i.get("PricePerUnit"),
+        "line_total_ex_tax": i.get("Cost"),
+        "line_total_inc_tax": i.get("CostIncTax"),
+        "tax": i.get("Tax"),
+        "tax_rate": i.get("TaxRate"),
+        "category": i.get("CategoryName"),
+        "stock_item_id": i.get("StockItemId") or i.get("ItemId"),
+        "bin_rack": i.get("BinRack"),
+        "channel_sku": i.get("ChannelSKU"),
+        "composite_sub_items": [_flatten_order_item(s) for s in sub],
+    }
+
+
 def _batch_order_items(order_guids: list[str]) -> dict[str, list]:
     """
     Fetch line items for a list of order GUIDs via Orders/GetOrdersById.
     Returns a dict mapping each OrderId GUID to its list of item dicts.
+    Each item dict preserves nested composite components under
+    `composite_sub_items` (see _flatten_order_item).
     Batches in groups of 50 to avoid oversized requests.
     """
     result: dict[str, list] = {}
@@ -2649,23 +2684,7 @@ def _batch_order_items(order_guids: list[str]) -> dict[str, list]:
         for order in detail_orders:
             oid = order.get("OrderId")
             items = order.get("Items") or []
-            result[oid] = [
-                {
-                    "sku": i.get("SKU"),
-                    "title": i.get("Title"),
-                    "quantity": i.get("Quantity"),
-                    "price_per_unit": i.get("PricePerUnit"),
-                    "line_total_ex_tax": i.get("Cost"),
-                    "line_total_inc_tax": i.get("CostIncTax"),
-                    "tax": i.get("Tax"),
-                    "tax_rate": i.get("TaxRate"),
-                    "category": i.get("CategoryName"),
-                    "stock_item_id": i.get("StockItemId"),
-                    "bin_rack": i.get("BinRack"),
-                    "channel_sku": i.get("ChannelSKU"),
-                }
-                for i in items
-            ]
+            result[oid] = [_flatten_order_item(i) for i in items]
     return result
 
 
@@ -3184,6 +3203,166 @@ def get_top_skus(
         "ranked_by": rank_by,
         "supplier_filter": supplier_name.strip(),
         "skus": skus,
+    }
+
+
+@mcp.tool()
+def get_component_sales(
+    from_date: str,
+    to_date: str,
+    date_field: str = "processed",
+    top_n: int = 50,
+    sku: str = "",
+) -> dict:
+    """
+    Aggregate UNIT sales at the composite-child (component) level for a date
+    range. Auto-paginates internally.
+
+    Every other sales tool attributes a composite sale entirely to the parent
+    SKU, so the real demand for the components hidden inside it (decks, trucks,
+    wheels, grip, items in a bundle/multipack, option/linking SKUs) is invisible.
+    This tool explodes each composite order line into its components and counts
+    the component units, so you can answer "how many decks did we actually sell
+    once bundles and custom completes are broken out?".
+
+    Units only. Composite children carry no price (the money lives on the parent
+    line), so revenue cannot be attributed to a component without a modelling
+    assumption — that is deliberately out of scope here.
+
+    How exploding works:
+      - A line with composite components contributes its CHILDREN's units, not
+        its own. Child quantities are already resolved to the line total
+        (e.g. 5 packs x 10 = 50), so they are summed directly.
+      - A normal (non-composite) line contributes its own units, so the report
+        is complete rather than composites-only.
+      - Only leaf items are counted (nested composites recurse), so nothing is
+        double-counted.
+    Each row reports composite_units vs standalone_units separately so you can
+    tell exploded demand from direct sales of the same SKU.
+
+    This is an auto-paginating tool: it can make hundreds of API calls. NEVER
+    run it in parallel with another auto-paginating tool (get_top_skus,
+    get_sales_by_supplier, get_category_report, get_revenue_summary,
+    get_period_comparison) — run them sequentially.
+
+    Args:
+        from_date: Start of the date range in ISO format, e.g. "2026-04-01".
+        to_date: End of the date range in ISO format, e.g. "2026-06-30".
+        date_field: Which date to filter on — "received", "processed" (default),
+            "payment", or "cancelled".
+        top_n: Number of top components to return. Defaults to 50.
+        sku: Optional. Restrict output to the components (children) of this one
+            composite parent SKU (case-insensitive exact match). Leave blank to
+            report every component and standalone SKU across all orders.
+
+    Returns:
+        A dict with:
+          - from_date, to_date, date_field: the query parameters used
+          - total_orders_scanned: total processed orders in the range
+          - parent_sku_filter:    the sku filter applied (or "")
+          - components: list of top_n component dicts sorted by units desc, each
+              with rank, sku, title, units, composite_units, standalone_units,
+              orders, from_composite (True when all units came from composites)
+    """
+    from collections import defaultdict
+
+    PAGE_SIZE = 500
+    sku_filter = sku.strip().lower()
+
+    comp_units: dict[str, int] = defaultdict(int)
+    standalone_units: dict[str, int] = defaultdict(int)
+    order_ids: dict[str, set] = defaultdict(set)
+    titles: dict[str, str] = {}
+
+    def _credit_leaves(item: dict, guid: str, from_composite: bool) -> None:
+        """Walk an item; credit only leaf nodes (those with no sub-items)."""
+        subs = item.get("composite_sub_items") or []
+        if subs:
+            for s in subs:
+                _credit_leaves(s, guid, True)
+            return
+        leaf_sku = item.get("sku") or "UNKNOWN"
+        qty = item.get("quantity") or 0
+        if from_composite:
+            comp_units[leaf_sku] += qty
+        else:
+            standalone_units[leaf_sku] += qty
+        order_ids[leaf_sku].add(guid)
+        if leaf_sku not in titles and item.get("title"):
+            titles[leaf_sku] = item["title"]
+
+    total_orders_scanned = 0
+    page = 1
+    total_pages: int | None = None
+
+    while total_pages is None or page <= total_pages:
+        summary_response = call_linnworks(
+            "ProcessedOrders/SearchProcessedOrders",
+            {
+                "request": {
+                    "DateField": date_field,
+                    "FromDate": f"{from_date}T00:00:00",
+                    "ToDate": f"{to_date}T23:59:59",
+                    "PageNumber": page,
+                    "ResultsPerPage": PAGE_SIZE,
+                }
+            },
+        )
+        wrapper = summary_response.get("ProcessedOrders") or {}
+        raw_orders = wrapper.get("Data") or []
+
+        if total_pages is None:
+            total_pages = wrapper.get("TotalPages", 1)
+            total_orders_scanned = wrapper.get("TotalEntries", 0)
+
+        if not raw_orders:
+            break
+
+        guids = [o["pkOrderID"] for o in raw_orders]
+        items_by_order = _batch_order_items(guids)
+
+        for guid in guids:
+            for item in items_by_order.get(guid, []):
+                subs = item.get("composite_sub_items") or []
+                if sku_filter:
+                    # Only explode the children of the requested parent SKU.
+                    if subs and (item.get("sku") or "").lower() == sku_filter:
+                        for s in subs:
+                            _credit_leaves(s, guid, True)
+                else:
+                    _credit_leaves(item, guid, False)
+
+        page += 1
+
+    all_skus = set(comp_units) | set(standalone_units)
+
+    def total_units(s: str) -> int:
+        return comp_units.get(s, 0) + standalone_units.get(s, 0)
+
+    ranked = sorted(all_skus, key=total_units, reverse=True)
+
+    components = []
+    for idx, s in enumerate(ranked[:top_n]):
+        cu = comp_units.get(s, 0)
+        su = standalone_units.get(s, 0)
+        components.append({
+            "rank": idx + 1,
+            "sku": s,
+            "title": titles.get(s, ""),
+            "units": cu + su,
+            "composite_units": cu,
+            "standalone_units": su,
+            "orders": len(order_ids[s]),
+            "from_composite": cu > 0 and su == 0,
+        })
+
+    return {
+        "from_date": from_date,
+        "to_date": to_date,
+        "date_field": date_field,
+        "total_orders_scanned": total_orders_scanned,
+        "parent_sku_filter": sku.strip(),
+        "components": components,
     }
 
 
