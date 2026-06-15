@@ -261,7 +261,7 @@ The helper `_resolve_sku_to_id(sku, cache)` is shared across all write tools —
 | `Inventory/CreateInventoryItemDescriptions` | POST | `{"inventoryItemDescriptions": [{pkRowId, StockItemId, Source, SubSource, Description}]}` | Creates new description rows; **`pkRowId` must be a client-generated GUID**; empty 2xx body; no implicit default row (unlike prices); **live-tested 15 Jun 2026** |
 | `Inventory/UpdateInventoryItemDescriptions` | POST | `{"inventoryItemDescriptions": [{StockItemId, pkRowId, Source, SubSource, Description}]}` | Updates existing description rows by pkRowId; **spec-based, not yet live-tested** |
 | `Inventory/CreateInventoryItemExtendedProperties` | POST | `{"inventoryItemExtendedProperties": [{pkRowId, fkStockItemId, SKU, ProperyName, PropertyValue, PropertyType}]}` | Creates new extended property rows; **`pkRowId` must be a client-generated GUID**; note deliberate API typo `ProperyName`; **returns a 2xx with a NON-empty, NON-JSON body on success** (not an empty body like the sibling write endpoints) — `call_linnworks` now falls back to `{"raw": text}` on `JSONDecodeError` so the write isn't mis-reported as failing (issue #13, 15 Jun 2026) |
-| `Inventory/UpdateInventoryItemExtendedProperties` | POST | `{"inventoryItemExtendedProperties": [{fkStockItemId, pkRowId, ProperyName, PropertyValue, PropertyType}]}` | Updates existing property rows by pkRowId; note deliberate API typo; **same non-JSON 2xx success body as the Create endpoint** — handled by the tolerant parse in `call_linnworks` (issue #13, 15 Jun 2026) |
+| `Inventory/UpdateInventoryItemExtendedProperties` | POST | `{"inventoryItemExtendedProperties": [{fkStockItemId, pkRowId, ProperyName, PropertyValue, PropertyType}]}` | Updates existing property rows by pkRowId; note deliberate API typo; **same non-JSON 2xx success body as the Create endpoint** — handled by the tolerant parse in `call_linnworks`; **create + update both live-tested 15 Jun 2026** against an isolated test SKU (persistence confirmed: the update path read back the value the create wrote) — issue #13 |
 | `Inventory/AddImageToInventoryItem` | POST | `{"request": {StockItemId, ImageUrl, IsMain}}` | Adds a single image by URL; no bulk equivalent — iterate per item; **spec-based, not yet live-tested** |
 | `Stock/UpdateStockLevelsBulk` | POST | `{"Items": [{SKU, StockItemId, StockLocationId, StockLevel}]}` | Sets absolute stock levels; **returns an empty 2xx body — does NOT echo `Items`** on this tenant, so per-item success is inferred from the 2xx (verify with `get_stock_level`); **live-tested 15 Jun 2026** |
 | `Stock/CreateVariationGroup` | POST | `{"template": {VariationGroupName, ParentSKU, ParentStockItemId, VariationItemIds: [guid]}}` | Creates a new variation group; all child GUIDs must resolve to existing items; **spec-based, not yet live-tested** |
@@ -334,7 +334,13 @@ Credentials go in `.env` (local dev) or the Claude Desktop config `env` block (p
 ## Testing
 
 - **`python server.py --list-tools`** — offline smoke test, **no credentials needed**. Lists every registered MCP tool and a total count. Confirms the module imports cleanly and your new tool actually registered — catches decorator typos, duplicate tool names, and import-time errors that `py_compile` alone misses. This is the primary CLI build-loop check (the credential gate is now lazy, so the module imports credential-free).
-- **`python server.py --check-auth`** — verifies credentials and the auth handshake without touching the MCP layer. Requires real credentials, so it only works where a `.env` (or env block) is present — **not** in a credential-free CLI build.
+- **`python server.py --check-auth`** — verifies credentials and the auth handshake without touching the MCP layer. Requires real credentials, so it only works where a `.env` (or env block) is present.
+- **Bootstrap CLI credentials from the Desktop config (local Mac)** — a CLI session doesn't inherit Claude Desktop's `env` block, so by default `--check-auth` and in-process live tests can't authenticate. But the creds already live on this machine in `~/Library/Application Support/Claude/claude_desktop_config.json` under `mcpServers.linnworks.env`. Generate a gitignored `.env` from them once and the whole local CLI build loop can self-test:
+  ```bash
+  python3 -c "import json,os; e=json.load(open(os.path.expanduser('~/Library/Application Support/Claude/claude_desktop_config.json')))['mcpServers']['linnworks']['env']; open('.env','w').write(''.join(f'{k}={e[k]}\n' for k in ('LINNWORKS_APPLICATION_ID','LINNWORKS_APPLICATION_SECRET','LINNWORKS_INSTALLATION_TOKEN')))"
+  ```
+  `.env` is gitignored (never commit it). This only works on the local Mac with Desktop installed — **genuinely-remote routine builds on claude.ai/code have no Desktop config and still can't authenticate**. Keep the `.env` in sync if the Desktop creds are rotated.
+- **In-process live testing** — once `.env` exists, `import server` and call any tool function directly against the live tenant (the running Desktop MCP won't hot-reload edits, so iterate in-process here, then restart Desktop to pick up the fix). For write tools, exercise `dry_run=False` against an isolated `ZZZ-MCP-TEST-*` SKU you create and delete (via `Inventory/DeleteInventoryItems`) — never a real catalogue SKU. NB: live production writes still require user approval (the auto-mode classifier blocks them otherwise).
 - **Claude Desktop** — after registering in `claude_desktop_config.json` and restarting, ask conversational questions. Logs: `~/Library/Logs/Claude/mcp.log` (macOS) · `%APPDATA%\Claude\logs\mcp.log` (Windows)
 - **Claude Code** — `claude mcp add` registers the server for a new session; useful for calling tools directly during development
 
@@ -381,8 +387,12 @@ module imports cleanly **and** your new tool registered (catching decorator typo
 duplicate names, and import-time errors `py_compile` misses). The `grep` must
 match and the total count should have gone up by the number of tools you added.
 
-`--check-auth` is NOT useful here: there are no credentials in a CLI build, so it
-always fails on missing creds. Save auth/live testing for Claude Desktop.
+`--check-auth` and live testing need credentials. On the local Mac you can
+bootstrap them: generate a gitignored `.env` from the Desktop config's
+`mcpServers.linnworks.env` (see the **Testing** section for the one-liner), then
+`--check-auth` passes and you can live-test tools in-process. On a genuinely
+remote build (claude.ai/code, no Desktop config) creds are unavailable — fall
+back to `--list-tools` only and defer live testing to Claude Desktop.
 
 ### Step 6 — Update CLAUDE.md
 - Add the new tool to the Tools table
@@ -413,7 +423,7 @@ gh issue edit N --repo josephgurney/linnworks-mcp --add-label "built" --remove-l
 ```
 
 ### Important notes for CLI builds
-- The Linnworks MCP is **not connected** in the CLI session, and there are no credentials — you cannot call Linnworks tools or run `--check-auth` to completion. Use `python server.py --list-tools` (offline, credential-free) to confirm the module loads and the new tool registered, and note in your commit/issue comment that live testing should be done via Claude Desktop.
+- The Linnworks MCP isn't connected as MCP tools in the CLI session, but on the local Mac you **can** authenticate: bootstrap a gitignored `.env` from the Desktop config (see **Testing**), then `--check-auth` passes and you can `import server` and call tool functions in-process against the live tenant — including `dry_run=False` on an isolated `ZZZ-MCP-TEST-*` SKU. Always run `python server.py --list-tools` (offline) as the baseline registration check. Live production writes still require user approval (the auto-mode classifier blocks them). On a genuinely remote build with no Desktop config, defer live testing to Claude Desktop.
 - Do not ask the user for confirmation between steps — execute the full workflow and report back at the end.
 - If an endpoint is unknown, check `https://apidocs.linnworks.net` or fetch the relevant spec file from `https://raw.githubusercontent.com/LinnSystems/PublicApiSpecs/master/1.0/<name>.json` before guessing. Key spec files: `orders.json`, `openorders.json`, `returnsrefunds.json`, `purchaseorder.json`, `inventory.json`, `stock.json`, `processedorders.json`, `importexport.json`, `rulesengine.json`.
 
