@@ -38,14 +38,24 @@ APPLICATION_ID = os.environ.get("LINNWORKS_APPLICATION_ID")
 APPLICATION_SECRET = os.environ.get("LINNWORKS_APPLICATION_SECRET")
 INSTALLATION_TOKEN = os.environ.get("LINNWORKS_INSTALLATION_TOKEN")
 
-if not all([APPLICATION_ID, APPLICATION_SECRET, INSTALLATION_TOKEN]):
-    sys.stderr.write(
-        "ERROR: Missing Linnworks credentials. Set LINNWORKS_APPLICATION_ID, "
-        "LINNWORKS_APPLICATION_SECRET, and LINNWORKS_INSTALLATION_TOKEN — either in "
-        "your Claude Desktop config's 'env' block, or in a .env file alongside "
-        "this script for local testing.\n"
-    )
-    sys.exit(1)
+def _require_credentials() -> None:
+    """Exit with a clear error if Linnworks credentials are not configured.
+
+    Called only on code paths that actually talk to Linnworks (running the MCP
+    server over stdio, or `--check-auth`). Deliberately NOT run at import time,
+    so the module can be imported credential-free for offline verification —
+    `--list-tools`, tool-registration smoke tests, and the CLI build loop, none
+    of which need live credentials. (Before this, importing the module without
+    credentials called sys.exit(1), which blocked all offline introspection.)
+    """
+    if not all([APPLICATION_ID, APPLICATION_SECRET, INSTALLATION_TOKEN]):
+        sys.stderr.write(
+            "ERROR: Missing Linnworks credentials. Set LINNWORKS_APPLICATION_ID, "
+            "LINNWORKS_APPLICATION_SECRET, and LINNWORKS_INSTALLATION_TOKEN — either in "
+            "your Claude Desktop config's 'env' block, or in a .env file alongside "
+            "this script for local testing.\n"
+        )
+        sys.exit(1)
 
 
 # Open-order status labels. Codes 1 and 4 confirmed from live tenant data;
@@ -6589,9 +6599,24 @@ def create_variation_group(
 # ---------- Entrypoint ----------
 
 def main() -> None:
+    # Offline smoke test — list every registered MCP tool WITHOUT credentials:
+    #     python server.py --list-tools
+    # Use this in the build loop: it confirms the module imports cleanly and the
+    # new tool actually registered (catches decorator typos, duplicate names, and
+    # import-time errors that `py_compile` alone misses). No network call.
+    if "--list-tools" in sys.argv:
+        import asyncio
+
+        tools = asyncio.run(mcp.list_tools())
+        for t in sorted(tools, key=lambda x: x.name):
+            print(t.name)
+        print(f"\n{len(tools)} tools registered")
+        sys.exit(0)
+
     # Sanity-check credentials without launching the MCP server:
     #     python server.py --check-auth
     if "--check-auth" in sys.argv:
+        _require_credentials()
         try:
             token, server = authorize()
             masked = f"{token[:8]}...{token[-4:]}" if len(token) > 12 else "<short>"
@@ -6604,6 +6629,7 @@ def main() -> None:
             sys.exit(1)
 
     # Normal path: run the MCP server over stdio for Claude Desktop to consume.
+    _require_credentials()
     mcp.run()
 
 

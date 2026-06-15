@@ -325,7 +325,8 @@ Credentials go in `.env` (local dev) or the Claude Desktop config `env` block (p
 
 ## Testing
 
-- **`python server.py --check-auth`** — verifies credentials and auth handshake without touching the MCP layer
+- **`python server.py --list-tools`** — offline smoke test, **no credentials needed**. Lists every registered MCP tool and a total count. Confirms the module imports cleanly and your new tool actually registered — catches decorator typos, duplicate tool names, and import-time errors that `py_compile` alone misses. This is the primary CLI build-loop check (the credential gate is now lazy, so the module imports credential-free).
+- **`python server.py --check-auth`** — verifies credentials and the auth handshake without touching the MCP layer. Requires real credentials, so it only works where a `.env` (or env block) is present — **not** in a credential-free CLI build.
 - **Claude Desktop** — after registering in `claude_desktop_config.json` and restarting, ask conversational questions. Logs: `~/Library/Logs/Claude/mcp.log` (macOS) · `%APPDATA%\Claude\logs\mcp.log` (Windows)
 - **Claude Code** — `claude mcp add` registers the server for a new session; useful for calling tools directly during development
 
@@ -362,11 +363,18 @@ Add the new tool function to `server.py` following these rules:
 ```
 Fix any errors before proceeding.
 
-### Step 5 — Verify auth
+### Step 5 — Verify the tool registered (offline)
 ```bash
-.venv/bin/python3 server.py --check-auth
+.venv/bin/python3 server.py --list-tools | grep <new_tool_name> && \
+  .venv/bin/python3 server.py --list-tools | tail -1
 ```
-Confirms the server loads and credentials are valid.
+This is the real CLI build-loop check — it needs no credentials. It confirms the
+module imports cleanly **and** your new tool registered (catching decorator typos,
+duplicate names, and import-time errors `py_compile` misses). The `grep` must
+match and the total count should have gone up by the number of tools you added.
+
+`--check-auth` is NOT useful here: there are no credentials in a CLI build, so it
+always fails on missing creds. Save auth/live testing for Claude Desktop.
 
 ### Step 6 — Update CLAUDE.md
 - Add the new tool to the Tools table
@@ -397,7 +405,7 @@ gh issue edit N --repo josephgurney/linnworks-mcp --add-label "built" --remove-l
 ```
 
 ### Important notes for CLI builds
-- The Linnworks MCP is **not connected** in the CLI session — you cannot call Linnworks tools directly to test. Use `--check-auth` to verify the server loads, and note in your commit that live testing should be done via Claude Desktop.
+- The Linnworks MCP is **not connected** in the CLI session, and there are no credentials — you cannot call Linnworks tools or run `--check-auth` to completion. Use `python server.py --list-tools` (offline, credential-free) to confirm the module loads and the new tool registered, and note in your commit/issue comment that live testing should be done via Claude Desktop.
 - Do not ask the user for confirmation between steps — execute the full workflow and report back at the end.
 - If an endpoint is unknown, check `https://apidocs.linnworks.net` or fetch the relevant spec file from `https://raw.githubusercontent.com/LinnSystems/PublicApiSpecs/master/1.0/<name>.json` before guessing. Key spec files: `orders.json`, `openorders.json`, `returnsrefunds.json`, `purchaseorder.json`, `inventory.json`, `stock.json`, `processedorders.json`, `importexport.json`, `rulesengine.json`.
 
