@@ -3957,7 +3957,10 @@ def create_purchase_order(
         "linnworks_status": confirmed_header.get("Status"),
         "external_invoice_number": confirmed_header.get("ExternalInvoiceNumber", ""),
         "line_count": confirmed_header.get("LineCount", 0),
-        "total_cost": confirmed_header.get("GrandTotal"),
+        # Header field is `TotalCost` (tax-inclusive); `GrandTotal` doesn't exist
+        # on the header and returned None — kept as a last-resort fallback.
+        "total_cost": confirmed_header.get("TotalCost") or confirmed_header.get("GrandTotal"),
+        "tax_paid": confirmed_header.get("taxPaid"),
         "resolved_items": resolved,
         "header": header_fields,
     }
