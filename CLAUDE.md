@@ -1,6 +1,6 @@
 # Linnworks MCP Server — Claude context
 
-**Current version: 1.14.0** — 53 tools. See `pyproject.toml` for full metadata.
+**Current version: 1.15.0** — 54 tools. See `pyproject.toml` for full metadata.
 
 ---
 
@@ -117,7 +117,8 @@ def set_stock_levels(updates: list[dict], confirmed_count: int | None = None, dr
 | Tool | Endpoint | Key notes |
 |---|---|---|
 | `get_open_orders(location_id, limit, overdue_only)` | `OpenOrders/GetOrdersLowFidelity` | Always returns `overdue_count`; `overdue_only=True` filters past-deadline; `StatusLabel` decoded |
-| `find_inventory_item(sku_or_title)` | `Inventory/GetInventoryItem` | **Exact SKU only** — no fuzzy/title search |
+| `find_inventory_item(sku_or_title)` | `Inventory/GetInventoryItem` | **Exact SKU only** — no fuzzy/title search; use `search_inventory_items` for keyword/name lookup |
+| `search_inventory_items(keyword, page, per_page)` | `Stock/GetStockItems` (GET) | **Keyword discovery** — matches title, SKU, and barcode (the UI search box endpoint). Paged (`per_page` capped at 200); returns `total_entries`/`total_pages` + per-item `sku`, `stock_item_id`, `title`, `stock_level`, `available`, `barcode`, `retail_price`, etc. so results chain straight into stock/price/write tools. **Live-tested 16 Jun 2026** (closes #14) |
 | `get_order(order_id)` | `Orders/GetOrdersById` or `GetOrderDetailsByNumOrderId` | GUID → POST; numeric ID → GET; returns `customer_name`, `customer_email`, `delivery_address`, `billing_address`, `notes` list, `totals` (subtotal/postage/tax/total/currency), `fulfilment_location_id`; each item now also includes `row_id` (OrderItemRowId — required by `refund_order_lines`), `price_per_unit`, `cost_inc_tax` |
 | `set_order_address(order_id, ..., dry_run=True)` | `Orders/SetOrderCustomerInfo` | Update delivery address on open orders only; GUID or numeric order_id; pass only the fields to change (None = keep current); read-before-write diff; blocks on processed orders |
 | `get_order_notes(order_id)` | `Orders/GetOrderNotes` | Fetch all notes on an order (open or processed); returns note_id, text, internal flag, timestamp, creator; GUID or numeric order_id |
@@ -219,6 +220,7 @@ The helper `_resolve_sku_to_id(sku, cache)` is shared across all write tools —
 | `Orders/GetOrdersById` | POST | `{"pkOrderIds":["guid",...]}` **unwrapped** | Bulk order detail; response includes `CustomerInfo.Address.EmailAddress`, `CustomerInfo.Address.FullName`, `CustomerInfo.ChannelBuyerName`; `OrderItem.RowId` = `OrderItemRowId` used by refund tools; `FulfilmentLocationId` used by `cancel_order`; **composite components nest under `OrderItem.CompositeSubItems`** (NOT `CompositeChild` — that field exists only on open orders via `GetOrdersLowFidelity`). Child `Quantity` is the resolved line total (e.g. 5 packs × 10 = 50) — **do not multiply by parent qty**. Children's `PricePerUnit`/`Cost` are `0.0` (money is on the parent line); `Level` is `0` on both parent and child, so detect composites by non-empty `CompositeSubItems`, not `Level`. `_batch_order_items` / `_flatten_order_item` preserve this nested array under `composite_sub_items`; `get_component_sales` consumes it. Confirmed 13 Jun 2026 |
 | `Orders/GetOrderDetailsByNumOrderId` | GET | `?orderId=<numeric>` | Single order by human-facing number |
 | `Inventory/GetInventoryItem` | POST | `{"sku":"..."}` or `{"stockItemId":"..."}` **unwrapped** | Exact match only; returns `StockItemId` |
+| `Stock/GetStockItems` | GET | `?keyWord=<term>&entriesPerPage=<n>&pageNumber=<n>` | **Keyword search behind the UI inventory box** — matches title, SKU, and barcode (partial, case-insensitive). Response: `{"PageNumber","EntriesPerPage","TotalEntries","TotalPages","Data":[...]}`; each `Data` row has `ItemNumber` (SKU), `ItemTitle`, `BarcodeNumber`, `Quantity`, `Available`, `InOrder`, `RetailPrice`, `PurchasePrice`, `CategoryName`, `StockItemId`, `IsCompositeParent`, `IsVariationParent`. Optional `locationId` query param scopes stock figures to one location. **This is the working keyword-search endpoint** — the plural `Stock/GetStockItemsFull` and `Inventory/GetInventoryItems` both 400 here, but this singular GET does not. **Live-tested 16 Jun 2026** (issue #14) |
 | `Stock/GetStockLevel_Batch` | POST | `{"request":{"StockItemIds":["guid",...]}}` | Returns all location rows |
 | `Stock/GetStockItemsFullByIds` | POST | `{"request":{"StockItemIds":["guid",...]}}` | Item metadata by GUID |
 | `Stock/GetStockItemsFullByIds` (with suppliers) | POST | `{"request":{"StockItemIds":[...],"DataRequirements":[1]}}` | **`DataRequirements:[1]` required** to populate `Suppliers[]` — default `[0]` returns empty array |
@@ -296,8 +298,8 @@ These have been probed and confirmed broken — don't waste time retrying them:
 |---|---|
 | `OpenOrders/GetOpenOrders` | HTTP 400 null-reference |
 | `OpenOrders/GetOpenOrderIds` | HTTP 400 null-reference |
-| `Stock/GetStockItemsFull` | HTTP 400 — does not support keyword search |
-| `Inventory/GetInventoryItems` | HTTP 400 — no working payload shape found; use `GetInventoryItem` (singular) for exact SKU lookup |
+| `Stock/GetStockItemsFull` | HTTP 400 — does not support keyword search; use `Stock/GetStockItems` (singular, GET) for keyword search instead |
+| `Inventory/GetInventoryItems` | HTTP 400 — no working payload shape found; use `GetInventoryItem` (singular) for exact SKU lookup, or `Stock/GetStockItems` (GET) for keyword/title/barcode search |
 | `Stock/GetStockList` | HTTP 404 |
 | `Inventory/SearchInventory` | HTTP 404 |
 | `Inventory/GetInventoryItemSuppliers` | HTTP 404 — use `Stock/GetStockItemsFullByIds` with `DataRequirements:[1]` instead |

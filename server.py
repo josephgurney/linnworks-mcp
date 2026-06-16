@@ -718,6 +718,95 @@ def find_inventory_item(
 
 
 @mcp.tool()
+def search_inventory_items(
+    keyword: str,
+    page: int = 1,
+    per_page: int = 50,
+) -> dict:
+    """
+    Search the inventory catalogue by a free-text keyword.
+
+    This is the discovery counterpart to find_inventory_item. Unlike that tool
+    (which only matches an EXACT SKU), this matches the keyword against item
+    TITLE, SKU, and BARCODE — the same search the Linnworks inventory search
+    box uses. Use it to resolve a human-readable product name (or a partial SKU
+    / barcode) to a SKU and StockItemId, so the result can chain straight into
+    stock-level, price, or write tools without a second lookup.
+
+    Example: search_inventory_items("Wistman") returns every Wistman variant
+    with its SKU and stock_item_id, so "reduce stock of Luma Wistman's silver
+    by one" becomes actionable without guessing the SKU string.
+
+    Results are paged — keyword searches can return many rows. Use `page` to
+    walk through them; `total_entries` / `total_pages` in the response tell you
+    how many there are.
+
+    Args:
+        keyword: Free-text term matched against title, SKU, and barcode
+            (case-insensitive, partial matches allowed).
+        page: 1-based page number to return (default 1).
+        per_page: Items per page (default 50, capped at 200).
+
+    Returns:
+        A dict with:
+          - query:         the keyword searched
+          - page:          the page returned
+          - per_page:      items per page used
+          - total_entries: total matching items across all pages
+          - total_pages:   total number of pages
+          - count:         number of items in this page
+          - items:         list of matched items, each with sku, stock_item_id,
+                           title, stock_level, available, in_order, barcode,
+                           retail_price, purchase_price, category,
+                           is_composite_parent, is_variation_parent
+    """
+    per_page = max(1, min(per_page, 200))
+    page = max(1, page)
+
+    # Stock/GetStockItems: GET, keyWord matches title/SKU/barcode. This is the
+    # endpoint behind the UI inventory search box — confirmed working in tenant
+    # testing (the Stock/GetStockItemsFull and Inventory/GetInventoryItems
+    # plural endpoints both return HTTP 400 here; this one does not).
+    result = call_linnworks_get(
+        "Stock/GetStockItems",
+        {
+            "keyWord": keyword,
+            "entriesPerPage": per_page,
+            "pageNumber": page,
+        },
+    )
+
+    data = result.get("Data", []) if isinstance(result, dict) else []
+    items = [
+        {
+            "sku": row.get("ItemNumber"),
+            "stock_item_id": row.get("StockItemId"),
+            "title": row.get("ItemTitle"),
+            "stock_level": row.get("Quantity"),
+            "available": row.get("Available"),
+            "in_order": row.get("InOrder"),
+            "barcode": row.get("BarcodeNumber"),
+            "retail_price": row.get("RetailPrice"),
+            "purchase_price": row.get("PurchasePrice"),
+            "category": row.get("CategoryName"),
+            "is_composite_parent": row.get("IsCompositeParent", False),
+            "is_variation_parent": row.get("IsVariationParent", False),
+        }
+        for row in data
+    ]
+
+    return {
+        "query": keyword,
+        "page": result.get("PageNumber", page) if isinstance(result, dict) else page,
+        "per_page": result.get("EntriesPerPage", per_page) if isinstance(result, dict) else per_page,
+        "total_entries": result.get("TotalEntries", len(items)) if isinstance(result, dict) else len(items),
+        "total_pages": result.get("TotalPages", 1) if isinstance(result, dict) else 1,
+        "count": len(items),
+        "items": items,
+    }
+
+
+@mcp.tool()
 def get_order(order_id: str) -> dict:
     """
     Fetch full detail for a single Linnworks order.
