@@ -1,6 +1,8 @@
 # Linnworks MCP Server — Claude context
 
-**Current version: 1.15.0** — 54 tools. See `pyproject.toml` for full metadata.
+**Current version: 1.16.0** — 54 tools. See `pyproject.toml` for full metadata.
+
+> **v1.16.0 (issue #15):** Fixed PO line-cost write — Linnworks `Cost` is the **tax-inclusive line total** (`unit × qty × (1+rate)`), not the ex-VAT unit cost. `create_purchase_order`, `add_purchase_order_item`, and `update_purchase_order_item` now convert via `_po_line_cost_inc_tax()` before writing (was sending the bare unit cost → wrong unit prices and PO totals). Read-back paths (`get_purchase_order`, the update diff) expose a derived `unit_cost_ex_tax` via `_po_line_unit_ex_tax()` so reads reconcile with the ex-VAT unit the tools accept.
 
 ---
 
@@ -155,7 +157,7 @@ def set_stock_levels(updates: list[dict], confirmed_count: int | None = None, dr
 | `search_purchase_orders(status, from_date, to_date, ...)` | `PurchaseOrder/Search_PurchaseOrders2`; payload **unwrapped** — wrapping silently ignores all filters |
 | `get_purchase_order(purchase_id)` | Returns header + items (with `outstanding` = qty − delivered) + delivery records; deleted items filtered |
 | `get_suppliers()` | `Inventory/GetSuppliers` GET — not in public OpenAPI specs but confirmed working |
-| `create_purchase_order(..., dry_run=True)` | `DateOfPurchase` always required (SQL rejects null); `SupplierReferenceNumber` always required (send `""` if none) |
+| `create_purchase_order(..., dry_run=True)` | `DateOfPurchase` always required (SQL rejects null); `SupplierReferenceNumber` always required (send `""` if none). `cost` is the **ex-VAT unit cost** — converted to a tax-inclusive line total on write (issue #15) |
 | `update_purchase_order_header(..., dry_run=True)` | Carry all existing header fields — missing fields are cleared; blocks on DELIVERED status |
 | `add_purchase_order_item(purchase_id, sku, quantity, cost, tax_rate, dry_run=True)` | Add a new line to a PENDING/OPEN/PARTIAL PO; resolves SKU → GUID automatically |
 | `update_purchase_order_item(purchase_id, purchase_item_id, quantity, cost, tax_rate, dry_run=True)` | Edit a line item; only fields you provide change; shows before/after diff; use `get_purchase_order` to find `purchase_item_id` |
@@ -234,8 +236,8 @@ The helper `_resolve_sku_to_id(sku, cache)` is shared across all write tools —
 | `PurchaseOrder/Get_PurchaseOrder` | POST | `{"pkPurchaseId":"guid"}` **unwrapped** | Returns header + items + delivery records |
 | `Orders/SetOrderCustomerInfo` | POST | `{"orderId":"guid","info":{"ChannelBuyerName":"...","Address":{...},"BillingAddress":{...}},"saveToCrm":false}` **unwrapped** | Address fields: FullName, Company, Address1/2/3, Town, Region, PostCode, Country, PhoneNumber, EmailAddress, CountryId, Continent; **not in public GitHub OpenAPI spec** but confirmed in apidocs.linnworks.net; returns OrderTotalsInfo |
 | `PurchaseOrder/Update_PurchaseOrderHeader` | POST | `{"updateParameter":{...all fields...}}` | Must carry all existing fields — nulls clear values; blocks on DELIVERED |
-| `PurchaseOrder/Add_PurchaseOrderItem` | POST | `{"addItemParameter":{"pkPurchaseId","fkStockItemId","Qty","Cost","TaxRate","PackQuantity","PackSize"}}` | Adds a new line; same endpoint used by `create_purchase_order` |
-| `PurchaseOrder/Update_PurchaseOrderItem` | POST | `{"updateItemParameter":{"pkPurchaseItemId","pkPurchaseId","Quantity","PackQuantity","PackSize","Cost","TaxRate"}}` | Note: uses `Quantity` (not `Qty` like Add); all fields required — carry unchanged values through |
+| `PurchaseOrder/Add_PurchaseOrderItem` | POST | `{"addItemParameter":{"pkPurchaseId","fkStockItemId","Qty","Cost","TaxRate","PackQuantity","PackSize"}}` | Adds a new line; same endpoint used by `create_purchase_order`. **`Cost` is the tax-inclusive LINE TOTAL** per the spec: `(unitcost × qty) + tax` — NOT the unit cost. Sending the bare unit cost makes Linnworks back-derive a wrong unit (`unit/1.2/qty`) and wrong PO totals (issue #15). Tools convert via `_po_line_cost_inc_tax()`. The header `UnitAmountTaxIncludedType:0` is correct and unchanged |
+| `PurchaseOrder/Update_PurchaseOrderItem` | POST | `{"updateItemParameter":{"pkPurchaseItemId","pkPurchaseId","Quantity","PackQuantity","PackSize","Cost","TaxRate"}}` | Note: uses `Quantity` (not `Qty` like Add); all fields required — carry unchanged values through. **`Cost` is the same tax-inclusive line total** as Add (issue #15) — the tool tracks the diff in ex-VAT unit terms and converts on write |
 | `PurchaseOrder/Delete_PurchaseOrderItem` | POST | `{"deleteItemParameter":{"pkPurchaseItemId","pkPurchaseId"}}` | Removes a line item; `pkPurchaseItemId` from `Get_PurchaseOrder` response |
 | `RulesEngine/GetRules` | GET | — | Flat list of rule headers |
 | `RulesEngine/GetRuleConditionNodes` | GET | `?pkRuleId=<int>` | Full IF/THEN tree for one rule |

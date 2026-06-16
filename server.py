@@ -3746,6 +3746,38 @@ def get_suppliers() -> dict:
 
 # ---------- Purchase order writes ----------
 
+def _po_line_cost_inc_tax(unit_cost_ex_tax: float, quantity: int, tax_rate: float) -> float:
+    """
+    Convert an ex-VAT *unit* cost into the value Linnworks expects in a purchase
+    order line's `Cost` field.
+
+    Per the Linnworks PurchaseOrder spec, the line `Cost` is the **tax-inclusive
+    line total**: `(unit_cost * qty) + tax`. The MCP tools take an ex-VAT unit
+    cost as their friendly `cost` parameter, so every PO line write must convert:
+
+        Cost = unit_cost_ex_tax * quantity * (1 + tax_rate / 100)
+
+    Sending the bare unit cost (the pre-fix bug, issue #15) made Linnworks treat
+    it as the inclusive line total and back-derive a wrong unit price
+    (`unit / 1.2 / qty`) and wrong PO grand totals.
+    """
+    return round(unit_cost_ex_tax * quantity * (1 + tax_rate / 100.0), 4)
+
+
+def _po_line_unit_ex_tax(stored_cost_inc_tax: float, quantity: int, tax_rate: float) -> float:
+    """
+    Inverse of `_po_line_cost_inc_tax`: recover the ex-VAT unit cost from a stored
+    Linnworks PO line `Cost` (which is the tax-inclusive line total).
+
+    Used by read-before-write so update diffs and read-backs are expressed in the
+    same ex-VAT unit terms the tools accept as input. Guards against divide-by-zero
+    on zero-quantity / zero-rate lines.
+    """
+    q = quantity or 1
+    denom = (1 + (tax_rate or 0.0) / 100.0) or 1.0
+    return round(stored_cost_inc_tax / denom / q, 4)
+
+
 @mcp.tool()
 def create_purchase_order(
     supplier_id: str,
@@ -3843,6 +3875,9 @@ def create_purchase_order(
             "tax_rate": tax_rate,
             "line_total_ex_tax": round(cost * qty, 4),
             "tax": tax,
+            # The tax-inclusive line total is what actually gets written to the
+            # Linnworks `Cost` field (see _po_line_cost_inc_tax / issue #15).
+            "line_total_inc_tax": _po_line_cost_inc_tax(cost, qty, tax_rate),
         })
 
     if errors:
@@ -3899,7 +3934,8 @@ def create_purchase_order(
                 "pkPurchaseId": new_po_id,
                 "fkStockItemId": r["stock_item_id"],
                 "Qty": r["quantity"],
-                "Cost": r["cost"],
+                # Linnworks `Cost` = tax-inclusive line total, NOT the unit cost.
+                "Cost": r["line_total_inc_tax"],
                 "TaxRate": r["tax_rate"],
                 "PackQuantity": 1,
                 "PackSize": 1,
@@ -4404,6 +4440,8 @@ def add_purchase_order_item(
         "tax_rate": tax_rate,
         "line_total_ex_tax": line_total,
         "tax": tax,
+        # The tax-inclusive line total is what gets written to Linnworks `Cost`.
+        "line_total_inc_tax": _po_line_cost_inc_tax(cost, quantity, tax_rate),
         "pack_quantity": pack_quantity,
         "pack_size": pack_size,
     }
@@ -4426,7 +4464,8 @@ def add_purchase_order_item(
                 "pkPurchaseId": purchase_id,
                 "fkStockItemId": stock_item_id,
                 "Qty": quantity,
-                "Cost": cost,
+                # Linnworks `Cost` = tax-inclusive line total, NOT the unit cost.
+                "Cost": item_detail["line_total_inc_tax"],
                 "TaxRate": tax_rate,
                 "PackQuantity": pack_quantity,
                 "PackSize": pack_size,
@@ -4530,26 +4569,35 @@ def update_purchase_order_item(
 
     sku = current_item.get("SKU", "")
 
-    # Step 2 — build diff: only record fields the caller explicitly provided
+    # Step 2 — build diff: only record fields the caller explicitly provided.
+    # The stored `Cost` is the tax-inclusive line total (Linnworks convention),
+    # but this tool's `cost` parameter is an ex-VAT *unit* cost — so we work the
+    # whole diff in ex-VAT unit terms and convert back to a line total on write.
     before: dict = {}
     after: dict = {}
 
-    new_quantity = current_item.get("Quantity")
-    new_cost = current_item.get("Cost")
-    new_tax_rate = current_item.get("TaxRate")
+    current_qty = current_item.get("Quantity") or 0
+    current_tax_rate = current_item.get("TaxRate") or 0.0
+    current_unit_ex = _po_line_unit_ex_tax(
+        current_item.get("Cost") or 0.0, current_qty, current_tax_rate
+    )
 
-    if quantity is not None and quantity != current_item.get("Quantity"):
-        before["quantity"] = current_item.get("Quantity")
+    new_quantity = current_qty
+    new_unit_ex = current_unit_ex
+    new_tax_rate = current_tax_rate
+
+    if quantity is not None and quantity != current_qty:
+        before["quantity"] = current_qty
         after["quantity"] = quantity
         new_quantity = quantity
 
-    if cost is not None and cost != current_item.get("Cost"):
-        before["cost"] = current_item.get("Cost")
-        after["cost"] = cost
-        new_cost = cost
+    if cost is not None and round(cost, 4) != current_unit_ex:
+        before["cost"] = current_unit_ex
+        after["cost"] = round(cost, 4)
+        new_unit_ex = cost
 
-    if tax_rate is not None and tax_rate != current_item.get("TaxRate"):
-        before["tax_rate"] = current_item.get("TaxRate")
+    if tax_rate is not None and tax_rate != current_tax_rate:
+        before["tax_rate"] = current_tax_rate
         after["tax_rate"] = tax_rate
         new_tax_rate = tax_rate
 
@@ -4585,7 +4633,9 @@ def update_purchase_order_item(
                 "Quantity": new_quantity,
                 "PackQuantity": current_item.get("PackQuantity", 1),
                 "PackSize": current_item.get("PackSize", 1),
-                "Cost": new_cost,
+                # Linnworks `Cost` = tax-inclusive line total — convert from the
+                # ex-VAT unit cost the diff is tracked in (issue #15).
+                "Cost": _po_line_cost_inc_tax(new_unit_ex, new_quantity, new_tax_rate),
                 "TaxRate": new_tax_rate,
             }
         },
@@ -4607,7 +4657,13 @@ def update_purchase_order_item(
         if "quantity" in after:
             confirmed_after["quantity"] = confirmed_item.get("Quantity")
         if "cost" in after:
-            confirmed_after["cost"] = confirmed_item.get("Cost")
+            # Stored Cost is the tax-inclusive line total — present it back as the
+            # ex-VAT unit cost so before/after stay in the same units.
+            confirmed_after["cost"] = _po_line_unit_ex_tax(
+                confirmed_item.get("Cost") or 0.0,
+                confirmed_item.get("Quantity") or 0,
+                confirmed_item.get("TaxRate") or 0.0,
+            )
         if "tax_rate" in after:
             confirmed_after["tax_rate"] = confirmed_item.get("TaxRate")
 
@@ -4930,7 +4986,15 @@ def get_purchase_order(purchase_id: str) -> dict:
             "quantity": i.get("Quantity"),
             "delivered": i.get("Delivered"),
             "outstanding": (i.get("Quantity") or 0) - (i.get("Delivered") or 0),
+            # `cost` / `line_total_inc_tax` is the raw Linnworks field: the
+            # tax-inclusive line total. `unit_cost_ex_tax` is the derived ex-VAT
+            # unit price that the create/add/update tools take as input — exposed
+            # so read-back reconciles cleanly with what was written (issue #15).
             "cost": i.get("Cost"),
+            "line_total_inc_tax": i.get("Cost"),
+            "unit_cost_ex_tax": _po_line_unit_ex_tax(
+                i.get("Cost") or 0.0, i.get("Quantity") or 0, i.get("TaxRate") or 0.0
+            ),
             "tax_rate": i.get("TaxRate"),
             "tax": i.get("Tax"),
             "pack_quantity": i.get("PackQuantity"),
