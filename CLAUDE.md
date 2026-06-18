@@ -1,6 +1,8 @@
 # Linnworks MCP Server — Claude context
 
-**Current version: 1.16.0** — 54 tools. See `pyproject.toml` for full metadata.
+**Current version: 1.17.0** — 55 tools. See `pyproject.toml` for full metadata.
+
+> **v1.17.0 (issue #16) — read path live-tested 18 Jun 2026:** Added `list_to_shopify` — the first **listing/channel** tool, wrapping the Generic Listing Tool (GLT) to push EXISTING Linnworks inventory to Shopify. Per-item configurator selection is data-driven: `configurator` override → the item's `Shopify Configurator` extended property → `default_configurator` fallback, then validated against the live Shopify configurator catalogue (a name that doesn't match becomes a per-item error row, never sinks the batch). **Channel-identity gotcha cracked live:** GLT identifies Shopify by `ChannelType="Shopify"` + `ChannelName="SHOPIFY"` — the uppercase **Source** string, NOT a SubSource store name (`"SWH Shopify"`, `"Venom Skateboards"` etc. all 400 with "Channel types mismatch on channel factory creation"). The individual stores are distinguished by each configurator's `ChannelId`/`SubSource` (18=SWH Shopify, 21=Venom Skateboards, 26=Icarus Eyewear, 29=Lobster Eyewear, 34=The Warehouse Group B2B). Configurator names are **not unique across stores** (12 names duplicated), so a shared name is reported as ambiguous unless `sub_source` scopes it. **Read/selection path live-confirmed** (catalogue fetch = 67 configurators, SKU→GUID, property read, override/default/validation/ambiguity/scoping/staging/injection all verified); the **write path (`CreateTemplates`+`ProcessTemplates`) is spec-based, NOT yet live-exercised** — a live run creates real customer-facing Shopify listings, so start with a single SKU. The issue named these endpoints under `Listings/` but they live under `GenericListings/`, and the configurator is applied at `CreateTemplates` time via `ConfiguratorId` (not a separate `SaveConfiguratorData` step — those modify a configurator's own definition).
 
 > **v1.16.0 (issue #15) — live-tested 16 Jun 2026:** Fixed PO line-cost write — Linnworks `Cost` is the **tax-inclusive line total** (`unit × qty × (1+rate)`), not the ex-VAT unit cost. `create_purchase_order`, `add_purchase_order_item`, and `update_purchase_order_item` now convert via `_po_line_cost_inc_tax()` before writing (was sending the bare unit cost → wrong unit prices and PO totals). Read-back paths (`get_purchase_order`, the update diff) expose a derived `unit_cost_ex_tax` via `_po_line_unit_ex_tax()` so reads reconcile with the ex-VAT unit the tools accept. Also fixed `create_purchase_order`'s return `total_cost`, which read a non-existent `GrandTotal` header key (→ `None`) instead of `TotalCost`. **Verified end-to-end against a live test PO** (create 3×£10@20% → £36; add 15×£17.50@20% → £315; update qty 3→5 → £60; update unit £10→£12.34 → £74.04; all header totals/tax correct), then deleted via `Delete_PurchaseOrder`.
 
@@ -53,6 +55,8 @@ Thresholds (defined in `WRITE_THRESHOLDS`):
 | `set_extended_properties` | 50 | Metadata, lower blast radius |
 | `set_inventory_item_descriptions` | 50 | Content, lower blast radius |
 | `add_inventory_item_images` | 100 | Additive only, no overwrites |
+| `delete_inventory_item` | 10 | Irreversible deletion |
+| `list_to_shopify` | 25 | Creates live customer-facing channel listings |
 | `default` | 25 | Fallback for unlisted operations |
 
 There is **no hard cap** — any batch size works once confirmed. The threshold is a staging gate, not a refusal.
@@ -212,6 +216,16 @@ The helper `_resolve_sku_to_id(sku, cache)` is shared across all write tools —
 
 ---
 
+### Listings — Generic Listing Tool (GLT)
+
+| Tool | Endpoint(s) | Threshold | Notes |
+|---|---|---|---|
+| `list_to_shopify(skus, configurator, default_configurator, sub_source, confirmed_count, dry_run=True)` | `GenericListings/GetConfiguratorsInfoPaged` (read) → `GenericListings/CreateTemplates` + `GenericListings/ProcessTemplates` (write) | 25 | Lists **existing** inventory to Shopify via a saved configurator — the API form of "select items → apply configurator → create listings". Per-item configurator chosen by: `configurator` override → item's `Shopify Configurator` extended property → `default_configurator` fallback; the chosen name is validated against the live catalogue (typo/blank → per-item `unresolved` row, never fatal). Items grouped by resolved configurator; each group = one CreateTemplates (returns `AllCreatedIds`) + one ProcessTemplates (`Action:"Create"`). **Read/selection path live-confirmed 18 Jun 2026; write path spec-based, not yet live-run** (creates real Shopify listings — start with one SKU). Channel = `ChannelType="Shopify"` + `ChannelName="SHOPIFY"` (the Source, **not** a SubSource); store derived from the configurator's `ChannelId`/`SubSource`. Pass `sub_source` to disambiguate the 12 configurator names shared across stores. |
+
+**GLT design notes (issue #16):** The issue referenced `Listings/…` but the endpoints are `GenericListings/…`. The configurator is applied at **CreateTemplates** time via `ConfiguratorId` — `SaveConfiguratorData`/`SaveConfiguratorFields` modify a *configurator's own definition*, not a template, so they're **not** part of the list-an-item flow. `_fetch_shopify_configurators()` normalizes the nested `Info.{Name,Id,ChannelId,SubSource}.Value` fields into flat dicts. v1 is Shopify-only by design (most forgiving channel); other channels (`Amazon`, `TikTok`, `Walmart`, etc. — also in the `ChannelType` enum) can follow once the write path is proven.
+
+---
+
 ## Confirmed working endpoints
 
 | Endpoint | Method | Payload shape | Key notes |
@@ -272,6 +286,9 @@ The helper `_resolve_sku_to_id(sku, cache)` is shared across all write tools —
 | `Stock/UpdateStockLevelsBulk` | POST | `{"Items": [{SKU, StockItemId, StockLocationId, StockLevel}]}` | Sets absolute stock levels; **returns an empty 2xx body — does NOT echo `Items`** on this tenant, so per-item success is inferred from the 2xx (verify with `get_stock_level`); **live-tested 15 Jun 2026** |
 | `Stock/CreateVariationGroup` | POST | `{"template": {VariationGroupName, ParentSKU, ParentStockItemId, VariationItemIds: [guid]}}` | Creates a new variation group; all child GUIDs must resolve to existing items; **spec-based, not yet live-tested** |
 | `Stock/GetVariationGroupByName` | GET | `?variationGroupName=<string>` | Returns the matching variation group, or **`null`** (HTTP 200, not a 404) if the name doesn't exist; used as pre-flight check in `create_variation_group` — the code guards with `if existing_group and existing_group.get("VariationGroupName")`, so null is handled; **read confirmed live 15 Jun 2026** |
+| `GenericListings/GetConfiguratorsInfoPaged` | POST | `{"request":{"ChannelType":"Shopify","ChannelName":"SHOPIFY","PaginationParameters":{"PageNumber":1,"EntriesPerPage":1000}}}` | Lists GLT configurators for a channel. **`ChannelName` must be the Source string `"SHOPIFY"`, NOT a SubSource** — a SubSource ("SWH Shopify" etc.) returns HTTP 400 "Channel types mismatch on channel factory creation: Shopify - Shopify". Response: `{"ConfiguratorsInfo":[{"Info":{"Name":{Value},"Id":{Value},"ChannelId":{Value},"SubSource":{Value},"IsShowInInventory":{Value},...}}]}` — every field is wrapped as `{Type,Value,Errors}` (unwrap via `_glt_field`). 67 configurators in this tenant; `ChannelId` 18=SWH Shopify, 21=Venom Skateboards, 26=Icarus Eyewear, 29=Lobster Eyewear, 34=The Warehouse Group B2B. **Live-confirmed 18 Jun 2026** (issue #16) |
+| `GenericListings/CreateTemplates` | POST | `{"request":{"ChannelType":"Shopify","ChannelName":"SHOPIFY","Parameters":{"SelectedRegions":[],"Token":"00000000-...","InventoryItemIds":["guid",...],"ChannelId":<int>},"PaginationParameters":{"PageNumber":1,"EntriesPerPage":<n>},"ConfiguratorId":<int>}}` | Creates GLT listing templates for the given items under one configurator. Response: `{"TemplatesInfo":[...],"AllCreatedIds":[<int>,...]}` — use **`AllCreatedIds`** (cleanly typed int array) for the template ids to process. The configurator is applied HERE via `ConfiguratorId`. **Spec-based, NOT yet live-run** (issue #16) — creates real templates |
+| `GenericListings/ProcessTemplates` | POST | `{"request":{"ChannelType":"Shopify","ChannelName":"SHOPIFY","TemplateRequests":[{"TemplateId":<int>,"Action":"Create"}],"ClientContext":{"Activity":"...","Source":"..."}}}` | Pushes templates (from CreateTemplates) live to the channel. `Action` enum: `Create`/`Update`/`Relist`/`Delete`/`Revise`/`ChannelSpecific`/`NotAllowed`. Empty 2xx response. **Spec-based, NOT yet live-run** (issue #16) — creates real customer-facing Shopify listings |
 
 ---
 

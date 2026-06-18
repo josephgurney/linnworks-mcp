@@ -9,7 +9,7 @@ See README.md for setup instructions.
 """
 from __future__ import annotations
 
-__version__ = "1.11.0"
+__version__ = "1.17.0"
 
 import os
 import sys
@@ -345,6 +345,7 @@ WRITE_THRESHOLDS: dict[str, int] = {
     "set_inventory_item_descriptions": 50,  # content, lower blast radius
     "add_inventory_item_images":      100,  # additive-only, no overwrites
     "delete_inventory_item":          10,   # IRREVERSIBLE — lowest threshold of all
+    "list_to_shopify":                25,   # creates live customer-facing channel listings
     "default":                        25,   # fallback for any unlisted operation
 }
 
@@ -7024,6 +7025,420 @@ def delete_inventory_item(
             "delete_error). Per-item read-back results show what actually got deleted."
         )
     return out
+
+
+# ---------- Listings — Generic Listing Tool (GLT) ----------
+#
+# The GLT lets you list EXISTING Linnworks inventory to a sales channel by
+# applying a saved "configurator" (the listing template recipe). v1 is Shopify
+# only — the most forgiving channel (no strict variation-theme / product-type
+# validation), so the smallest, lowest-risk path to build and prove.
+#
+# Channel identity gotcha (cracked live 18 Jun 2026): GLT identifies the Shopify
+# channel by ChannelType="Shopify" + ChannelName="SHOPIFY" — the uppercase
+# *Source* string, NOT the per-store SubSource ("SWH Shopify", "Venom
+# Skateboards", …). Passing a SubSource as ChannelName returns HTTP 400
+# "Channel types mismatch on channel factory creation: Shopify - Shopify."
+# The individual stores are distinguished by each configurator's ChannelId /
+# SubSource instead (18=SWH Shopify, 21=Venom Skateboards, 26=Icarus Eyewear,
+# 29=Lobster Eyewear, 34=The Warehouse Group B2B in this tenant).
+
+GLT_SHOPIFY_CHANNEL_TYPE = "Shopify"
+# GLT ChannelName for Shopify = the Source string, NOT a SubSource store name.
+GLT_SHOPIFY_CHANNEL_NAME = "SHOPIFY"
+# Extended property read per item to decide which configurator to apply.
+SHOPIFY_CONFIGURATOR_PROPERTY = "Shopify Configurator"
+_ZERO_GUID = "00000000-0000-0000-0000-000000000000"
+
+
+def _glt_field(info: dict, key: str):
+    """Unwrap a GLT ConfiguratorsInfo field.
+
+    Each field comes wrapped as {"Type": "...", "Value": <x>, "Errors": [...]}.
+    Returns the inner Value, or the raw field if it isn't wrapped.
+    """
+    f = info.get(key)
+    if isinstance(f, dict) and "Value" in f:
+        return f.get("Value")
+    return f
+
+
+def _fetch_shopify_configurators() -> list[dict]:
+    """Fetch all Shopify GLT configurators for this tenant.
+
+    Calls GenericListings/GetConfiguratorsInfoPaged with ChannelType=Shopify,
+    ChannelName="SHOPIFY". Returns a flat list of normalized dicts:
+    {id, name, channel_id, sub_source, show_in_inventory}.
+
+    Confirmed live 18 Jun 2026 — 67 configurators in this tenant. A single page
+    of 1000 covers it; tenants with >1000 configurators would need pagination.
+    """
+    resp = call_linnworks(
+        "GenericListings/GetConfiguratorsInfoPaged",
+        {"request": {
+            "ChannelType": GLT_SHOPIFY_CHANNEL_TYPE,
+            "ChannelName": GLT_SHOPIFY_CHANNEL_NAME,
+            "PaginationParameters": {"PageNumber": 1, "EntriesPerPage": 1000},
+        }},
+    )
+    infos = resp.get("ConfiguratorsInfo") if isinstance(resp, dict) else None
+    out: list[dict] = []
+    for it in (infos or []):
+        info = it.get("Info") if isinstance(it, dict) and isinstance(it.get("Info"), dict) else it
+        out.append({
+            "id":                _glt_field(info, "Id"),
+            "name":              _glt_field(info, "Name"),
+            "channel_id":        _glt_field(info, "ChannelId"),
+            "sub_source":        _glt_field(info, "SubSource"),
+            "show_in_inventory": _glt_field(info, "IsShowInInventory"),
+        })
+    return out
+
+
+def _norm_conf_name(name: str | None) -> str:
+    """Normalize a configurator name for case/space-insensitive matching."""
+    return (name or "").strip().lower()
+
+
+@mcp.tool()
+def list_to_shopify(
+    skus: list[str],
+    configurator: str | None = None,
+    default_configurator: str | None = None,
+    sub_source: str | None = None,
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    List EXISTING Linnworks inventory items to Shopify via the Generic Listing
+    Tool (GLT) — the API equivalent of the UI flow "select items → apply
+    configurator → create listings". Shopify only (v1).
+
+    Per-item configurator selection is data-driven, so a mixed batch auto-routes
+    each product to the right listing recipe:
+      1. `configurator` override (if given) — forces this configurator for ALL skus
+      2. else the item's "Shopify Configurator" extended property value
+      3. else `default_configurator` (the batch fallback)
+    The chosen name is validated against the live Shopify configurator catalogue
+    (GenericListings/GetConfiguratorsInfoPaged). A name that doesn't match a real
+    configurator becomes a per-item error row in `unresolved` — reported, not
+    fatal — so one typo or one unfilled property never sinks the whole batch.
+
+    The same configurator name can exist on more than one Shopify store (e.g. a
+    deck configurator on both "SWH Shopify" and "Venom Skateboards"). A name that
+    matches configurators on multiple stores is ambiguous and is reported as such;
+    pass `sub_source` (e.g. "SWH Shopify") to scope the batch to one store.
+
+    Flow per configurator group (live run only):
+      GenericListings/CreateTemplates  → returns the created template ids
+      GenericListings/ProcessTemplates → pushes those templates live to Shopify
+    Items are grouped by their resolved configurator so each group is one
+    CreateTemplates + one ProcessTemplates call.
+
+    ⚠️  A live run (dry_run=False) creates REAL Shopify listings — customer-facing
+    and not trivially undone. Always run dry_run=True first and read the plan.
+    The read/selection path (configurator catalogue, SKU + extended-property
+    resolution) is live-confirmed; the write path (CreateTemplates /
+    ProcessTemplates) is built to the OpenAPI spec but NOT yet live-exercised in
+    this tenant — start with a single SKU.
+
+    For batches larger than 25 SKUs this tool stages: it returns the plan and asks
+    you to confirm with confirmed_count=<N> before executing.
+
+    Args:
+        skus: Exact SKUs / ItemNumbers to list. Each is resolved to its
+            StockItemId and its "Shopify Configurator" extended property is read.
+        configurator: Optional override — force this configurator name for every
+            SKU, ignoring per-item extended properties.
+        default_configurator: Optional fallback configurator name for any item
+            whose "Shopify Configurator" property is blank (only consulted when
+            `configurator` is not given).
+        sub_source: Optional Shopify store name to scope to (e.g. "SWH Shopify",
+            "Venom Skateboards"). Disambiguates configurator names shared across
+            stores and restricts which configurators count as valid.
+        confirmed_count: For batches > 25 SKUs, pass len(skus) after reviewing
+            the plan to confirm the write.
+        dry_run: If True (default), returns the plan without creating any listing.
+            Set to False to create and push the Shopify listings.
+
+    Returns:
+        A dict with:
+          - dry_run, item_count
+          - configurator_catalogue_count: configurators available for matching
+          - available_sub_sources: Shopify store names present in the catalogue
+          - plan: per-SKU resolution for items that resolved cleanly (sku,
+            stock_item_id, title, configurator, configurator_id, channel_id,
+            sub_source, decision)
+          - groups: items grouped by resolved configurator — what each
+            CreateTemplates call would cover
+          - unresolved: per-SKU error rows (not found / no configurator decided /
+            name not in catalogue / ambiguous across stores)
+          - results: per-group outcome with created template ids and process
+            status (live run only)
+    """
+    if not skus:
+        raise ValueError("skus must contain at least one SKU.")
+
+    # Injection check on the free-text selection args (defensive — these are
+    # matched against a fixed catalogue, so an injected string just won't match,
+    # but the framework says check every free-text write parameter).
+    _check_injection("configurator", configurator or "")
+    _check_injection("default_configurator", default_configurator or "")
+    _check_injection("sub_source", sub_source or "")
+
+    # ── Fetch the live Shopify configurator catalogue (read-before-write) ──────
+    catalogue = _fetch_shopify_configurators()
+    available_sub_sources = sorted(
+        {c["sub_source"] for c in catalogue if c.get("sub_source")}
+    )
+
+    # Optional store scope. Validate up front so a typo'd sub_source fails loudly
+    # rather than silently matching nothing.
+    scope = catalogue
+    if sub_source:
+        scope = [c for c in catalogue if _norm_conf_name(c.get("sub_source")) == _norm_conf_name(sub_source)]
+        if not scope:
+            return {
+                "error": (
+                    f"sub_source '{sub_source}' is not a Shopify store in this tenant. "
+                    f"Available: {available_sub_sources}"
+                ),
+                "available_sub_sources": available_sub_sources,
+            }
+
+    # name → [configurators] (within the chosen scope)
+    by_name: dict[str, list[dict]] = {}
+    for c in scope:
+        by_name.setdefault(_norm_conf_name(c.get("name")), []).append(c)
+
+    # ── Resolve each SKU → GUID, decide configurator, validate ────────────────
+    sku_cache: dict[str, str] = {}
+    plan: list[dict] = []
+    unresolved: list[dict] = []
+
+    for raw_sku in skus:
+        sku = (raw_sku or "").strip()
+        if not sku:
+            unresolved.append({"sku": raw_sku, "error": "empty SKU"})
+            continue
+
+        # Resolve identity (StockItemId + title)
+        try:
+            item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+        except RuntimeError as exc:
+            unresolved.append({"sku": sku, "error": f"not found: {exc}"})
+            continue
+        stock_item_id = item.get("StockItemId")
+        if not stock_item_id:
+            unresolved.append({"sku": sku, "error": "found but returned no StockItemId"})
+            continue
+        sku_cache[sku] = stock_item_id
+        title = item.get("ItemTitle")
+
+        # Decide which configurator name applies + where the decision came from
+        decision: str
+        conf_name: str | None
+        if configurator:
+            conf_name, decision = configurator, "override"
+        else:
+            prop_value = None
+            try:
+                props = call_linnworks(
+                    "Inventory/GetInventoryItemExtendedProperties",
+                    {"inventoryItemId": stock_item_id},
+                )
+                for p in (props if isinstance(props, list) else []):
+                    if _norm_conf_name(p.get("ProperyName")) == _norm_conf_name(SHOPIFY_CONFIGURATOR_PROPERTY):
+                        val = (p.get("PropertyValue") or "").strip()
+                        if val:
+                            prop_value = val
+                        break
+            except RuntimeError:
+                prop_value = None  # treat property read failure as "blank"
+
+            if prop_value:
+                conf_name, decision = prop_value, "extended_property"
+            elif default_configurator:
+                conf_name, decision = default_configurator, "default"
+            else:
+                unresolved.append({
+                    "sku": sku, "stock_item_id": stock_item_id, "title": title,
+                    "error": (
+                        f"no configurator: item has no '{SHOPIFY_CONFIGURATOR_PROPERTY}' "
+                        "extended property and no default_configurator was given"
+                    ),
+                })
+                continue
+
+        # Validate the chosen name against the catalogue
+        matches = by_name.get(_norm_conf_name(conf_name), [])
+        if not matches:
+            unresolved.append({
+                "sku": sku, "stock_item_id": stock_item_id, "title": title,
+                "configurator": conf_name, "decision": decision,
+                "error": (
+                    f"configurator '{conf_name}' not found in the Shopify catalogue"
+                    + (f" for store '{sub_source}'" if sub_source else "")
+                    + " — check spelling/casing against available configurators"
+                ),
+            })
+            continue
+        if len(matches) > 1:
+            unresolved.append({
+                "sku": sku, "stock_item_id": stock_item_id, "title": title,
+                "configurator": conf_name, "decision": decision,
+                "error": (
+                    f"ambiguous: '{conf_name}' exists on "
+                    f"{len(matches)} stores ({[m['sub_source'] for m in matches]}) — "
+                    "pass sub_source to disambiguate"
+                ),
+            })
+            continue
+
+        chosen = matches[0]
+        plan.append({
+            "sku":             sku,
+            "stock_item_id":   stock_item_id,
+            "title":           title,
+            "configurator":    chosen.get("name"),
+            "configurator_id": chosen.get("id"),
+            "channel_id":      chosen.get("channel_id"),
+            "sub_source":      chosen.get("sub_source"),
+            "decision":        decision,
+        })
+
+    # ── Group resolved items by configurator (what each CreateTemplates covers) ─
+    groups: dict[int, dict] = {}
+    for row in plan:
+        cid = row["configurator_id"]
+        g = groups.setdefault(cid, {
+            "configurator":    row["configurator"],
+            "configurator_id": cid,
+            "channel_id":      row["channel_id"],
+            "sub_source":      row["sub_source"],
+            "skus":            [],
+            "inventory_item_ids": [],
+        })
+        g["skus"].append(row["sku"])
+        g["inventory_item_ids"].append(row["stock_item_id"])
+    group_list = list(groups.values())
+
+    base_out = {
+        "item_count":                    len(skus),
+        "configurator_catalogue_count":  len(catalogue),
+        "available_sub_sources":         available_sub_sources,
+        "plan":                          plan,
+        "groups":                        [
+            {k: v for k, v in g.items() if k != "inventory_item_ids"}
+            for g in group_list
+        ],
+        "unresolved":                    unresolved,
+    }
+
+    # ── Write guard (threshold 25) ────────────────────────────────────────────
+    guard = _write_guard("list_to_shopify", skus, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, **base_out}
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            **base_out,
+            "message": (
+                f"Dry run — nothing listed. {len(plan)} SKU(s) across "
+                f"{len(group_list)} configurator group(s) would be listed to Shopify; "
+                f"{len(unresolved)} SKU(s) could not be resolved (see unresolved). "
+                "Review the plan, then set dry_run=False to create and push the "
+                "listings. A live run creates real customer-facing Shopify listings."
+            ),
+        }
+
+    if not group_list:
+        return {
+            "dry_run": False,
+            **base_out,
+            "results": [],
+            "message": "No SKUs resolved to a configurator; nothing was listed.",
+        }
+
+    # ── Live execution: per group, CreateTemplates then ProcessTemplates ───────
+    results: list[dict] = []
+    for g in group_list:
+        ids = g["inventory_item_ids"]
+        result = {
+            "configurator":    g["configurator"],
+            "configurator_id": g["configurator_id"],
+            "channel_id":      g["channel_id"],
+            "sub_source":      g["sub_source"],
+            "sku_count":       len(ids),
+            "created_template_ids": [],
+            "processed":       False,
+        }
+        try:
+            create_resp = call_linnworks(
+                "GenericListings/CreateTemplates",
+                {"request": {
+                    "ChannelType": GLT_SHOPIFY_CHANNEL_TYPE,
+                    "ChannelName": GLT_SHOPIFY_CHANNEL_NAME,
+                    "Parameters": {
+                        "SelectedRegions":  [],
+                        "Token":            _ZERO_GUID,
+                        "InventoryItemIds": ids,
+                        "ChannelId":        g["channel_id"],
+                    },
+                    "PaginationParameters": {"PageNumber": 1, "EntriesPerPage": max(len(ids), 1)},
+                    "ConfiguratorId": g["configurator_id"],
+                }},
+            )
+        except RuntimeError as exc:
+            result["error"] = f"CreateTemplates failed: {exc}"
+            results.append(result)
+            continue
+
+        created_ids = []
+        if isinstance(create_resp, dict):
+            created_ids = create_resp.get("AllCreatedIds") or []
+        result["created_template_ids"] = created_ids
+
+        if not created_ids:
+            result["error"] = (
+                "CreateTemplates returned no template ids (AllCreatedIds empty) — "
+                "nothing to process. Inspect TemplatesInfo in the Linnworks UI."
+            )
+            results.append(result)
+            continue
+
+        try:
+            call_linnworks(
+                "GenericListings/ProcessTemplates",
+                {"request": {
+                    "ChannelType": GLT_SHOPIFY_CHANNEL_TYPE,
+                    "ChannelName": GLT_SHOPIFY_CHANNEL_NAME,
+                    "TemplateRequests": [
+                        {"TemplateId": tid, "Action": "Create"} for tid in created_ids
+                    ],
+                    "ClientContext": {"Activity": "list_to_shopify", "Source": "linnworks-mcp"},
+                }},
+            )
+            result["processed"] = True
+        except RuntimeError as exc:
+            result["error"] = (
+                f"templates created (ids {created_ids}) but ProcessTemplates failed: {exc}"
+            )
+        results.append(result)
+
+    listed = sum(1 for r in results if r.get("processed"))
+    return {
+        "dry_run":    False,
+        **base_out,
+        "results":    results,
+        "message": (
+            f"{listed}/{len(results)} configurator group(s) listed and pushed to "
+            "Shopify. Verify the new listings in the Linnworks GLT / your Shopify "
+            "admin — there is no clean API read-back for newly created listings. "
+            "Any per-group error is surfaced in results[].error."
+        ),
+    }
 
 
 # ---------- Entrypoint ----------
