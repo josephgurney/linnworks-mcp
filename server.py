@@ -7316,6 +7316,207 @@ def _norm_conf_name(name: str | None) -> str:
     return (name or "").strip().lower()
 
 
+# ---------- Channel listings (read) ----------
+#
+# The read-side companion to list_to_shopify (issue #18). Answers "is this SKU
+# already listed, and on which channel/store?" by reading the channel-SKU link
+# table (Inventory/GetInventoryItemChannelSKUs). A non-empty row set for a stock
+# item means it is mapped/listed on that Source+SubSource — exactly what you need
+# to dedupe a brand's in-stock items before a bulk list_to_shopify run, instead
+# of guessing from barcodes. Confirmed live 18 Jun 2026 against this tenant
+# (SHOPIFY per store, EBAY, AMAZON per region, Mirakl MP, MAGENTO all observed).
+
+
+def _format_channel_sku_row(r: dict) -> dict:
+    """Normalize one StockItemChannelSKU row into our flat shape.
+
+    `update_status` carries the channel sync state ("", "Confirmed",
+    "Notification", or a verbose error blob). Pathologically long error blobs
+    are truncated to keep bulk responses readable — the row id and reference id
+    are preserved so the full status can still be inspected in the Linnworks UI.
+    """
+    status = r.get("UpdateStatus")
+    if isinstance(status, str) and len(status) > 280:
+        status = status[:280] + " …(truncated)"
+    return {
+        "source":               r.get("Source"),       # e.g. SHOPIFY, EBAY, AMAZON, Mirakl MP
+        "sub_source":           r.get("SubSource"),     # store/region, e.g. "SWH Shopify", "EBAY0"
+        "channel_sku":          r.get("SKU"),
+        "channel_reference_id": r.get("ChannelReferenceId"),
+        "update_status":        status,
+        "listed_quantity":      r.get("ListedQuantity"),
+        "max_listed_quantity":  r.get("MaxListedQuantity"),
+        "last_update":          r.get("LastUpdate"),
+        "ignore_sync":          r.get("IgnoreSync"),
+        "is_multi_location":    r.get("IsMultiLocation"),
+        "channel_sku_row_id":   r.get("ChannelSKURowId"),
+    }
+
+
+def _fetch_channel_skus_for_ids(stock_item_ids: list[str]) -> dict[str, list]:
+    """Batch-fetch channel-SKU link rows for many stock items.
+
+    Returns {stock_item_id (lowercased): [raw StockItemChannelSKU rows]}.
+    Wraps Inventory/BatchGetInventoryItemChannelSKUs (POST, payload sent
+    UNWRAPPED as {"inventoryItemIds": [...]}), chunked at 200 to stay well under
+    the endpoint's 150/min rate limit. Confirmed live 18 Jun 2026.
+    """
+    out: dict[str, list] = {}
+    ids = [i for i in stock_item_ids if i]
+    for i in range(0, len(ids), 200):
+        chunk = ids[i:i + 200]
+        resp = call_linnworks(
+            "Inventory/BatchGetInventoryItemChannelSKUs",
+            {"inventoryItemIds": chunk},
+        )
+        for entry in (resp if isinstance(resp, list) else []):
+            sid = entry.get("StockItemId")
+            if sid:
+                out[sid.lower()] = entry.get("ChannelSkus") or []
+    return out
+
+
+@mcp.tool()
+def get_channel_listings(sku: str) -> dict:
+    """
+    Read the existing channel listings for ONE inventory item — answers
+    "is this SKU already listed, and on which channel/store?".
+
+    Reads the Linnworks channel-SKU link table
+    (Inventory/GetInventoryItemChannelSKUs) for the item. Each row is a live
+    mapping between this stock item and a sales-channel listing, so a non-empty
+    result means the item is already listed/linked on that channel. Covers every
+    channel the item is mapped to — Shopify (per store), eBay, Amazon (per
+    region), Mirakl, Magento, etc.
+
+    This is the read-side companion to `list_to_shopify`: use it to confirm
+    whether a SKU is already live before (re)listing, instead of guessing from
+    the barcode. To check many SKUs at once, use `get_channel_listings_bulk`.
+
+    Args:
+        sku: The exact SKU / ItemNumber to look up.
+
+    Returns:
+        A dict with:
+          - sku, stock_item_id, title
+          - is_listed:     True if the item has any channel-SKU mapping
+          - listing_count: number of channel listings
+          - channels:      distinct Source values (e.g. ["AMAZON", "SHOPIFY"])
+          - sub_sources:   distinct store/region names (e.g. ["SWH Shopify"])
+          - listings:      per-channel rows (source, sub_source, channel_sku,
+                           channel_reference_id, update_status, listed_quantity,
+                           max_listed_quantity, last_update, ignore_sync,
+                           is_multi_location, channel_sku_row_id)
+
+    Note: Linnworks does not return a ready-made listing URL. `channel_sku` and
+    `channel_reference_id` identify the listing on the channel (for Shopify the
+    reference is a product:variant:inventory id triple).
+    """
+    try:
+        item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+    except RuntimeError:
+        return {"error": f"No inventory item found for SKU '{sku}'", "sku": sku}
+
+    stock_item_id = item.get("StockItemId")
+    if not stock_item_id:
+        return {"error": f"Item found for SKU '{sku}' but StockItemId was missing", "sku": sku}
+
+    rows = call_linnworks_get(
+        "Inventory/GetInventoryItemChannelSKUs",
+        {"inventoryItemId": stock_item_id},
+    )
+    listings = [_format_channel_sku_row(r) for r in (rows if isinstance(rows, list) else [])]
+
+    return {
+        "sku":           sku,
+        "stock_item_id": stock_item_id,
+        "title":         item.get("ItemTitle"),
+        "is_listed":     len(listings) > 0,
+        "listing_count": len(listings),
+        "channels":      sorted({l["source"] for l in listings if l.get("source")}),
+        "sub_sources":   sorted({l["sub_source"] for l in listings if l.get("sub_source")}),
+        "listings":      listings,
+    }
+
+
+@mcp.tool()
+def get_channel_listings_bulk(skus: list[str]) -> dict:
+    """
+    Read the existing channel listings for MANY inventory items at once — the
+    batch dedupe companion to `list_to_shopify`.
+
+    For each SKU, resolves it to its StockItemId and reads the channel-SKU link
+    table via Inventory/BatchGetInventoryItemChannelSKUs (one batched call per
+    200 items). Use this before a bulk listing run to skip SKUs that are already
+    live on a channel/store, rather than relying on the barcode heuristic.
+
+    Args:
+        skus: List of exact SKUs / ItemNumbers to check.
+
+    Returns:
+        A dict with:
+          - item_count:     number of SKUs requested
+          - resolved_count: how many resolved to a stock item
+          - listed_count / unlisted_count: split of resolved items by whether
+            they have any channel listing
+          - results: per-SKU rows (sku, stock_item_id, title, is_listed,
+            listing_count, channels, sub_sources, listings) — same listing shape
+            as get_channel_listings
+          - unresolved: per-SKU error rows for SKUs that were not found
+    """
+    if not skus:
+        raise ValueError("skus must contain at least one SKU.")
+
+    resolved: list[tuple[str, str]] = []
+    titles: dict[str, str] = {}
+    unresolved: list[dict] = []
+
+    for raw in skus:
+        s = (raw or "").strip()
+        if not s:
+            unresolved.append({"sku": raw, "error": "empty SKU"})
+            continue
+        try:
+            item = call_linnworks("Inventory/GetInventoryItem", {"sku": s})
+        except RuntimeError as exc:
+            unresolved.append({"sku": s, "error": f"not found: {exc}"})
+            continue
+        sid = item.get("StockItemId")
+        if not sid:
+            unresolved.append({"sku": s, "error": "found but returned no StockItemId"})
+            continue
+        resolved.append((s, sid))
+        titles[sid.lower()] = item.get("ItemTitle")
+
+    by_id = _fetch_channel_skus_for_ids([sid for _, sid in resolved])
+
+    results: list[dict] = []
+    listed_count = 0
+    for s, sid in resolved:
+        listings = [_format_channel_sku_row(r) for r in by_id.get(sid.lower(), [])]
+        if listings:
+            listed_count += 1
+        results.append({
+            "sku":           s,
+            "stock_item_id": sid,
+            "title":         titles.get(sid.lower()),
+            "is_listed":     len(listings) > 0,
+            "listing_count": len(listings),
+            "channels":      sorted({l["source"] for l in listings if l.get("source")}),
+            "sub_sources":   sorted({l["sub_source"] for l in listings if l.get("sub_source")}),
+            "listings":      listings,
+        })
+
+    return {
+        "item_count":     len(skus),
+        "resolved_count": len(resolved),
+        "listed_count":   listed_count,
+        "unlisted_count": len(resolved) - listed_count,
+        "results":        results,
+        "unresolved":     unresolved,
+    }
+
+
 @mcp.tool()
 def list_to_shopify(
     skus: list[str],
@@ -7523,6 +7724,38 @@ def list_to_shopify(
             "decision":        decision,
         })
 
+    # ── Dedupe: drop items already listed on their target Shopify store ───────
+    # Read-before-write via the channel-SKU link table (see get_channel_listings,
+    # issue #18). Any resolved item that already has a SHOPIFY channel-SKU on its
+    # target store (the configurator's sub_source) is moved out of the listing
+    # plan into `already_listed` and is NOT sent to CreateTemplates — so a bulk
+    # run can't silently create a duplicate customer-facing Shopify listing.
+    # Runs on both dry runs and live runs. A lookup failure degrades safely:
+    # dedupe is skipped and a warning is surfaced rather than blocking the listing.
+    already_listed: list[dict] = []
+    dedupe_warning: str | None = None
+    if plan:
+        try:
+            channel_map = _fetch_channel_skus_for_ids([r["stock_item_id"] for r in plan])
+            still_to_list: list[dict] = []
+            for row in plan:
+                existing = [
+                    _format_channel_sku_row(cr)
+                    for cr in channel_map.get((row["stock_item_id"] or "").lower(), [])
+                    if _norm_conf_name(cr.get("Source")) == _norm_conf_name(GLT_SHOPIFY_CHANNEL_NAME)
+                    and _norm_conf_name(cr.get("SubSource")) == _norm_conf_name(row["sub_source"])
+                ]
+                if existing:
+                    already_listed.append({**row, "existing_listings": existing})
+                else:
+                    still_to_list.append(row)
+            plan = still_to_list
+        except RuntimeError as exc:
+            dedupe_warning = (
+                f"could not check existing channel listings ({exc}); proceeding "
+                "WITHOUT dedupe — verify nothing is double-listed"
+            )
+
     # ── Group resolved items by configurator (what each CreateTemplates covers) ─
     groups: dict[int, dict] = {}
     for row in plan:
@@ -7548,8 +7781,11 @@ def list_to_shopify(
             {k: v for k, v in g.items() if k != "inventory_item_ids"}
             for g in group_list
         ],
+        "already_listed":                already_listed,
         "unresolved":                    unresolved,
     }
+    if dedupe_warning:
+        base_out["dedupe_warning"] = dedupe_warning
 
     # ── Write guard (threshold 25) ────────────────────────────────────────────
     guard = _write_guard("list_to_shopify", skus, confirmed_count, dry_run)
@@ -7563,6 +7799,8 @@ def list_to_shopify(
             "message": (
                 f"Dry run — nothing listed. {len(plan)} SKU(s) across "
                 f"{len(group_list)} configurator group(s) would be listed to Shopify; "
+                f"{len(already_listed)} SKU(s) already live on their target store and "
+                f"skipped (see already_listed); "
                 f"{len(unresolved)} SKU(s) could not be resolved (see unresolved). "
                 "Review the plan, then set dry_run=False to create and push the "
                 "listings. A live run creates real customer-facing Shopify listings."
@@ -7570,11 +7808,17 @@ def list_to_shopify(
         }
 
     if not group_list:
+        msg = "No SKUs resolved to a configurator; nothing was listed."
+        if already_listed:
+            msg = (
+                f"Nothing listed — all resolved SKU(s) were already live on their "
+                f"target store ({len(already_listed)} skipped, see already_listed)."
+            )
         return {
             "dry_run": False,
             **base_out,
             "results": [],
-            "message": "No SKUs resolved to a configurator; nothing was listed.",
+            "message": msg,
         }
 
     # ── Live execution: per group, CreateTemplates then ProcessTemplates ───────
