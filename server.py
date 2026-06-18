@@ -711,6 +711,7 @@ def find_inventory_item(
                 "Title": item.get("ItemTitle"),
                 "Barcode": item.get("BarcodeNumber"),
                 "IsCompositeParent": item.get("IsCompositeParent", False),
+                "IsVariationParent": item.get("IsVariationParent", False),
                 "RetailPrice": item.get("RetailPrice"),
                 "PurchasePrice": item.get("PurchasePrice"),
             }
@@ -804,6 +805,221 @@ def search_inventory_items(
         "total_pages": result.get("TotalPages", 1) if isinstance(result, dict) else 1,
         "count": len(items),
         "items": items,
+    }
+
+
+def _format_variation_member(m: dict) -> dict:
+    """Map a Stock/GetVariationItems member row to the MCP-facing shape."""
+    return {
+        "sku": m.get("ItemNumber") or m.get("SKU"),
+        "stock_item_id": m.get("pkStockItemId") or m.get("StockItemId"),
+        "title": m.get("ItemTitle"),
+    }
+
+
+def _resolve_variation(sku: str, stock_item_id: str) -> dict:
+    """
+    Resolve a SKU's variation-group relationship in BOTH directions.
+
+    Forward (parent -> children): Stock/GetVariationGroupByParentId returns the
+        group for a parent stock item (HTTP 200 `null` for non-parents); the
+        parent's StockItemId IS the group's pkVariationItemId. Stock/GetVariationItems
+        then lists the child members (the parent itself is NOT in that list).
+
+    Reverse (child -> parent + siblings): Stock/SearchVariationGroups with
+        searchType=ItemSKU substring-matches member SKUs. Because it is a substring
+        match, candidate groups are confirmed by exact SKU membership via
+        GetVariationItems before being accepted — this avoids false positives and
+        is what lets reverse_lookup_confirmed be True.
+
+    All endpoint shapes confirmed live in this tenant 18 Jun 2026 (issue #17).
+    NB: the IsVariationParent flag on GetInventoryItem is unreliable here (observed
+    False on a genuine parent), so role is derived from these relationship
+    endpoints, never from the flag.
+    """
+    # --- Forward: is this SKU a variation PARENT? ---
+    group = call_linnworks_get(
+        "Stock/GetVariationGroupByParentId", {"pkStockItemId": stock_item_id}
+    )
+    if group:  # non-null dict => parent
+        pk = group.get("pkVariationItemId")
+        members = call_linnworks_get(
+            "Stock/GetVariationItems", {"pkVariationItemId": pk}
+        ) or []
+        return {
+            "role": "parent",
+            "group_name": group.get("VariationGroupName"),
+            "parent_sku": sku,
+            "children": [_format_variation_member(m) for m in members],
+            "siblings": [],
+            "reverse_lookup_confirmed": True,
+        }
+
+    # --- Reverse: is this SKU a variation CHILD? ---
+    target = (sku or "").strip().lower()
+    page: int | None = 1
+    pages_scanned = 0
+    while page and pages_scanned < 5:
+        res = call_linnworks_get(
+            "Stock/SearchVariationGroups",
+            {"searchType": "ItemSKU", "searchText": sku,
+             "pageNumber": page, "entriesPerPage": 100},
+        )
+        candidates = res.get("Data", []) if isinstance(res, dict) else []
+        total_pages = res.get("TotalPages", 1) if isinstance(res, dict) else 1
+        for cand in candidates:
+            members = call_linnworks_get(
+                "Stock/GetVariationItems",
+                {"pkVariationItemId": cand.get("pkVariationItemId")},
+            ) or []
+            member_rows = [_format_variation_member(m) for m in members]
+            if any((r["sku"] or "").strip().lower() == target for r in member_rows):
+                return {
+                    "role": "child",
+                    "group_name": cand.get("VariationGroupName"),
+                    "parent_sku": cand.get("VariationSKU"),
+                    "children": [],
+                    "siblings": [
+                        r for r in member_rows
+                        if (r["sku"] or "").strip().lower() != target
+                    ],
+                    "reverse_lookup_confirmed": True,
+                }
+        pages_scanned += 1
+        page = page + 1 if page < total_pages else None
+
+    return {
+        "role": "none",
+        "group_name": None,
+        "parent_sku": None,
+        "children": [],
+        "siblings": [],
+        "reverse_lookup_confirmed": True,
+        "note": "Not part of any variation group (forward + reverse checked).",
+    }
+
+
+def _resolve_composition(sku: str, stock_item_id: str) -> dict:
+    """
+    Resolve a SKU's composite/bundle relationship.
+
+    Forward (parent -> components): Inventory/GetInventoryItemCompositions returns
+        the component list for a composite parent and `[]` for a non-composite.
+        Each row's LinkedStockItemId is the COMPONENT's stock item id; the row's
+        own StockItemId field is the PARENT's id (do not use it as the component id).
+
+    Reverse (component -> parent composites) is NOT supported: Linnworks exposes no
+        endpoint mapping a component back to the composites that contain it, and no
+        working catalogue-list endpoint exists in this tenant to scan every
+        composite (Inventory/GetInventoryItems and Stock/GetStockItemsFull both 400).
+        So belongs_to is always empty and reverse_lookup_supported is always False —
+        this means a non-parent cannot be positively classified as a "component"
+        (Open Q2, issue #17). Confirmed live 18 Jun 2026.
+    """
+    comps = call_linnworks_get(
+        "Inventory/GetInventoryItemCompositions",
+        {"inventoryItemId": stock_item_id, "getFullDetail": "true"},
+    ) or []
+
+    if comps:
+        return {
+            "role": "parent",
+            "components": [
+                {
+                    "sku": c.get("SKU"),
+                    "linked_stock_item_id": c.get("LinkedStockItemId"),
+                    "title": c.get("ItemTitle"),
+                    "quantity": c.get("Quantity"),
+                    "purchase_price": c.get("PurchasePrice"),
+                }
+                for c in comps
+            ],
+            "belongs_to": [],
+            "reverse_lookup_supported": False,
+        }
+
+    return {
+        "role": "none",
+        "components": [],
+        "belongs_to": [],
+        "reverse_lookup_supported": False,
+        "note": ("Not a composite parent. Whether this SKU is a COMPONENT of "
+                 "another composite cannot be determined — Linnworks exposes no "
+                 "component->parent reverse lookup (issue #17, Open Q2)."),
+    }
+
+
+@mcp.tool()
+def get_item_relationships(sku: str) -> dict:
+    """
+    Resolve how a SKU relates to parent/child groupings — variation groups AND
+    composites (bundles) — in both directions, in a single call.
+
+    This answers the question "does this SKU belong to a parent, and which one?"
+    that find_inventory_item and search_inventory_items cannot: those only tell
+    you whether a SKU *is* a parent (flags), never what it rolls up under or what
+    it contains.
+
+    What it resolves:
+      • Variation — forward (parent -> its child variants) and reverse
+        (child -> its parent group + sibling variants). Reverse is confirmed
+        working in this tenant, so a child SKU returns its parent and siblings.
+      • Composite — forward (bundle/custom-complete parent -> its components, with
+        per-component quantity and purchase price). Reverse (component -> the
+        bundles that contain it) is NOT available from the Linnworks API and is
+        always reported empty (composite.reverse_lookup_supported = False).
+
+    Args:
+        sku: The exact SKU / item number (case-insensitive). Partial SKUs and
+            title keywords will not match — use search_inventory_items first if
+            you only have a product name.
+
+    Returns:
+        A dict with:
+          - sku, stock_item_id, title, found
+          - is_variation_parent, is_composite_parent — derived from the live
+            relationship endpoints (the raw item flags are unreliable in this
+            tenant), not from GetInventoryItem's flags
+          - variation: {role ("parent"|"child"|"none"), group_name, parent_sku,
+              children[] (when parent), siblings[] (when child),
+              reverse_lookup_confirmed}
+          - composite: {role ("parent"|"none"), components[] (when parent),
+              belongs_to[] (always empty), reverse_lookup_supported (always False)}
+        Children/siblings/components each carry sku, stock_item_id/linked id, and
+        title; components also carry quantity and purchase_price.
+
+        If the SKU does not exist, returns {sku, found: False, note}.
+    """
+    # Step 0 — resolve SKU -> StockItemId (+ title). GetInventoryItem is exact-SKU
+    # only and raises on a miss (same contract as find_inventory_item).
+    try:
+        item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+    except RuntimeError:
+        return {
+            "sku": sku,
+            "found": False,
+            "note": ("No inventory item found for that exact SKU. Use "
+                     "search_inventory_items for keyword / partial / barcode lookup."),
+        }
+
+    stock_item_id = item.get("StockItemId")
+    if not stock_item_id:
+        return {"sku": sku, "found": False,
+                "note": "Item found but returned no StockItemId."}
+
+    canonical_sku = item.get("ItemNumber") or sku
+    variation = _resolve_variation(canonical_sku, stock_item_id)
+    composite = _resolve_composition(canonical_sku, stock_item_id)
+
+    return {
+        "sku": canonical_sku,
+        "stock_item_id": stock_item_id,
+        "title": item.get("ItemTitle"),
+        "found": True,
+        "is_variation_parent": variation["role"] == "parent",
+        "is_composite_parent": composite["role"] == "parent",
+        "variation": variation,
+        "composite": composite,
     }
 
 
