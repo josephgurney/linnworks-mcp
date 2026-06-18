@@ -7517,6 +7517,187 @@ def get_channel_listings_bulk(skus: list[str]) -> dict:
     }
 
 
+def _format_image_row(r: dict) -> dict:
+    """Normalize one image record into our flat shape.
+
+    Handles both endpoint shapes: the single GET (StockItemImage) returns the
+    thumbnail under `Source`, while the bulk POST (GetImagesInBulkResponseImage)
+    returns it under `FullSourceThumbnail`. Both return the full-size image under
+    `FullSource`. Confirmed live 18 Jun 2026.
+    """
+    return {
+        "image_id":      r.get("pkRowId"),
+        "is_main":       bool(r.get("IsMain")),
+        "sort_order":    r.get("SortOrder"),
+        "full_url":      r.get("FullSource"),
+        "thumbnail_url": r.get("Source") or r.get("FullSourceThumbnail"),
+    }
+
+
+def _fetch_images_for_ids(stock_item_ids: list[str]) -> dict[str, list]:
+    """Batch-fetch image rows for many stock items.
+
+    Returns {stock_item_id (lowercased): [raw image rows]}.
+    Wraps Inventory/GetImagesInBulk (POST, payload WRAPPED as
+    {"request": {"StockItemIds": [...]}} — sending it unwrapped returns HTTP 400
+    "request is empty"), chunked at 200. The bulk response carries `StockItemId`
+    on each image (but not `SKU`), so callers map images back to their SKU via the
+    resolved id. Confirmed live 18 Jun 2026.
+    """
+    out: dict[str, list] = {}
+    ids = [i for i in stock_item_ids if i]
+    for i in range(0, len(ids), 200):
+        chunk = ids[i:i + 200]
+        resp = call_linnworks(
+            "Inventory/GetImagesInBulk",
+            {"request": {"StockItemIds": chunk}},
+        )
+        imgs = resp.get("Images") if isinstance(resp, dict) else None
+        for img in (imgs if isinstance(imgs, list) else []):
+            sid = img.get("StockItemId")
+            if sid:
+                out.setdefault(sid.lower(), []).append(img)
+    return out
+
+
+@mcp.tool()
+def get_inventory_item_images(sku: str) -> dict:
+    """
+    Read the images attached to ONE inventory item — answers "does this SKU have
+    a product image, how many, and is a main image set?".
+
+    Reads the Linnworks image table (Inventory/GetInventoryItemImages) for the
+    item. This is the read-side companion to `add_inventory_item_images` (the
+    write tool) and the third piece of the safe-bulk-listing workflow alongside
+    `get_channel_listings` (is it already listed?) and `list_to_shopify`.
+
+    Use it as a pre-listing image gate: an item with no image — or one with
+    pictures but no main image set — is not ready to go live on a channel.
+    To check many SKUs at once, use `get_inventory_item_images_bulk`.
+
+    Args:
+        sku: The exact SKU / ItemNumber to look up.
+
+    Returns:
+        A dict with:
+          - sku, stock_item_id, title
+          - has_image:      True if the item has at least one image
+          - image_count:    number of images
+          - has_main_image: True if any image is flagged as the main image —
+                            spot items that have a picture but no main set
+          - images:         per-image rows (image_id, is_main, sort_order,
+                            full_url, thumbnail_url), sorted by sort_order
+    """
+    try:
+        item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+    except RuntimeError:
+        return {"error": f"No inventory item found for SKU '{sku}'", "sku": sku}
+
+    stock_item_id = item.get("StockItemId")
+    if not stock_item_id:
+        return {"error": f"Item found for SKU '{sku}' but StockItemId was missing", "sku": sku}
+
+    rows = call_linnworks_get(
+        "Inventory/GetInventoryItemImages",
+        {"inventoryItemId": stock_item_id},
+    )
+    images = [_format_image_row(r) for r in (rows if isinstance(rows, list) else [])]
+    images.sort(key=lambda im: (im["sort_order"] if im["sort_order"] is not None else 0))
+
+    return {
+        "sku":            sku,
+        "stock_item_id":  stock_item_id,
+        "title":          item.get("ItemTitle"),
+        "has_image":      len(images) > 0,
+        "image_count":    len(images),
+        "has_main_image": any(im["is_main"] for im in images),
+        "images":         images,
+    }
+
+
+@mcp.tool()
+def get_inventory_item_images_bulk(skus: list[str]) -> dict:
+    """
+    Read the images for MANY inventory items at once — the batch pre-listing
+    image gate, mirroring `get_channel_listings_bulk`.
+
+    For each SKU, resolves it to its StockItemId (which also yields the title and
+    flags SKUs that don't exist), then batch-reads the image table via
+    Inventory/GetImagesInBulk (one batched call per 200 items). An item that
+    exists but has zero images is reported with has_image=False (a real item to
+    fix), distinct from an `unresolved` SKU (not found in the catalogue).
+
+    Use this before a bulk listing run to skip/flag SKUs with no image, so you
+    only list the genuinely ready ones.
+
+    Args:
+        skus: List of exact SKUs / ItemNumbers to check.
+
+    Returns:
+        A dict with:
+          - item_count:        number of SKUs requested
+          - resolved_count:    how many resolved to a stock item
+          - with_image_count / without_image_count: split of resolved items by
+            whether they have any image
+          - results: per-SKU rows (sku, stock_item_id, title, has_image,
+            image_count, has_main_image, images) — same image shape as
+            get_inventory_item_images
+          - unresolved: per-SKU error rows for SKUs that were not found
+    """
+    if not skus:
+        raise ValueError("skus must contain at least one SKU.")
+
+    resolved: list[tuple[str, str]] = []
+    titles: dict[str, str] = {}
+    unresolved: list[dict] = []
+
+    for raw in skus:
+        s = (raw or "").strip()
+        if not s:
+            unresolved.append({"sku": raw, "error": "empty SKU"})
+            continue
+        try:
+            item = call_linnworks("Inventory/GetInventoryItem", {"sku": s})
+        except RuntimeError as exc:
+            unresolved.append({"sku": s, "error": f"not found: {exc}"})
+            continue
+        sid = item.get("StockItemId")
+        if not sid:
+            unresolved.append({"sku": s, "error": "found but returned no StockItemId"})
+            continue
+        resolved.append((s, sid))
+        titles[sid.lower()] = item.get("ItemTitle")
+
+    by_id = _fetch_images_for_ids([sid for _, sid in resolved])
+
+    results: list[dict] = []
+    with_image = 0
+    for s, sid in resolved:
+        raw_imgs = by_id.get(sid.lower(), [])
+        images = [_format_image_row(r) for r in raw_imgs]
+        images.sort(key=lambda im: (im["sort_order"] if im["sort_order"] is not None else 0))
+        if images:
+            with_image += 1
+        results.append({
+            "sku":            s,
+            "stock_item_id":  sid,
+            "title":          titles.get(sid.lower()),
+            "has_image":      len(images) > 0,
+            "image_count":    len(images),
+            "has_main_image": any(im["is_main"] for im in images),
+            "images":         images,
+        })
+
+    return {
+        "item_count":         len(skus),
+        "resolved_count":     len(resolved),
+        "with_image_count":   with_image,
+        "without_image_count": len(resolved) - with_image,
+        "results":            results,
+        "unresolved":         unresolved,
+    }
+
+
 @mcp.tool()
 def list_to_shopify(
     skus: list[str],
