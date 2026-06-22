@@ -346,6 +346,7 @@ WRITE_THRESHOLDS: dict[str, int] = {
     "add_inventory_item_images":      100,  # additive-only, no overwrites
     "delete_inventory_item":          10,   # IRREVERSIBLE — lowest threshold of all
     "list_to_shopify":                25,   # creates live customer-facing channel listings
+    "refresh_channel_listing":        25,   # re-pushes live customer-facing channel listings
     "default":                        25,   # fallback for any unlisted operation
 }
 
@@ -8078,6 +8079,305 @@ def list_to_shopify(
             "Shopify. Verify the new listings in the Linnworks GLT / your Shopify "
             "admin — there is no clean API read-back for newly created listings. "
             "Any per-group error is surfaced in results[].error."
+        ),
+    }
+
+
+# GLT actions that re-push an EXISTING listing (used by refresh_channel_listing).
+# The full enum on TemplateToProcess also includes Create/Delete/NotAllowed,
+# which are not "refresh" actions.
+_GLT_PROCESS_ACTIONS = {
+    "Create", "Update", "Relist", "Delete", "Revise", "ChannelSpecific", "NotAllowed",
+}
+# Auto-mode: which of the template's NextSuggestedAction values count as a valid
+# "push my pending changes to the live listing" action.
+_GLT_REFRESH_ACTIONS = {"Update", "Revise", "Relist", "ChannelSpecific"}
+
+
+@mcp.tool()
+def refresh_channel_listing(
+    skus: list[str],
+    sub_source: str = "SWH Shopify",
+    action: str | None = None,
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Re-push / revise EXISTING Shopify listings so updated item data — extended
+    properties, title, price, description, etc. — propagates to the live channel.
+    Shopify only (v1).
+
+    This is the revise counterpart to `list_to_shopify`: that tool CREATES new
+    listings; this one REVISES listings that already exist. It never creates a
+    listing — if a SKU isn't already live on the target store it's reported in
+    `unresolved` (use `list_to_shopify` to create it).
+
+    Flow per SKU (read-before-write):
+      1. Resolve SKU → StockItemId + title.
+      2. Confirm the item has a SHOPIFY channel-SKU mapping on `sub_source` (the
+         channel-SKU link table — see get_channel_listings). Not listed →
+         unresolved.
+      3. GenericListings/OpenTemplatesByInventory → open the item's EXISTING GLT
+         template for that store (this OPENS the existing template, it does NOT
+         create a new one — so it can't duplicate the listing).
+      4. (live run) GenericListings/ProcessTemplates with the revise action →
+         pushes the current item data to the live Shopify listing.
+
+    Action selection (per template, data-driven):
+      - action=None (default, "auto"): use the template's own
+        `NextSuggestedAction` when GLT marks it allowed — this is the action the
+        GLT engine itself computed for pushing the pending change (typically
+        "Update" for Shopify) — otherwise fall back to "Revise".
+      - action="Revise"/"Update"/"Relist"/…: force that GLT action for every item.
+    Templates GLT marks as locked, or where neither the suggested action nor
+    Revise is allowed, are reported in `unresolved` rather than force-pushed.
+
+    ⚠️  A live run (dry_run=False) changes REAL customer-facing Shopify listings.
+    The read/selection path (channel check + OpenTemplatesByInventory) is
+    live-confirmed; the ProcessTemplates revise push is built to the OpenAPI spec
+    but NOT yet live-exercised in this tenant — start with a single SKU.
+
+    For batches larger than 25 SKUs this tool stages: it returns the plan and asks
+    you to confirm with confirmed_count=<N> before executing.
+
+    Args:
+        skus: Exact SKUs / ItemNumbers whose Shopify listings to refresh.
+        sub_source: Shopify store name (default "SWH Shopify"). Scopes both the
+            "is it listed?" check and which store's template is opened/revised.
+        action: Optional GLT action override (e.g. "Revise", "Update"). Default
+            None = auto (use the template's NextSuggestedAction, else "Revise").
+        confirmed_count: For batches > 25 SKUs, pass len(skus) after reviewing
+            the plan to confirm the write.
+        dry_run: If True (default), returns the plan without pushing anything.
+            Set to False to push the revisions to Shopify.
+
+    Returns:
+        A dict with:
+          - dry_run, item_count, target_sub_source, target_channel_id,
+            available_sub_sources
+          - plan: per-SKU rows that would be revised (sku, stock_item_id, title,
+            template_id, configurator_id, active_listing_id, status, action,
+            next_suggested_action, is_allowed_to_revise)
+          - unresolved: per-SKU error rows (not found / not listed on the store /
+            no template / locked / no allowed revise action)
+          - results: per-SKU push outcome (live run only)
+    """
+    if not skus:
+        raise ValueError("skus must contain at least one SKU.")
+
+    _check_injection("sub_source", sub_source or "")
+    _check_injection("action", action or "")
+
+    if action is not None and action not in _GLT_PROCESS_ACTIONS:
+        raise ValueError(
+            f"action '{action}' is not a valid GLT action. Valid: {sorted(_GLT_PROCESS_ACTIONS)}"
+        )
+
+    # ── Resolve target store ChannelId from the configurator catalogue ────────
+    catalogue = _fetch_shopify_configurators()
+    available_sub_sources = sorted({c["sub_source"] for c in catalogue if c.get("sub_source")})
+    ss_to_channel: dict[str, int] = {}
+    for c in catalogue:
+        ss, cid = c.get("sub_source"), c.get("channel_id")
+        if ss and cid is not None:
+            ss_to_channel.setdefault(_norm_conf_name(ss), cid)
+    target_channel_id = ss_to_channel.get(_norm_conf_name(sub_source))
+    if target_channel_id is None:
+        return {
+            "error": (
+                f"sub_source '{sub_source}' is not a Shopify store in this tenant. "
+                f"Available: {available_sub_sources}"
+            ),
+            "available_sub_sources": available_sub_sources,
+        }
+
+    # ── Resolve each SKU + confirm it's listed on the target store ────────────
+    resolved: list[dict] = []
+    unresolved: list[dict] = []
+    for raw in skus:
+        sku = (raw or "").strip()
+        if not sku:
+            unresolved.append({"sku": raw, "error": "empty SKU"})
+            continue
+        try:
+            item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+        except RuntimeError as exc:
+            unresolved.append({"sku": sku, "error": f"not found: {exc}"})
+            continue
+        sid = item.get("StockItemId")
+        if not sid:
+            unresolved.append({"sku": sku, "error": "found but returned no StockItemId"})
+            continue
+        title = item.get("ItemTitle")
+        try:
+            rows = call_linnworks_get(
+                "Inventory/GetInventoryItemChannelSKUs", {"inventoryItemId": sid}
+            )
+        except RuntimeError as exc:
+            unresolved.append({
+                "sku": sku, "stock_item_id": sid, "title": title,
+                "error": f"could not read channel listings: {exc}",
+            })
+            continue
+        on_store = [
+            r for r in (rows if isinstance(rows, list) else [])
+            if _norm_conf_name(r.get("Source")) == _norm_conf_name(GLT_SHOPIFY_CHANNEL_NAME)
+            and _norm_conf_name(r.get("SubSource")) == _norm_conf_name(sub_source)
+        ]
+        if not on_store:
+            unresolved.append({
+                "sku": sku, "stock_item_id": sid, "title": title,
+                "error": (
+                    f"not listed on Shopify store '{sub_source}' — "
+                    "use list_to_shopify to create it first"
+                ),
+            })
+            continue
+        resolved.append({"sku": sku, "stock_item_id": sid, "title": title})
+
+    # ── Open the existing GLT templates for the resolved items (read) ──────────
+    templates_by_sid: dict[str, dict] = {}
+    ids = [r["stock_item_id"] for r in resolved]
+    for i in range(0, len(ids), 200):
+        chunk = ids[i:i + 200]
+        resp = call_linnworks(
+            "GenericListings/OpenTemplatesByInventory",
+            {"request": {
+                "ChannelType": GLT_SHOPIFY_CHANNEL_TYPE,
+                "ChannelName": GLT_SHOPIFY_CHANNEL_NAME,
+                "Parameters": {
+                    "SelectedRegions":  [],
+                    "Token":            _ZERO_GUID,
+                    "InventoryItemIds": chunk,
+                    "ChannelId":        target_channel_id,
+                },
+                "PaginationParameters": {"PageNumber": 1, "EntriesPerPage": max(len(chunk), 1)},
+            }},
+        )
+        for t in (resp.get("TemplatesInfo") if isinstance(resp, dict) else None) or []:
+            tsid = t.get("StockItemId")
+            if tsid:
+                templates_by_sid[tsid.lower()] = t
+
+    # ── Build the plan, deciding the push action per template ─────────────────
+    plan: list[dict] = []
+    for r in resolved:
+        t = templates_by_sid.get(r["stock_item_id"].lower())
+        if not t:
+            unresolved.append({
+                **r,
+                "error": "listed on the channel but no GLT template could be opened for it",
+            })
+            continue
+        if t.get("IsLocked"):
+            unresolved.append({
+                **r, "template_id": t.get("Id"),
+                "error": "GLT template is locked — cannot revise right now",
+            })
+            continue
+
+        next_action  = t.get("NextSuggestedAction")
+        next_allowed = bool(t.get("IsNextSuggestedActionAllowed"))
+        can_revise   = bool(t.get("IsAllowedToRevise"))
+
+        if action is not None:
+            chosen_action = action
+        elif next_allowed and next_action in _GLT_REFRESH_ACTIONS:
+            chosen_action = next_action
+        elif can_revise:
+            chosen_action = "Revise"
+        else:
+            unresolved.append({
+                **r, "template_id": t.get("Id"), "next_suggested_action": next_action,
+                "error": "GLT does not allow a revise/update on this template (no allowed push action)",
+            })
+            continue
+
+        info = t.get("Info") if isinstance(t.get("Info"), dict) else {}
+        plan.append({
+            "sku":                   r["sku"],
+            "stock_item_id":         r["stock_item_id"],
+            "title":                 r["title"],
+            "template_id":           t.get("Id"),
+            "configurator_id":       t.get("ConfiguratorId"),
+            "active_listing_id":     _glt_field(info, "ActiveListingId"),
+            "status":                _glt_field(info, "Status"),
+            "action":                chosen_action,
+            "next_suggested_action": next_action,
+            "is_allowed_to_revise":  can_revise,
+        })
+
+    base_out = {
+        "item_count":            len(skus),
+        "target_sub_source":     sub_source,
+        "target_channel_id":     target_channel_id,
+        "available_sub_sources": available_sub_sources,
+        "plan":                  plan,
+        "unresolved":            unresolved,
+    }
+
+    # ── Write guard (threshold 25) ────────────────────────────────────────────
+    guard = _write_guard("refresh_channel_listing", skus, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, **base_out}
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            **base_out,
+            "message": (
+                f"Dry run — nothing pushed. {len(plan)} listing(s) on '{sub_source}' would be "
+                f"revised; {len(unresolved)} SKU(s) could not be revised (see unresolved). "
+                "Review the plan, then set dry_run=False to push the revisions. A live run "
+                "changes real customer-facing Shopify listings."
+            ),
+        }
+
+    if not plan:
+        return {
+            "dry_run": False,
+            **base_out,
+            "results": [],
+            "message": "Nothing to revise — no SKU resolved to an existing, revisable Shopify template.",
+        }
+
+    # ── Live execution: ProcessTemplates per template (Revise/Update push) ─────
+    results: list[dict] = []
+    pushed = 0
+    for row in plan:
+        res = {
+            "sku":         row["sku"],
+            "template_id": row["template_id"],
+            "action":      row["action"],
+            "processed":   False,
+        }
+        try:
+            call_linnworks(
+                "GenericListings/ProcessTemplates",
+                {"request": {
+                    "ChannelType": GLT_SHOPIFY_CHANNEL_TYPE,
+                    "ChannelName": GLT_SHOPIFY_CHANNEL_NAME,
+                    "TemplateRequests": [
+                        {"TemplateId": row["template_id"], "Action": row["action"]}
+                    ],
+                    "ClientContext": {"Activity": "refresh_channel_listing", "Source": "linnworks-mcp"},
+                }},
+            )
+            res["processed"] = True
+            pushed += 1
+        except RuntimeError as exc:
+            res["error"] = f"ProcessTemplates ({row['action']}) failed: {exc}"
+        results.append(res)
+
+    return {
+        "dry_run": False,
+        **base_out,
+        "results": results,
+        "message": (
+            f"{pushed}/{len(plan)} Shopify listing(s) on '{sub_source}' revised and pushed. "
+            "ProcessTemplates returns no body, so success is inferred from a 2xx — verify the "
+            "updated values in your Shopify admin / the Linnworks GLT. Per-item errors are in "
+            "results[].error."
         ),
     }
 
