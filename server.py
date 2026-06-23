@@ -343,6 +343,7 @@ WRITE_THRESHOLDS: dict[str, int] = {
     "create_or_update_inventory_item": 50,  # channel sync is async, less instant
     "set_extended_properties":        50,   # metadata, lower blast radius
     "set_inventory_item_descriptions": 50,  # content, lower blast radius
+    "set_inventory_item_titles":      50,   # channel title overrides, lower blast radius
     "add_inventory_item_images":      100,  # additive-only, no overwrites
     "delete_inventory_item":          10,   # IRREVERSIBLE — lowest threshold of all
     "list_to_shopify":                25,   # creates live customer-facing channel listings
@@ -6770,6 +6771,302 @@ def set_inventory_item_descriptions(
     return {
         "dry_run":    False,
         "item_count": len(descriptions),
+        "created":    created,
+        "updated":    updated,
+        "errors":     errors,
+        "results":    results,
+        "manifest":   manifest,
+    }
+
+
+@mcp.tool()
+def get_inventory_item_descriptions(sku: str) -> dict:
+    """
+    Read the channel-specific descriptions for ONE inventory item.
+
+    Descriptions in Linnworks are keyed by (StockItemId, Source, SubSource), so an
+    item can carry a different description per channel plus a default (Source and
+    SubSource both blank). This is the read-side companion to
+    `set_inventory_item_descriptions` (which previously had no getter).
+
+    Args:
+        sku: The exact SKU / ItemNumber to look up.
+
+    Returns:
+        A dict with:
+          - sku, stock_item_id, title
+          - description_count: number of description rows
+          - default_description: the text of the default row (blank Source +
+            SubSource), or None if no default row exists
+          - descriptions: per-row entries (source, sub_source, description,
+            pk_row_id)
+    """
+    try:
+        item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+    except RuntimeError:
+        return {"error": f"No inventory item found for SKU '{sku}'", "sku": sku}
+
+    stock_item_id = item.get("StockItemId")
+    if not stock_item_id:
+        return {"error": f"Item found for SKU '{sku}' but StockItemId was missing", "sku": sku}
+
+    rows = call_linnworks_get(
+        "Inventory/GetInventoryItemDescriptions",
+        params={"inventoryItemId": stock_item_id},
+    )
+    descriptions = [
+        {
+            "source":      r.get("Source", ""),
+            "sub_source":  r.get("SubSource", ""),
+            "description": r.get("Description"),
+            "pk_row_id":   r.get("pkRowId"),
+        }
+        for r in (rows if isinstance(rows, list) else [])
+    ]
+    default = next(
+        (d["description"] for d in descriptions if not d["source"] and not d["sub_source"]),
+        None,
+    )
+    return {
+        "sku":                 sku,
+        "stock_item_id":       stock_item_id,
+        "title":               item.get("ItemTitle"),
+        "description_count":   len(descriptions),
+        "default_description": default,
+        "descriptions":        descriptions,
+    }
+
+
+@mcp.tool()
+def get_inventory_item_titles(sku: str) -> dict:
+    """
+    Read the channel-specific titles for ONE inventory item.
+
+    Linnworks stores per-channel listing titles that can diverge from the base
+    `ItemTitle`. They are keyed by (StockItemId, Source, SubSource), so an item
+    can have a different title on each channel/store plus a default (Source and
+    SubSource both blank). The base `ItemTitle` (set via
+    `create_or_update_inventory_item`) is separate and returned here as
+    `base_title` for comparison. This is the read-side companion to
+    `set_inventory_item_titles`.
+
+    Args:
+        sku: The exact SKU / ItemNumber to look up.
+
+    Returns:
+        A dict with:
+          - sku, stock_item_id, base_title
+          - title_count: number of channel-title rows
+          - default_title: the text of the default row (blank Source +
+            SubSource), or None if no default row exists
+          - titles: per-row entries (source, sub_source, title, pk_row_id)
+    """
+    try:
+        item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+    except RuntimeError:
+        return {"error": f"No inventory item found for SKU '{sku}'", "sku": sku}
+
+    stock_item_id = item.get("StockItemId")
+    if not stock_item_id:
+        return {"error": f"Item found for SKU '{sku}' but StockItemId was missing", "sku": sku}
+
+    rows = call_linnworks_get(
+        "Inventory/GetInventoryItemTitles",
+        params={"inventoryItemId": stock_item_id},
+    )
+    titles = [
+        {
+            "source":     r.get("Source", ""),
+            "sub_source": r.get("SubSource", ""),
+            "title":      r.get("Title"),
+            "pk_row_id":  r.get("pkRowId"),
+        }
+        for r in (rows if isinstance(rows, list) else [])
+    ]
+    default = next(
+        (t["title"] for t in titles if not t["source"] and not t["sub_source"]),
+        None,
+    )
+    return {
+        "sku":           sku,
+        "stock_item_id": stock_item_id,
+        "base_title":    item.get("ItemTitle"),
+        "title_count":   len(titles),
+        "default_title": default,
+        "titles":        titles,
+    }
+
+
+@mcp.tool()
+def set_inventory_item_titles(
+    titles: list[dict],
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Create or update channel-specific titles on Linnworks inventory items.
+
+    Linnworks stores per-channel listing titles that can diverge from the base
+    `ItemTitle`. They are keyed by (StockItemId, Source, SubSource), so you can
+    set a different title per channel. Pass source="" and sub_source="" to set the
+    default channel-title row.
+
+    Note: this writes the channel-title overrides only — it does NOT change the
+    base `ItemTitle` (use `create_or_update_inventory_item` for that). When
+    correcting product data, update both so listings don't go stale. Read current
+    values first with `get_inventory_item_titles`.
+
+    For batches larger than 50 items this tool requires confirmed_count=<N>.
+
+    Args:
+        titles: List of dicts, each with:
+            - sku (str):        Item SKU  [required]
+            - title (str):      The title text  [required]
+            - source (str):     Channel source (e.g. "AMAZON"). Defaults to "".
+            - sub_source (str): Channel sub-source. Defaults to "".
+        confirmed_count: For batches > 50, pass len(titles) here.
+        dry_run: If True (default), returns a manifest without writing.
+            Set to False to execute.
+
+    Returns:
+        A dict with:
+          - dry_run:     whether this was a dry run
+          - item_count:  number of title rows in the batch
+          - manifest:    per-item preview (always present)
+          - results:     per-item outcome (live run only)
+          - created:     new rows created (live run only)
+          - updated:     existing rows updated (live run only)
+          - errors:      rows that failed (live run only)
+    """
+    # ── Injection check ───────────────────────────────────────────────────────
+    for t in titles:
+        _check_injection("title", t.get("title", ""))
+
+    # ── Validate ──────────────────────────────────────────────────────────────
+    for i, t in enumerate(titles):
+        if not t.get("sku"):
+            raise ValueError(f"titles[{i}] is missing 'sku'.")
+        if t.get("title") is None:
+            raise ValueError(f"titles[{i}] (SKU '{t.get('sku')}') is missing 'title'.")
+
+    sku_cache: dict[str, str] = {}
+    existing_titles: dict[str, list] = {}
+
+    # ── Read existing + build manifest ────────────────────────────────────────
+    manifest = []
+    for t in titles:
+        sku        = t["sku"].strip()
+        source     = t.get("source", "")
+        sub_source = t.get("sub_source", "")
+        new_title  = t["title"]
+
+        try:
+            stock_item_id = _resolve_sku_to_id(sku, sku_cache)
+        except ValueError as exc:
+            manifest.append({
+                "sku": sku, "source": source, "sub_source": sub_source,
+                "title": new_title, "error": str(exc),
+            })
+            continue
+
+        if stock_item_id not in existing_titles:
+            rows = call_linnworks_get(
+                "Inventory/GetInventoryItemTitles",
+                params={"inventoryItemId": stock_item_id},
+            )
+            existing_titles[stock_item_id] = rows if isinstance(rows, list) else []
+
+        match = next(
+            (r for r in existing_titles[stock_item_id]
+             if r.get("Source", "") == source and r.get("SubSource", "") == sub_source),
+            None,
+        )
+        manifest.append({
+            "sku":           sku,
+            "stock_item_id": stock_item_id,
+            "source":        source,
+            "sub_source":    sub_source,
+            "old_title":     match.get("Title") if match else None,
+            "new_title":     new_title,
+            "action":        "update" if match else "create",
+            "pk_row_id":     match.get("pkRowId") if match else None,
+        })
+
+    # ── Write guard ───────────────────────────────────────────────────────────
+    guard = _write_guard("set_inventory_item_titles", titles, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, "manifest": manifest}
+
+    if dry_run:
+        return {
+            "dry_run":    True,
+            "item_count": len(titles),
+            "manifest":   manifest,
+            "message":    "Dry run — no titles changed. Set dry_run=False to execute.",
+        }
+
+    # ── Live execution ─────────────────────────────────────────────────────────
+    to_create  = [m for m in manifest if m.get("action") == "create" and not m.get("error")]
+    to_update  = [m for m in manifest if m.get("action") == "update" and not m.get("error")]
+    error_rows = [m for m in manifest if m.get("error")]
+
+    results = []
+    created = 0
+    updated = 0
+    errors  = len(error_rows)
+
+    if to_create:
+        create_payload = [
+            {
+                "pkRowId":     str(uuid.uuid4()),  # Linnworks needs a client-supplied GUID
+                "StockItemId": m["stock_item_id"],
+                "Source":      m["source"],
+                "SubSource":   m["sub_source"],
+                "Title":       m["new_title"],
+            }
+            for m in to_create
+        ]
+        call_linnworks(
+            "Inventory/CreateInventoryItemTitles",
+            {"inventoryItemTitles": create_payload},
+        )
+        for m in to_create:
+            created += 1
+            results.append({
+                "sku": m["sku"], "action": "created",
+                "source": m["source"], "sub_source": m["sub_source"],
+            })
+
+    if to_update:
+        update_payload = [
+            {
+                "StockItemId": m["stock_item_id"],
+                "pkRowId":     m["pk_row_id"],
+                "Source":      m["source"],
+                "SubSource":   m["sub_source"],
+                "Title":       m["new_title"],
+            }
+            for m in to_update
+        ]
+        call_linnworks(
+            "Inventory/UpdateInventoryItemTitles",
+            {"inventoryItemTitles": update_payload},
+        )
+        for m in to_update:
+            updated += 1
+            results.append({
+                "sku": m["sku"], "action": "updated",
+                "source": m["source"], "sub_source": m["sub_source"],
+                "old_title": m["old_title"],
+                "new_title": m["new_title"],
+            })
+
+    for m in error_rows:
+        results.append({"sku": m["sku"], "action": "error", "error": m["error"]})
+
+    return {
+        "dry_run":    False,
+        "item_count": len(titles),
         "created":    created,
         "updated":    updated,
         "errors":     errors,
