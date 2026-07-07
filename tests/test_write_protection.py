@@ -224,6 +224,44 @@ class TestWriteThresholds:
         for op, val in server.WRITE_THRESHOLDS.items():
             assert isinstance(val, int) and val > 0, f"{op}: threshold must be a positive int"
 
+    def test_unpublish_channel_listing_is_destructive_tier(self):
+        """Taking down a live listing is destructive — it must sit in the tightest
+        tier alongside the other irreversible operation, delete_inventory_item."""
+        unpublish = server.WRITE_THRESHOLDS["unpublish_channel_listing"]
+        delete_item = server.WRITE_THRESHOLDS["delete_inventory_item"]
+        list_shopify = server.WRITE_THRESHOLDS["list_to_shopify"]
+        assert unpublish == delete_item, "unpublish threshold should match delete_inventory_item"
+        assert unpublish < list_shopify, "taking a listing down must stage sooner than creating one"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# unpublish_channel_listing — write-guard staging (issue #22)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestUnpublishChannelListingGuard:
+    """The take-down tool must stage above its (tight) threshold of 10, using the
+    same _write_guard contract as every other bulk write tool."""
+
+    OP = "unpublish_channel_listing"
+    THRESH = server.WRITE_THRESHOLDS["unpublish_channel_listing"]  # 10
+
+    def test_at_threshold_passes_without_confirmation(self):
+        assert server._write_guard(self.OP, _items(self.THRESH), None, dry_run=False) is None
+
+    def test_above_threshold_stages(self):
+        guard = server._write_guard(self.OP, _items(self.THRESH + 1), None, dry_run=False)
+        assert guard is not None and guard.get("staged") is True
+
+    def test_above_threshold_wrong_count_blocked(self):
+        n = self.THRESH + 5
+        guard = server._write_guard(self.OP, _items(n), n - 1, dry_run=False)
+        assert guard is not None
+        assert guard.get("success") is False and guard.get("staged") is False
+
+    def test_above_threshold_correct_count_executes(self):
+        n = self.THRESH + 5
+        assert server._write_guard(self.OP, _items(n), n, dry_run=False) is None
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # _check_injection — clean inputs pass through

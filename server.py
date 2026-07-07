@@ -348,6 +348,7 @@ WRITE_THRESHOLDS: dict[str, int] = {
     "delete_inventory_item":          10,   # IRREVERSIBLE — lowest threshold of all
     "list_to_shopify":                25,   # creates live customer-facing channel listings
     "refresh_channel_listing":        25,   # re-pushes live customer-facing channel listings
+    "unpublish_channel_listing":      10,   # TAKES DOWN live customer-facing listings — destructive
     "default":                        25,   # fallback for any unlisted operation
 }
 
@@ -8675,6 +8676,315 @@ def refresh_channel_listing(
             "ProcessTemplates returns no body, so success is inferred from a 2xx — verify the "
             "updated values in your Shopify admin / the Linnworks GLT. Per-item errors are in "
             "results[].error."
+        ),
+    }
+
+
+# ---------- Unpublish / take down a channel listing (write) ----------
+#
+# The destructive counterpart to list_to_shopify (creates) and
+# refresh_channel_listing (revises). Where those keep a listing alive, this ENDS
+# it — the GLT "Delete" action against the item's existing template retires the
+# live Shopify listing so it stops selling. Built for the duplicate-item cleanup
+# in issue #22: after a SKU-scheme migration leaves an orphaned Linnworks item
+# still live-listed on Shopify at a stale quantity, this takes that listing down
+# in bulk instead of doing it by hand in the Shopify admin, SKU by SKU.
+#
+# Same read-before-write selection path as refresh_channel_listing (resolve →
+# confirm the SHOPIFY+sub_source channel-SKU mapping → OpenTemplatesByInventory
+# opens the EXISTING template — never creates one), but it forces Action="Delete"
+# and reads the channel-SKU table back afterwards to confirm the listing is gone.
+
+
+@mcp.tool()
+def unpublish_channel_listing(
+    skus: list[str],
+    sub_source: str = "SWH Shopify",
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Take an EXISTING Shopify listing DOWN — unpublish/retire the storefront
+    listing so it stops selling. Shopify only (v1).
+
+    This is the destructive counterpart to `list_to_shopify` (which CREATES
+    listings) and `refresh_channel_listing` (which REVISES them). It ends the
+    live listing via the GLT "Delete" action against the item's existing
+    template. Use it to retire an orphaned/duplicate listing — e.g. after a
+    SKU-scheme migration leaves a stale Linnworks item still live on Shopify at a
+    frozen quantity, silently able to oversell.
+
+    ⚠️  DESTRUCTIVE and customer-facing. A live run removes a REAL Shopify
+    listing (with its reviews, ranking and URL). Point it only at the orphan you
+    mean to retire — NOT the good listing you want to keep. Re-listing later is
+    possible via `list_to_shopify`, but the original listing's channel history
+    (reviews / SEO) is not recoverable.
+
+    Flow per SKU (read-before-write):
+      1. Resolve SKU → StockItemId + title.
+      2. Confirm the item has a SHOPIFY channel-SKU mapping on `sub_source`
+         (the channel-SKU link table — see get_channel_listings), and capture
+         its current channel_reference_id + listed_quantity for the manifest.
+         Not listed on that store → unresolved.
+      3. GenericListings/OpenTemplatesByInventory → open the item's EXISTING GLT
+         template for that store (OPENS the existing template — it does NOT
+         create one). Locked templates → unresolved.
+      4. (live run) GenericListings/ProcessTemplates with Action="Delete" →
+         ends the live Shopify listing.
+      5. (live run) Re-read the channel-SKU table to confirm the SHOPIFY row on
+         `sub_source` is gone / no longer listed (`taken_down` per SKU).
+
+    Live safety: the read/selection path (channel check + OpenTemplatesByInventory)
+    is live-confirmed; the ProcessTemplates Delete push is built to the OpenAPI
+    spec but NOT yet live-exercised in this tenant — it retires a real
+    customer-facing listing, so start with a single SKU on a throwaway/orphan
+    item you are certain about.
+
+    Staging: the threshold is 10 (the tightest tier, shared with
+    delete_inventory_item). For batches > 10 SKUs this returns the plan + manifest
+    and asks you to confirm with confirmed_count=<N> before executing.
+
+    Args:
+        skus: Exact SKUs / ItemNumbers whose Shopify listings to take down.
+        sub_source: Shopify store name (default "SWH Shopify"). Scopes both the
+            "is it listed?" check and which store's listing is deleted.
+        confirmed_count: For batches > 10 SKUs, pass len(skus) after reviewing the
+            plan to confirm the write.
+        dry_run: If True (default), returns the plan without taking anything down.
+            Set to False to delete the listings on Shopify.
+
+    Returns:
+        A dict with:
+          - dry_run, item_count, target_sub_source, target_channel_id,
+            available_sub_sources
+          - plan: per-SKU rows that would be taken down (sku, stock_item_id,
+            title, template_id, configurator_id, active_listing_id, status,
+            channel_reference_id, listed_quantity, action)
+          - unresolved: per-SKU error rows (not found / not listed on the store /
+            no template / locked)
+          - results: per-SKU outcome (live run only — processed, taken_down,
+            still_listed, error)
+    """
+    if not skus:
+        raise ValueError("skus must contain at least one SKU.")
+
+    _check_injection("sub_source", sub_source or "")
+
+    # ── Resolve target store ChannelId from the configurator catalogue ────────
+    catalogue = _fetch_shopify_configurators()
+    available_sub_sources = sorted({c["sub_source"] for c in catalogue if c.get("sub_source")})
+    ss_to_channel: dict[str, int] = {}
+    for c in catalogue:
+        ss, cid = c.get("sub_source"), c.get("channel_id")
+        if ss and cid is not None:
+            ss_to_channel.setdefault(_norm_conf_name(ss), cid)
+    target_channel_id = ss_to_channel.get(_norm_conf_name(sub_source))
+    if target_channel_id is None:
+        return {
+            "error": (
+                f"sub_source '{sub_source}' is not a Shopify store in this tenant. "
+                f"Available: {available_sub_sources}"
+            ),
+            "available_sub_sources": available_sub_sources,
+        }
+
+    # ── Resolve each SKU + confirm it's listed on the target store ────────────
+    resolved: list[dict] = []
+    unresolved: list[dict] = []
+    for raw in skus:
+        sku = (raw or "").strip()
+        if not sku:
+            unresolved.append({"sku": raw, "error": "empty SKU"})
+            continue
+        try:
+            item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+        except RuntimeError as exc:
+            unresolved.append({"sku": sku, "error": f"not found: {exc}"})
+            continue
+        sid = item.get("StockItemId")
+        if not sid:
+            unresolved.append({"sku": sku, "error": "found but returned no StockItemId"})
+            continue
+        title = item.get("ItemTitle")
+        try:
+            rows = call_linnworks_get(
+                "Inventory/GetInventoryItemChannelSKUs", {"inventoryItemId": sid}
+            )
+        except RuntimeError as exc:
+            unresolved.append({
+                "sku": sku, "stock_item_id": sid, "title": title,
+                "error": f"could not read channel listings: {exc}",
+            })
+            continue
+        on_store = [
+            r for r in (rows if isinstance(rows, list) else [])
+            if _norm_conf_name(r.get("Source")) == _norm_conf_name(GLT_SHOPIFY_CHANNEL_NAME)
+            and _norm_conf_name(r.get("SubSource")) == _norm_conf_name(sub_source)
+        ]
+        if not on_store:
+            unresolved.append({
+                "sku": sku, "stock_item_id": sid, "title": title,
+                "error": f"not listed on Shopify store '{sub_source}' — nothing to take down",
+            })
+            continue
+        # Capture the current listing identity for the manifest / confirmation.
+        row0 = on_store[0]
+        resolved.append({
+            "sku": sku, "stock_item_id": sid, "title": title,
+            "channel_reference_id": row0.get("ChannelReferenceId"),
+            "listed_quantity":      row0.get("ListedQuantity"),
+        })
+
+    # ── Open the existing GLT templates for the resolved items (read) ──────────
+    templates_by_sid: dict[str, dict] = {}
+    ids = [r["stock_item_id"] for r in resolved]
+    for i in range(0, len(ids), 200):
+        chunk = ids[i:i + 200]
+        resp = call_linnworks(
+            "GenericListings/OpenTemplatesByInventory",
+            {"request": {
+                "ChannelType": GLT_SHOPIFY_CHANNEL_TYPE,
+                "ChannelName": GLT_SHOPIFY_CHANNEL_NAME,
+                "Parameters": {
+                    "SelectedRegions":  [],
+                    "Token":            _ZERO_GUID,
+                    "InventoryItemIds": chunk,
+                    "ChannelId":        target_channel_id,
+                },
+                "PaginationParameters": {"PageNumber": 1, "EntriesPerPage": max(len(chunk), 1)},
+            }},
+        )
+        for t in (resp.get("TemplatesInfo") if isinstance(resp, dict) else None) or []:
+            tsid = t.get("StockItemId")
+            if tsid:
+                templates_by_sid[tsid.lower()] = t
+
+    # ── Build the take-down plan ───────────────────────────────────────────────
+    plan: list[dict] = []
+    for r in resolved:
+        t = templates_by_sid.get(r["stock_item_id"].lower())
+        if not t:
+            unresolved.append({
+                **r,
+                "error": "listed on the channel but no GLT template could be opened for it",
+            })
+            continue
+        if t.get("IsLocked"):
+            unresolved.append({
+                **r, "template_id": t.get("Id"),
+                "error": "GLT template is locked — cannot take it down right now",
+            })
+            continue
+
+        info = t.get("Info") if isinstance(t.get("Info"), dict) else {}
+        plan.append({
+            "sku":                  r["sku"],
+            "stock_item_id":        r["stock_item_id"],
+            "title":                r["title"],
+            "template_id":          t.get("Id"),
+            "configurator_id":      t.get("ConfiguratorId"),
+            "active_listing_id":    _glt_field(info, "ActiveListingId"),
+            "status":               _glt_field(info, "Status"),
+            "channel_reference_id": r["channel_reference_id"],
+            "listed_quantity":      r["listed_quantity"],
+            "action":               "Delete",
+        })
+
+    base_out = {
+        "item_count":            len(skus),
+        "target_sub_source":     sub_source,
+        "target_channel_id":     target_channel_id,
+        "available_sub_sources": available_sub_sources,
+        "plan":                  plan,
+        "unresolved":            unresolved,
+    }
+
+    # ── Write guard (threshold 10) ─────────────────────────────────────────────
+    guard = _write_guard("unpublish_channel_listing", skus, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, **base_out}
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            **base_out,
+            "message": (
+                f"Dry run — nothing taken down. {len(plan)} listing(s) on '{sub_source}' would be "
+                f"DELETED (unpublished from Shopify); {len(unresolved)} SKU(s) could not be taken "
+                "down (see unresolved). Review the plan — confirm each channel_reference_id / "
+                "listed_quantity is the orphan you mean to retire, NOT a listing you want to keep — "
+                "then set dry_run=False. A live run removes real customer-facing Shopify listings."
+            ),
+        }
+
+    if not plan:
+        return {
+            "dry_run": False,
+            **base_out,
+            "results": [],
+            "message": "Nothing to take down — no SKU resolved to an existing Shopify template.",
+        }
+
+    # ── Live execution: ProcessTemplates Delete, then read-back per item ───────
+    results: list[dict] = []
+    taken = 0
+    for row in plan:
+        res = {
+            "sku":         row["sku"],
+            "template_id": row["template_id"],
+            "action":      "Delete",
+            "processed":   False,
+            "taken_down":  None,
+        }
+        try:
+            call_linnworks(
+                "GenericListings/ProcessTemplates",
+                {"request": {
+                    "ChannelType": GLT_SHOPIFY_CHANNEL_TYPE,
+                    "ChannelName": GLT_SHOPIFY_CHANNEL_NAME,
+                    "TemplateRequests": [
+                        {"TemplateId": row["template_id"], "Action": "Delete"}
+                    ],
+                    "ClientContext": {"Activity": "unpublish_channel_listing", "Source": "linnworks-mcp"},
+                }},
+            )
+            res["processed"] = True
+        except RuntimeError as exc:
+            res["error"] = f"ProcessTemplates (Delete) failed: {exc}"
+            results.append(res)
+            continue
+
+        # Read-back: is the SHOPIFY row on this store gone / no longer listed?
+        try:
+            rows = call_linnworks_get(
+                "Inventory/GetInventoryItemChannelSKUs",
+                {"inventoryItemId": row["stock_item_id"]},
+            )
+            still = [
+                r for r in (rows if isinstance(rows, list) else [])
+                if _norm_conf_name(r.get("Source")) == _norm_conf_name(GLT_SHOPIFY_CHANNEL_NAME)
+                and _norm_conf_name(r.get("SubSource")) == _norm_conf_name(sub_source)
+            ]
+            res["still_listed"] = len(still) > 0
+            res["taken_down"] = len(still) == 0
+            if still:
+                taken += 0  # left up; sync may lag — surface but don't count as done
+            else:
+                taken += 1
+        except RuntimeError as exc:
+            res["readback_error"] = f"could not confirm take-down: {exc}"
+        results.append(res)
+
+    return {
+        "dry_run": False,
+        **base_out,
+        "results": results,
+        "message": (
+            f"{taken}/{len(plan)} Shopify listing(s) on '{sub_source}' confirmed taken down. "
+            "ProcessTemplates returns no body, so success is inferred from a 2xx plus a channel-SKU "
+            "read-back; the channel may lag, so a row that is still_listed=true may simply not have "
+            "synced yet — re-check with get_channel_listings, and verify in your Shopify admin. "
+            "Per-item errors are in results[].error."
         ),
     }
 
