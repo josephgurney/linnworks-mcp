@@ -1,6 +1,6 @@
 [project]
 name = "linnworks-mcp"
-version = "1.24.0"
+version = "1.24.1"
 description = "A local MCP server that connects Claude Desktop to your Linnworks account"
 readme = "README.md"
 requires-python = ">=3.10"

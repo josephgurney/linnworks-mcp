@@ -7564,17 +7564,45 @@ def delete_inventory_item(
 #                                        empty 2xx body)
 #   Inventory/DeleteCategoryById  POST {"categoryId": "guid"} -> {} on success
 #                                       (empty 2xx; a non-empty category's items are
-#                                        reassigned to Default)
+#                                        reassigned to Default). Returns HTTP 400
+#                                       "Category is in use" if the category still has
+#                                       ARCHIVED items or channel references — see below.
 #
-# "Empty" = no inventory item references the category. There is NO per-category
-# count endpoint (GetInventoryItemsCount returns only a global total), so
-# emptiness is derived by sweeping the whole catalogue via Stock/GetStockItems
-# (keyWord="") and tallying CategoryId. That sweep is ~161 pages for ~32k items
-# (~2 min); it throttles under the 150/min rate limit and backs off on HTTP 429.
-# The scan always runs to completion — a partial scan could misreport a used
-# category as empty and cause a wrongful delete.
+# "Empty" here means "no ACTIVE inventory item references the category". There is
+# NO per-category count endpoint (GetInventoryItemsCount returns only a global
+# total, no category filter), so emptiness is derived by sweeping the whole
+# catalogue via Stock/GetStockItems (keyWord="") and tallying CategoryId. That
+# sweep is ~161 pages for ~32k items (~2 min); it throttles under the 150/min
+# rate limit and backs off on HTTP 429. The scan always runs to completion — a
+# partial scan could misreport a used category as empty and cause a wrongful
+# delete.
+#
+# ⚠️  ARCHIVED-ITEM BLIND SPOT (confirmed live 7 Jul 2026): the sweep endpoint
+# Stock/GetStockItems only returns ACTIVE stock — archived items are invisible to
+# it (and there is NO endpoint that lists/counts archived items per category:
+# GetStockItemsFull is also active-only, GetInventoryItemsCount has no category
+# filter, and no GetArchivedItems endpoint exists). On this tenant 32,125 items
+# are active but 92,816 exist including archived (~60k archived). So a category
+# holding ONLY archived items reads as "0 items"/empty here, yet Linnworks refuses
+# to delete it with HTTP 400 "Category is in use". That server-side guard is the
+# AUTHORITATIVE emptiness check — it sees archived items and channel references the
+# sweep cannot. The delete tools therefore treat a "Category is in use" 400 as an
+# expected `skipped_in_use` outcome (NOT a failure), and the active-item sweep is
+# only a cheap first-pass filter, not the final word. Use _is_category_in_use().
 
 _DEFAULT_CATEGORY_ID = "00000000-0000-0000-0000-000000000000"
+
+
+def _is_category_in_use(err: str) -> bool:
+    """
+    True if a DeleteCategoryById error is Linnworks' "Category is in use" 400.
+
+    This is the authoritative "not actually empty" signal: it fires when a
+    category still holds ARCHIVED items (invisible to the active-item sweep) or is
+    referenced by a channel/listing configuration. Treated as an expected skip,
+    not a delete failure. See the archived-item blind-spot note above.
+    """
+    return "category is in use" in (err or "").lower()
 
 
 def _fetch_categories() -> list[dict]:
@@ -7604,10 +7632,16 @@ def _count_items_per_category() -> dict:
     Returns {"counts": {category_id_lower: n}, "total_items": int, "pages": int}.
 
     Linnworks has no per-category count endpoint, so this paginates
-    Stock/GetStockItems (keyWord="") across the whole catalogue. It is the
-    authoritative source for "is this category empty?" — so it always runs to
-    completion (no page cap). Throttled to stay under the 150/min rate limit,
+    Stock/GetStockItems (keyWord="") across the whole catalogue and always runs
+    to completion (no page cap). Throttled to stay under the 150/min rate limit,
     with a bounded 429 backoff. Expect ~2 minutes for a large catalogue.
+
+    ⚠️  ACTIVE ITEMS ONLY. Stock/GetStockItems does not return ARCHIVED items
+    (and no endpoint counts archived items per category — see the note above
+    _is_category_in_use). So a count of 0 here means "no ACTIVE items", NOT
+    "truly empty" — a category of only archived items reads as 0 and Linnworks
+    will still refuse to delete it ("Category is in use"). This is a cheap
+    first-pass filter; the delete endpoint's own guard is the final word.
     """
     counts: dict[str, int] = {}
     total = 0
@@ -7657,6 +7691,12 @@ def get_categories(with_counts: bool = False) -> dict:
     (~2 minutes for a large catalogue) because Linnworks has no per-category
     count endpoint. Use with_counts=True when you want to find empty categories
     to clean up; leave it False for a quick name → id lookup.
+
+    ⚠️  item_count / is_empty count ACTIVE items only — the sweep cannot see
+    archived items (no Linnworks endpoint counts archived items per category).
+    A category holding only archived stock shows item_count 0 / is_empty True
+    here, yet Linnworks will refuse to delete it ("Category is in use"). Treat
+    is_empty as "has no active items", not "safe to delete".
 
     Args:
         with_counts: If True, sweep the whole catalogue and add item_count +
@@ -7876,6 +7916,13 @@ def delete_categories(
     have specific category ids to remove; to clean up ALL empty categories at
     once, use delete_empty_categories instead.
 
+    ⚠️  The sweep counts ACTIVE items only. A category holding only ARCHIVED
+    items looks empty (item_count 0) but Linnworks refuses to delete it
+    ("Category is in use"). Such categories come back as `skipped_in_use` (not
+    an error); the response reports `deleted` and `skipped_in_use` counts.
+    force=True does NOT override this — it only skips the sweep; the server-side
+    in-use guard still applies. Unarchive/reassign the items first to delete.
+
     Staging: batches over 10 categories require a confirmed_count echo-back
     after you review the manifest. dry_run=True by default.
 
@@ -7964,6 +8011,7 @@ def delete_categories(
     # ── Live execution ─────────────────────────────────────────────────────────
     results = []
     deleted = 0
+    skipped_in_use = 0
     for m in deletable:
         cid = m["category_id"]
         err = None
@@ -7971,26 +8019,50 @@ def delete_categories(
             call_linnworks("Inventory/DeleteCategoryById", {"categoryId": cid})
         except RuntimeError as exc:
             err = str(exc)
-        results.append({**m, "delete_error": err} if err else m)
-        if not err:
+        if err and _is_category_in_use(err):
+            # Not really empty — holds archived items or channel references the
+            # active-item sweep can't see. Expected skip, not a failure.
+            results.append({
+                **m, "status": "skipped_in_use",
+                "reason": (
+                    "Linnworks reports this category is still in use, so it was NOT "
+                    "deleted. It almost certainly holds ARCHIVED items (invisible to "
+                    "the active-item sweep) or is referenced by a channel/listing "
+                    "config. Unarchive/reassign those items (or clear the reference) "
+                    "before it can be deleted."
+                ),
+                "detail": err,
+            })
+            skipped_in_use += 1
+        elif err:
+            results.append({**m, "delete_error": err})
+        else:
+            results.append({**m, "deleted": True})
             deleted += 1
 
-    # Read-back once — confirm the deletable ids are gone
+    # Read-back once — confirm the ids we believe we deleted are actually gone
     cats2 = _fetch_categories()
     still = {(c.get("CategoryId") or "").lower() for c in cats2}
     for r in results:
-        if "delete_error" not in r:
-            r["deleted"] = r["category_id"].lower() not in still
+        if r.get("deleted") is True:
+            r["deleted"] = (r["category_id"] or "").lower() not in still
 
     non_deletable = [m for m in manifest if m.get("status") != "deletable"]
+    msg = f"Deleted {deleted} of {len(deletable)} deletable category(ies)."
+    if skipped_in_use:
+        msg += (
+            f" {skipped_in_use} skipped — still in use (archived items or channel "
+            "references; not truly empty)."
+        )
     return {
-        "dry_run":    False,
-        "force":      force,
-        "item_count": len(category_ids),
-        "deleted":    deleted,
-        "results":    results + non_deletable,
-        "manifest":   manifest,
-        "message":    f"Deleted {deleted} of {len(deletable)} deletable category(ies).",
+        "dry_run":        False,
+        "force":          force,
+        "item_count":     len(category_ids),
+        "deleted":        deleted,
+        "skipped_in_use": skipped_in_use,
+        "results":        results + non_deletable,
+        "manifest":       manifest,
+        "message":        msg,
     }
 
 
@@ -8003,17 +8075,25 @@ def delete_empty_categories(
     Find and PERMANENTLY delete every inventory category that has no items.
 
     This is the category-cleanup tool. It sweeps the entire catalogue (~2 min)
-    to count items per category, identifies the ones with zero items, shows you
-    a manifest, and — on a confirmed live run — deletes them. The built-in
-    Default category is always excluded even if it is empty.
+    to count items per category, identifies the ones with zero ACTIVE items,
+    shows you a manifest, and — on a confirmed live run — deletes them. The
+    built-in Default category is always excluded even if it is empty.
 
-    Because emptiness comes from a full scan, a category flagged empty here
-    genuinely has no items at scan time. This can surface a LOT of categories
-    (archived ranges, junk from spreadsheet imports, seasonal lines you may want
-    to keep) — so ALWAYS review the manifest first. If more than 10 categories
-    are empty, you must re-call with confirmed_count=<N> to proceed, and the
-    sweep re-runs on that call to re-verify emptiness. To delete only a hand-
-    picked subset, copy their ids into delete_categories instead.
+    ⚠️  "Empty" here = zero ACTIVE items. The sweep CANNOT see archived items,
+    and no Linnworks endpoint counts archived items per category. So a category
+    that holds only archived stock is flagged empty here but Linnworks will
+    REFUSE to delete it ("Category is in use"). The tool handles this cleanly:
+    such categories come back as `skipped_in_use` (not an error), and the
+    response reports both `deleted` and `skipped_in_use` counts. To actually
+    remove one, unarchive/reassign its items (or clear its channel reference)
+    first. This means the empty_count is an UPPER BOUND on what will delete.
+
+    This can surface a LOT of categories (archived ranges, junk from spreadsheet
+    imports, seasonal lines you may want to keep) — so ALWAYS review the manifest
+    first. If more than 10 categories are empty, you must re-call with
+    confirmed_count=<N> to proceed, and the sweep re-runs on that call to
+    re-verify emptiness. To delete only a hand-picked subset, copy their ids into
+    delete_categories instead.
 
     dry_run=True by default. Uses Stock/GetStockItems (sweep) +
     Inventory/DeleteCategoryById (one call per empty category).
@@ -8068,6 +8148,7 @@ def delete_empty_categories(
     # ── Live execution ─────────────────────────────────────────────────────────
     results = []
     deleted = 0
+    skipped_in_use = 0
     for c in empty:
         cid = c.get("CategoryId")
         err = None
@@ -8076,26 +8157,45 @@ def delete_empty_categories(
         except RuntimeError as exc:
             err = str(exc)
         row = {"category_id": cid, "category_name": c.get("CategoryName")}
-        if err:
+        if err and _is_category_in_use(err):
+            # "Empty" by the active-item sweep, but Linnworks blocks it — the
+            # category holds archived items or channel references. Expected skip.
+            row["status"] = "skipped_in_use"
+            row["reason"] = (
+                "Not truly empty — Linnworks reports it is still in use (ARCHIVED "
+                "items, invisible to the active-item sweep, or a channel/listing "
+                "reference). Not deleted."
+            )
+            row["detail"] = err
+            skipped_in_use += 1
+        elif err:
             row["delete_error"] = err
-        results.append(row)
-        if not err:
+        else:
+            row["deleted"] = True
             deleted += 1
+        results.append(row)
 
-    # Read-back once — confirm they are gone
+    # Read-back once — confirm the ids we believe we deleted are actually gone
     cats2 = _fetch_categories()
     still = {(c.get("CategoryId") or "").lower() for c in cats2}
     for r in results:
-        if "delete_error" not in r:
+        if r.get("deleted") is True:
             r["deleted"] = (r["category_id"] or "").lower() not in still
 
+    msg = f"Deleted {deleted} of {len(empty)} category(ies) reported empty by the sweep."
+    if skipped_in_use:
+        msg += (
+            f" {skipped_in_use} skipped — still in use (archived items or channel "
+            "references; the active-item sweep can't see those)."
+        )
     return {
-        "dry_run":     False,
-        "empty_count": len(empty),
-        "deleted":     deleted,
-        "results":     results,
-        "manifest":    manifest,
-        "message":     f"Deleted {deleted} of {len(empty)} empty category(ies).",
+        "dry_run":        False,
+        "empty_count":    len(empty),
+        "deleted":        deleted,
+        "skipped_in_use": skipped_in_use,
+        "results":        results,
+        "manifest":       manifest,
+        "message":        msg,
     }
 
 
