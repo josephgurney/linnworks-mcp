@@ -13,6 +13,7 @@ __version__ = "1.17.0"
 
 import os
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Literal, Optional
@@ -349,6 +350,8 @@ WRITE_THRESHOLDS: dict[str, int] = {
     "list_to_shopify":                25,   # creates live customer-facing channel listings
     "refresh_channel_listing":        25,   # re-pushes live customer-facing channel listings
     "unpublish_channel_listing":      10,   # TAKES DOWN live customer-facing listings — destructive
+    "delete_categories":              10,   # IRREVERSIBLE — deletes categories (non-empty → items reassigned)
+    "delete_empty_categories":        10,   # IRREVERSIBLE — bulk-deletes empty categories
     "default":                        25,   # fallback for any unlisted operation
 }
 
@@ -7540,6 +7543,560 @@ def delete_inventory_item(
             "delete_error). Per-item read-back results show what actually got deleted."
         )
     return out
+
+
+# ---------- Inventory categories ----------
+#
+# Linnworks category CRUD. Categories are a flat list (StructureCategoryId is 0
+# for every row in this tenant — the tree/"structure" feature is unused). Each
+# category is {CategoryId (guid), CategoryName, StructureCategoryId,
+# ProductCategoryId}. The zero-GUID "Default" category is built in and must
+# never be renamed or deleted.
+#
+# Endpoints (all live-confirmed 7 Jul 2026):
+#   Inventory/GetCategories       GET  -> [LinnworksCategory]
+#   Inventory/CreateCategory      POST {"categoryName": "..."} -> LinnworksCategory
+#                                       (Linnworks mints the CategoryId server-side —
+#                                        no client GUID needed, unlike the sub-entity
+#                                        Create* endpoints)
+#   Inventory/UpdateCategory      POST {"category": {full record}} -> {} on success
+#                                       (carry ALL fields — omitted fields are cleared;
+#                                        empty 2xx body)
+#   Inventory/DeleteCategoryById  POST {"categoryId": "guid"} -> {} on success
+#                                       (empty 2xx; a non-empty category's items are
+#                                        reassigned to Default)
+#
+# "Empty" = no inventory item references the category. There is NO per-category
+# count endpoint (GetInventoryItemsCount returns only a global total), so
+# emptiness is derived by sweeping the whole catalogue via Stock/GetStockItems
+# (keyWord="") and tallying CategoryId. That sweep is ~161 pages for ~32k items
+# (~2 min); it throttles under the 150/min rate limit and backs off on HTTP 429.
+# The scan always runs to completion — a partial scan could misreport a used
+# category as empty and cause a wrongful delete.
+
+_DEFAULT_CATEGORY_ID = "00000000-0000-0000-0000-000000000000"
+
+
+def _fetch_categories() -> list[dict]:
+    """Return the raw LinnworksCategory list (one GET)."""
+    cats = call_linnworks_get("Inventory/GetCategories")
+    return cats if isinstance(cats, list) else []
+
+
+def _format_category(c: dict, item_count: int | None = None) -> dict:
+    """Normalise a LinnworksCategory into the MCP-facing shape."""
+    out = {
+        "category_id":         c.get("CategoryId"),
+        "category_name":       c.get("CategoryName"),
+        "product_category_id": c.get("ProductCategoryId"),
+        "is_default":          (c.get("CategoryId") or "").lower() == _DEFAULT_CATEGORY_ID,
+    }
+    if item_count is not None:
+        out["item_count"] = item_count
+        out["is_empty"] = item_count == 0
+    return out
+
+
+def _count_items_per_category() -> dict:
+    """
+    Sweep the entire inventory and tally how many items reference each category.
+
+    Returns {"counts": {category_id_lower: n}, "total_items": int, "pages": int}.
+
+    Linnworks has no per-category count endpoint, so this paginates
+    Stock/GetStockItems (keyWord="") across the whole catalogue. It is the
+    authoritative source for "is this category empty?" — so it always runs to
+    completion (no page cap). Throttled to stay under the 150/min rate limit,
+    with a bounded 429 backoff. Expect ~2 minutes for a large catalogue.
+    """
+    counts: dict[str, int] = {}
+    total = 0
+    pages = 0
+    page = 1
+    while True:
+        resp = None
+        for _ in range(6):
+            try:
+                resp = call_linnworks_get(
+                    "Stock/GetStockItems",
+                    {"keyWord": "", "entriesPerPage": 200, "pageNumber": page},
+                )
+                break
+            except RuntimeError as exc:
+                if "429" in str(exc) or "quota" in str(exc).lower():
+                    time.sleep(15)  # rate-limit backoff, then retry the same page
+                    continue
+                raise
+        if resp is None:
+            raise RuntimeError(
+                f"Category sweep aborted: repeated rate-limit (429) on page {page}. "
+                "Emptiness could not be determined; no categories were changed."
+            )
+        data = resp.get("Data") or []
+        pages += 1
+        for it in data:
+            cid = (it.get("CategoryId") or "").lower()
+            counts[cid] = counts.get(cid, 0) + 1
+            total += 1
+        total_pages = resp.get("TotalPages") or 1
+        if page >= total_pages or not data:
+            break
+        page += 1
+        time.sleep(0.45)  # proactive throttle to stay under 150/min
+    return {"counts": counts, "total_items": total, "pages": pages}
+
+
+@mcp.tool()
+def get_categories(with_counts: bool = False) -> dict:
+    """
+    List all Linnworks inventory categories.
+
+    By default this makes ONE fast API call and returns the category list. Pass
+    with_counts=True to also report how many inventory items are in each
+    category and flag the empty ones — but that triggers a FULL catalogue sweep
+    (~2 minutes for a large catalogue) because Linnworks has no per-category
+    count endpoint. Use with_counts=True when you want to find empty categories
+    to clean up; leave it False for a quick name → id lookup.
+
+    Args:
+        with_counts: If True, sweep the whole catalogue and add item_count +
+            is_empty to every category (slow). Default False.
+
+    Returns:
+        - category_count: total number of categories
+        - with_counts: echo of the flag
+        - categories: list of {category_id, category_name, product_category_id,
+            is_default[, item_count, is_empty]} sorted by name
+        - (with_counts only) total_items, empty_count, used_count
+    """
+    cats = _fetch_categories()
+    counts = None
+    swept = None
+    if with_counts:
+        swept = _count_items_per_category()
+        counts = swept["counts"]
+
+    rows = []
+    for c in cats:
+        n = None if counts is None else counts.get((c.get("CategoryId") or "").lower(), 0)
+        rows.append(_format_category(c, n))
+    rows.sort(key=lambda r: (r.get("category_name") or "").lower())
+
+    out = {
+        "category_count": len(rows),
+        "with_counts":    with_counts,
+        "categories":     rows,
+    }
+    if with_counts:
+        empty = [r for r in rows if r.get("is_empty")]
+        out["total_items"] = swept["total_items"]
+        out["empty_count"] = len(empty)
+        out["used_count"]  = len(rows) - len(empty)
+    return out
+
+
+@mcp.tool()
+def create_category(name: str, dry_run: bool = True) -> dict:
+    """
+    Create a new inventory category.
+
+    Single-category create. Checks for an existing category with the same name
+    (case-insensitive) first and refuses to create a duplicate. dry_run=True by
+    default — preview only; set dry_run=False to actually create.
+
+    Uses Inventory/CreateCategory (Linnworks mints the CategoryId server-side).
+
+    Args:
+        name: The category name to create.
+        dry_run: If True (default), preview only. Set False to create.
+
+    Returns:
+        A dict with created flag, category_id (live run only), and any
+        duplicate note.
+    """
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("name must be a non-empty category name.")
+    _check_injection("name", name)
+
+    existing = _fetch_categories()
+    dup = next(
+        (c for c in existing
+         if (c.get("CategoryName") or "").strip().lower() == name.lower()),
+        None,
+    )
+    if dup:
+        return {
+            "created":              False,
+            "dry_run":              dry_run,
+            "category_name":        name,
+            "existing_category_id": dup.get("CategoryId"),
+            "message": (
+                f"A category named '{dup.get('CategoryName')}' already exists "
+                "— not creating a duplicate."
+            ),
+        }
+
+    if dry_run:
+        return {
+            "created":       False,
+            "dry_run":       True,
+            "category_name": name,
+            "message":       f"Dry run — would create category '{name}'. Set dry_run=False to create.",
+        }
+
+    resp = call_linnworks("Inventory/CreateCategory", {"categoryName": name})
+    return {
+        "created":       True,
+        "dry_run":       False,
+        "category_id":   resp.get("CategoryId"),
+        "category_name": resp.get("CategoryName", name),
+        "message":       f"Created category '{name}'.",
+    }
+
+
+@mcp.tool()
+def rename_category(category_id: str, new_name: str, dry_run: bool = True) -> dict:
+    """
+    Rename an existing inventory category.
+
+    Reads the current category first (for a before/after diff), then updates its
+    name while carrying every other field through unchanged — Inventory/Update
+    Category clears any field you omit, so the full record must be re-sent.
+    Refuses to rename the built-in Default category, and refuses a name already
+    used by another category. dry_run=True by default; reads back after writing.
+
+    Uses Inventory/UpdateCategory.
+
+    Args:
+        category_id: The CategoryId (GUID) to rename — from get_categories.
+        new_name: The new category name.
+        dry_run: If True (default), preview only. Set False to apply.
+    """
+    category_id = (category_id or "").strip()
+    new_name = (new_name or "").strip()
+    if not category_id:
+        raise ValueError("category_id is required.")
+    if not new_name:
+        raise ValueError("new_name must be a non-empty category name.")
+    _check_injection("new_name", new_name)
+    if category_id.lower() == _DEFAULT_CATEGORY_ID:
+        raise ValueError("The built-in Default category cannot be renamed.")
+
+    cats = _fetch_categories()
+    rec = next(
+        (c for c in cats if (c.get("CategoryId") or "").lower() == category_id.lower()),
+        None,
+    )
+    if rec is None:
+        return {
+            "updated":     False,
+            "dry_run":     dry_run,
+            "category_id": category_id,
+            "message":     f"No category found with id {category_id}.",
+        }
+
+    old_name = rec.get("CategoryName")
+    dup = next(
+        (c for c in cats
+         if (c.get("CategoryName") or "").strip().lower() == new_name.lower()
+         and (c.get("CategoryId") or "").lower() != category_id.lower()),
+        None,
+    )
+    if dup:
+        return {
+            "updated":     False,
+            "dry_run":     dry_run,
+            "category_id": category_id,
+            "message":     f"Another category is already named '{dup.get('CategoryName')}'.",
+        }
+
+    if old_name == new_name:
+        return {
+            "updated":     False,
+            "dry_run":     dry_run,
+            "category_id": category_id,
+            "message":     f"Category is already named '{new_name}' — nothing to do.",
+        }
+
+    if dry_run:
+        return {
+            "updated":     False,
+            "dry_run":     True,
+            "category_id": category_id,
+            "before":      {"category_name": old_name},
+            "after":       {"category_name": new_name},
+            "message":     f"Dry run — would rename '{old_name}' → '{new_name}'. Set dry_run=False to apply.",
+        }
+
+    updated = dict(rec)
+    updated["CategoryName"] = new_name
+    call_linnworks("Inventory/UpdateCategory", {"category": updated})
+
+    # Read-back
+    cats2 = _fetch_categories()
+    rec2 = next(
+        (c for c in cats2 if (c.get("CategoryId") or "").lower() == category_id.lower()),
+        None,
+    )
+    now = rec2.get("CategoryName") if rec2 else None
+    ok = now == new_name
+    return {
+        "updated":     ok,
+        "dry_run":     False,
+        "category_id": category_id,
+        "before":      {"category_name": old_name},
+        "after":       {"category_name": now},
+        "message": (
+            f"Renamed '{old_name}' → '{now}'." if ok
+            else "Update sent, but read-back did not confirm the new name."
+        ),
+    }
+
+
+@mcp.tool()
+def delete_categories(
+    category_ids: list[str],
+    force: bool = False,
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    PERMANENTLY delete specific inventory categories by CategoryId.
+
+    ⚠️  Deleting a category that still has items reassigns those items to the
+    Default category — it does NOT delete the items, but it does change their
+    categorisation. By default this tool REFUSES to delete a non-empty category
+    and reports it as blocked; pass force=True to delete non-empty categories
+    anyway (their items move to Default). The built-in Default category can
+    never be deleted.
+
+    Emptiness is checked via a full catalogue sweep (~2 min) UNLESS force=True
+    (which deletes regardless, so it skips the sweep). Use this tool when you
+    have specific category ids to remove; to clean up ALL empty categories at
+    once, use delete_empty_categories instead.
+
+    Staging: batches over 10 categories require a confirmed_count echo-back
+    after you review the manifest. dry_run=True by default.
+
+    Uses Inventory/DeleteCategoryById (one call per category).
+
+    Args:
+        category_ids: List of CategoryId GUIDs to delete (from get_categories).
+        force: If True, delete even non-empty categories (their items → Default)
+            and skip the emptiness sweep. Default False (empty-only, safe).
+        confirmed_count: For batches > 10, pass len(category_ids) after review.
+        dry_run: If True (default), preview only. Set False to execute.
+
+    Returns:
+        A dict with manifest (per-id: name, item_count, status of
+        deletable/blocked/error) and, on a live run, per-id delete results.
+    """
+    if not category_ids:
+        raise ValueError("category_ids must contain at least one CategoryId.")
+
+    cats = _fetch_categories()
+    by_id = {(c.get("CategoryId") or "").lower(): c for c in cats}
+
+    counts = None
+    if not force:
+        counts = _count_items_per_category()["counts"]
+
+    manifest: list[dict] = []
+    for cid in category_ids:
+        cid_norm = (cid or "").strip()
+        key = cid_norm.lower()
+        rec = by_id.get(key)
+        if not cid_norm:
+            manifest.append({"category_id": cid, "status": "error", "reason": "empty id"})
+            continue
+        if key == _DEFAULT_CATEGORY_ID:
+            manifest.append({
+                "category_id": cid_norm, "category_name": rec.get("CategoryName") if rec else "Default",
+                "status": "blocked", "reason": "the built-in Default category cannot be deleted",
+            })
+            continue
+        if rec is None:
+            manifest.append({"category_id": cid_norm, "status": "error",
+                             "reason": "no category found with this id"})
+            continue
+
+        row = {
+            "category_id":   cid_norm,
+            "category_name": rec.get("CategoryName"),
+        }
+        if counts is not None:
+            n = counts.get(key, 0)
+            row["item_count"] = n
+            if n > 0:
+                row["status"] = "blocked"
+                row["reason"] = f"category has {n} item(s); pass force=True to delete (items → Default)"
+            else:
+                row["status"] = "deletable"
+        else:
+            # force=True — no sweep; we still note the reassignment risk
+            row["status"] = "deletable"
+            row["note"] = "force=True — will delete even if non-empty (any items → Default)"
+        manifest.append(row)
+
+    deletable = [m for m in manifest if m.get("status") == "deletable"]
+
+    # ── Write guard (threshold 10, on the input list) ──────────────────────────
+    guard = _write_guard("delete_categories", category_ids, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, "force": force, "manifest": manifest}
+
+    if dry_run:
+        blocked = [m for m in manifest if m.get("status") == "blocked"]
+        errors = [m for m in manifest if m.get("status") == "error"]
+        return {
+            "dry_run":    True,
+            "force":      force,
+            "item_count": len(category_ids),
+            "manifest":   manifest,
+            "message": (
+                f"Dry run — nothing deleted. {len(deletable)} category(ies) would be "
+                f"deleted, {len(blocked)} blocked, {len(errors)} error(s). Review the "
+                "manifest, then set dry_run=False to execute."
+            ),
+        }
+
+    # ── Live execution ─────────────────────────────────────────────────────────
+    results = []
+    deleted = 0
+    for m in deletable:
+        cid = m["category_id"]
+        err = None
+        try:
+            call_linnworks("Inventory/DeleteCategoryById", {"categoryId": cid})
+        except RuntimeError as exc:
+            err = str(exc)
+        results.append({**m, "delete_error": err} if err else m)
+        if not err:
+            deleted += 1
+
+    # Read-back once — confirm the deletable ids are gone
+    cats2 = _fetch_categories()
+    still = {(c.get("CategoryId") or "").lower() for c in cats2}
+    for r in results:
+        if "delete_error" not in r:
+            r["deleted"] = r["category_id"].lower() not in still
+
+    non_deletable = [m for m in manifest if m.get("status") != "deletable"]
+    return {
+        "dry_run":    False,
+        "force":      force,
+        "item_count": len(category_ids),
+        "deleted":    deleted,
+        "results":    results + non_deletable,
+        "manifest":   manifest,
+        "message":    f"Deleted {deleted} of {len(deletable)} deletable category(ies).",
+    }
+
+
+@mcp.tool()
+def delete_empty_categories(
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Find and PERMANENTLY delete every inventory category that has no items.
+
+    This is the category-cleanup tool. It sweeps the entire catalogue (~2 min)
+    to count items per category, identifies the ones with zero items, shows you
+    a manifest, and — on a confirmed live run — deletes them. The built-in
+    Default category is always excluded even if it is empty.
+
+    Because emptiness comes from a full scan, a category flagged empty here
+    genuinely has no items at scan time. This can surface a LOT of categories
+    (archived ranges, junk from spreadsheet imports, seasonal lines you may want
+    to keep) — so ALWAYS review the manifest first. If more than 10 categories
+    are empty, you must re-call with confirmed_count=<N> to proceed, and the
+    sweep re-runs on that call to re-verify emptiness. To delete only a hand-
+    picked subset, copy their ids into delete_categories instead.
+
+    dry_run=True by default. Uses Stock/GetStockItems (sweep) +
+    Inventory/DeleteCategoryById (one call per empty category).
+
+    Args:
+        confirmed_count: For >10 empty categories, pass the empty_count reported
+            in the manifest to confirm the deletion.
+        dry_run: If True (default), preview only. Set False to execute.
+
+    Returns:
+        A dict with empty_count, manifest (each empty category's id + name), and,
+        on a live run, per-category delete results.
+    """
+    swept = _count_items_per_category()
+    counts = swept["counts"]
+    cats = _fetch_categories()
+
+    empty = [
+        c for c in cats
+        if (c.get("CategoryId") or "").lower() != _DEFAULT_CATEGORY_ID
+        and counts.get((c.get("CategoryId") or "").lower(), 0) == 0
+    ]
+    empty.sort(key=lambda c: (c.get("CategoryName") or "").lower())
+    manifest = [
+        {"category_id": c.get("CategoryId"), "category_name": c.get("CategoryName"), "item_count": 0}
+        for c in empty
+    ]
+
+    # ── Write guard (threshold 10, on the discovered empty list) ───────────────
+    guard = _write_guard("delete_empty_categories", empty, confirmed_count, dry_run)
+    if guard is not None:
+        return {
+            **guard,
+            "empty_count":  len(empty),
+            "total_items":  swept["total_items"],
+            "manifest":     manifest,
+        }
+
+    if dry_run:
+        return {
+            "dry_run":     True,
+            "empty_count": len(empty),
+            "total_items": swept["total_items"],
+            "manifest":    manifest,
+            "message": (
+                f"Dry run — nothing deleted. {len(empty)} empty category(ies) found "
+                f"(Default excluded). Review the manifest, then set dry_run=False to "
+                "delete them."
+            ),
+        }
+
+    # ── Live execution ─────────────────────────────────────────────────────────
+    results = []
+    deleted = 0
+    for c in empty:
+        cid = c.get("CategoryId")
+        err = None
+        try:
+            call_linnworks("Inventory/DeleteCategoryById", {"categoryId": cid})
+        except RuntimeError as exc:
+            err = str(exc)
+        row = {"category_id": cid, "category_name": c.get("CategoryName")}
+        if err:
+            row["delete_error"] = err
+        results.append(row)
+        if not err:
+            deleted += 1
+
+    # Read-back once — confirm they are gone
+    cats2 = _fetch_categories()
+    still = {(c.get("CategoryId") or "").lower() for c in cats2}
+    for r in results:
+        if "delete_error" not in r:
+            r["deleted"] = (r["category_id"] or "").lower() not in still
+
+    return {
+        "dry_run":     False,
+        "empty_count": len(empty),
+        "deleted":     deleted,
+        "results":     results,
+        "manifest":    manifest,
+        "message":     f"Deleted {deleted} of {len(empty)} empty category(ies).",
+    }
 
 
 # ---------- Listings — Generic Listing Tool (GLT) ----------
