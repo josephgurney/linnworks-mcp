@@ -350,8 +350,11 @@ WRITE_THRESHOLDS: dict[str, int] = {
     "list_to_shopify":                25,   # creates live customer-facing channel listings
     "refresh_channel_listing":        25,   # re-pushes live customer-facing channel listings
     "unpublish_channel_listing":      10,   # TAKES DOWN live customer-facing listings — destructive
+    "delist_all_shopify_listings":    10,   # TAKES DOWN every Shopify listing for an item — destructive
     "delete_categories":              10,   # IRREVERSIBLE — deletes categories (non-empty → items reassigned)
     "delete_empty_categories":        10,   # IRREVERSIBLE — bulk-deletes empty categories
+    "archive_inventory_items":        25,   # hides items from channels; reversible via unarchive
+    "unarchive_inventory_items":      25,   # restores items to active; reversible via archive
     "default":                        25,   # fallback for any unlisted operation
 }
 
@@ -9642,6 +9645,334 @@ def unpublish_channel_listing(
             "read-back; the channel may lag, so a row that is still_listed=true may simply not have "
             "synced yet — re-check with get_channel_listings, and verify in your Shopify admin. "
             "Per-item errors are in results[].error."
+        ),
+    }
+
+
+@mcp.tool()
+def delist_all_shopify_listings(
+    skus: list[str],
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Take down EVERY Shopify listing for each given item, across ALL Shopify
+    stores it is listed on — the convenience wrapper over unpublish_channel_listing
+    (which handles one store at a time).
+
+    Built for archived-item cleanup: after you UNARCHIVE items in the Linnworks UI
+    (they must be ACTIVE — an archived SKU cannot be resolved, so this tool can't
+    see it), run this to retire all their Shopify storefront listings in one pass,
+    then re-archive with archive_inventory_items.
+
+    Per SKU it reads the channel-SKU link table, finds every distinct SHOPIFY
+    store the item is listed on, and delegates each (SKU, store) to the proven
+    unpublish_channel_listing (GLT ProcessTemplates Delete). It does NOT touch the
+    base item, stock, or non-Shopify channels.
+
+    ⚠️  SHOPIFY ONLY. Any listing on a non-Shopify channel (Mirakl, eBay, Amazon,
+    Magento…) is reported under `skipped_channels` and left UP — the GLT delete
+    path cannot retire it. So "all listings gone" is only true for Shopify stores.
+
+    ⚠️  DESTRUCTIVE and customer-facing — removes real Shopify listings (reviews,
+    ranking, URL not recoverable). dry_run=True by default; staging threshold 10
+    on the number of (SKU × store) take-downs.
+
+    Args:
+        skus: Exact SKUs / ItemNumbers (must be ACTIVE / resolvable) whose Shopify
+            listings should all be taken down.
+        confirmed_count: For > 10 planned take-downs, pass the take_down_count from
+            the dry-run manifest to confirm.
+        dry_run: If True (default), preview only. Set False to execute.
+
+    Returns:
+        dict with per-SKU discovery (shopify_stores, skipped_channels), a combined
+        `plan` of (sku, store) take-downs, `unresolved`, and — on a live run —
+        per-(sku, store) `results` (processed / taken_down / still_listed / error).
+    """
+    if not skus:
+        raise ValueError("skus must contain at least one SKU.")
+
+    catalogue = _fetch_shopify_configurators()
+    shopify_stores = {_norm_conf_name(c["sub_source"]) for c in catalogue if c.get("sub_source")}
+
+    # ── Discover, per SKU, which Shopify stores (and which non-Shopify channels) ─
+    discovery: list[dict] = []
+    unresolved: list[dict] = []
+    work: list[tuple[str, str]] = []   # (sku, actual store sub_source)
+    for raw in skus:
+        sku = (raw or "").strip()
+        if not sku:
+            unresolved.append({"sku": raw, "error": "empty SKU"})
+            continue
+        try:
+            item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+        except RuntimeError as exc:
+            unresolved.append({
+                "sku": sku,
+                "error": (
+                    f"not found / not resolvable: {exc}. If this item is ARCHIVED, "
+                    "unarchive it in Linnworks first — archived SKUs cannot be resolved."
+                ),
+            })
+            continue
+        sid = item.get("StockItemId")
+        if not sid:
+            unresolved.append({"sku": sku, "error": "found but returned no StockItemId"})
+            continue
+        try:
+            rows = call_linnworks_get(
+                "Inventory/GetInventoryItemChannelSKUs", {"inventoryItemId": sid}
+            )
+        except RuntimeError as exc:
+            unresolved.append({"sku": sku, "stock_item_id": sid,
+                               "error": f"could not read channel listings: {exc}"})
+            continue
+        rows = rows if isinstance(rows, list) else []
+        stores_here: list[str] = []
+        skipped: list[dict] = []
+        seen_stores: set[str] = set()
+        for r in rows:
+            src, ss = r.get("Source"), r.get("SubSource")
+            if _norm_conf_name(src) == _norm_conf_name(GLT_SHOPIFY_CHANNEL_NAME):
+                key = _norm_conf_name(ss)
+                if key in shopify_stores and key not in seen_stores:
+                    seen_stores.add(key)
+                    stores_here.append(ss)
+                    work.append((sku, ss))
+            else:
+                skipped.append({"source": src, "sub_source": ss,
+                                "channel_reference_id": r.get("ChannelReferenceId")})
+        discovery.append({
+            "sku": sku, "stock_item_id": sid, "title": item.get("ItemTitle"),
+            "shopify_stores": stores_here, "skipped_channels": skipped,
+        })
+
+    # ── Build the combined plan by dry-running the proven tool per (sku, store) ──
+    plan: list[dict] = []
+    for sku, store in work:
+        sub = unpublish_channel_listing(skus=[sku], sub_source=store, dry_run=True)
+        for p in sub.get("plan", []):
+            plan.append({**p, "sub_source": store})
+        for u in sub.get("unresolved", []):
+            unresolved.append({**u, "sub_source": store})
+
+    base_out = {
+        "item_count":       len(skus),
+        "shopify_stores_in_tenant": sorted(shopify_stores),
+        "discovery":        discovery,
+        "plan":             plan,
+        "unresolved":       unresolved,
+        "skipped_channels": [
+            {"sku": d["sku"], **s} for d in discovery for s in d["skipped_channels"]
+        ],
+    }
+
+    # ── Write guard (threshold 10) on the number of take-downs ─────────────────
+    guard = _write_guard("delist_all_shopify_listings", plan, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, **base_out}
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            **base_out,
+            "take_down_count": len(plan),
+            "message": (
+                f"Dry run — nothing taken down. {len(plan)} Shopify listing(s) across "
+                f"{len({(p['sku'], p['sub_source']) for p in plan})} (item×store) would be DELETED; "
+                f"{len(base_out['skipped_channels'])} non-Shopify listing(s) can't be taken down "
+                "(see skipped_channels) and will stay up. Review the plan, then set dry_run=False."
+            ),
+        }
+
+    # ── Live execution: delegate each (sku, store) to the proven tool ──────────
+    results: list[dict] = []
+    for sku, store in work:
+        sub = unpublish_channel_listing(skus=[sku], sub_source=store, dry_run=False)
+        for r in sub.get("results", []):
+            results.append({**r, "sub_source": store})
+    taken = sum(1 for r in results if r.get("taken_down"))
+    return {
+        "dry_run": False,
+        **base_out,
+        "results": results,
+        "message": (
+            f"{taken}/{len(results)} Shopify listing(s) confirmed taken down across all stores. "
+            f"{len(base_out['skipped_channels'])} non-Shopify listing(s) left up (see "
+            "skipped_channels). Channel sync may lag — re-check with get_channel_listings."
+        ),
+    }
+
+
+@mcp.tool()
+def archive_inventory_items(
+    skus: list[str],
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    ARCHIVE inventory items (the Linnworks "archive" action) by SKU.
+
+    Archiving hides an item from the active catalogue. It is REVERSIBLE via
+    unarchive_inventory_items (or the Linnworks UI). Typically the final step of
+    archived-item cleanup: after you unarchive items to delist them
+    (delist_all_shopify_listings), re-archive them here.
+
+    Items must be ACTIVE to resolve by SKU (an already-archived SKU won't resolve
+    → reported unresolved). Read-before-write resolves each SKU → StockItemId and
+    captures the title; read-back confirms the SKU no longer resolves (i.e. it is
+    archived). Uses Inventory/ArchiveInventoryItems (one batched call).
+
+    ⚠️  Archiving an item can affect its channel behaviour (a stale listing may be
+    left frozen — see the archived-item listing gotcha). Delist first, then archive.
+
+    Args:
+        skus: Exact SKUs / ItemNumbers to archive (must be ACTIVE).
+        confirmed_count: For > 25 items, pass len(skus) after reviewing the manifest.
+        dry_run: If True (default), preview only. Set False to archive.
+
+    Returns:
+        dict with manifest (per-SKU sku, stock_item_id, title, status) plus
+        unresolved rows, and — on a live run — per-SKU `archived` read-back.
+    """
+    return _set_archive_state(skus, archive=True,
+                              confirmed_count=confirmed_count, dry_run=dry_run)
+
+
+@mcp.tool()
+def unarchive_inventory_items(
+    stock_item_ids: list[str],
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    UNARCHIVE (restore to active) inventory items by StockItemId GUID.
+
+    ⚠️  Takes StockItemId GUIDs, NOT SKUs — an archived item CANNOT be resolved
+    from its SKU (GetInventoryItem fails, and no SKU→id resolver sees archived
+    items), so the only handle is the GUID. Source the GUIDs from a Linnworks
+    export of the Archived view that includes the "Stock Item ID" column. There is
+    no API to enumerate archived items.
+
+    Restoring is REVERSIBLE via archive_inventory_items. Once unarchived, an item
+    becomes active and resolves by SKU again — so you can then delist it
+    (delist_all_shopify_listings) and re-archive it. Uses
+    Inventory/UnarchiveInventoryItems (one batched call). Read-back confirms each
+    id now resolves as an active item.
+
+    Args:
+        stock_item_ids: StockItemId GUIDs to unarchive.
+        confirmed_count: For > 25 items, pass len(stock_item_ids) after review.
+        dry_run: If True (default), preview only. Set False to unarchive.
+
+    Returns:
+        dict with manifest (per-id stock_item_id) plus, on a live run, per-id
+        `active` read-back.
+    """
+    return _set_archive_state(stock_item_ids, archive=False,
+                              confirmed_count=confirmed_count, dry_run=dry_run)
+
+
+def _set_archive_state(
+    items: list[str],
+    archive: bool,
+    confirmed_count: int | None,
+    dry_run: bool,
+) -> dict:
+    """
+    Shared archive/unarchive worker. archive=True takes SKUs (resolves → GUID);
+    archive=False takes StockItemId GUIDs directly (archived SKUs can't resolve).
+    """
+    op = "archive_inventory_items" if archive else "unarchive_inventory_items"
+    endpoint = ("Inventory/ArchiveInventoryItems" if archive
+                else "Inventory/UnarchiveInventoryItems")
+    if not items:
+        raise ValueError("The list must contain at least one item.")
+
+    # ── Resolve to StockItemId GUIDs + build manifest ─────────────────────────
+    manifest: list[dict] = []
+    unresolved: list[dict] = []
+    ids: list[str] = []
+    cache: dict = {}
+    for raw in items:
+        val = (raw or "").strip()
+        if not val:
+            unresolved.append({"input": raw, "error": "empty value"})
+            continue
+        if archive:
+            # SKU → GUID (item must be active to resolve)
+            try:
+                item = call_linnworks("Inventory/GetInventoryItem", {"sku": val})
+            except RuntimeError as exc:
+                unresolved.append({"sku": val, "error": (
+                    f"not resolvable: {exc}. Already archived items cannot be "
+                    "resolved by SKU.")})
+                continue
+            sid = item.get("StockItemId")
+            if not sid:
+                unresolved.append({"sku": val, "error": "no StockItemId returned"})
+                continue
+            manifest.append({"sku": val, "stock_item_id": sid,
+                             "title": item.get("ItemTitle")})
+            ids.append(sid)
+        else:
+            # GUID passed directly
+            manifest.append({"stock_item_id": val})
+            ids.append(val)
+
+    base_out = {"item_count": len(items), "manifest": manifest, "unresolved": unresolved}
+
+    guard = _write_guard(op, items, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, **base_out}
+
+    if dry_run:
+        verb = "archived" if archive else "unarchived"
+        return {
+            "dry_run": True, **base_out,
+            "message": (
+                f"Dry run — nothing changed. {len(ids)} item(s) would be {verb}; "
+                f"{len(unresolved)} unresolved. Set dry_run=False to execute."
+            ),
+        }
+
+    if not ids:
+        return {"dry_run": False, **base_out,
+                "message": "Nothing to do — no items resolved."}
+
+    # ── Execute (one batched call) ─────────────────────────────────────────────
+    call_linnworks(endpoint, {"parameters": {
+        "InventoryItemIds": ids, "SelectedRegions": [], "Token": _ZERO_GUID,
+    }})
+
+    # ── Read-back: archived items stop resolving by SKU; unarchived start ──────
+    results: list[dict] = []
+    for m in manifest:
+        row = dict(m)
+        if archive and m.get("sku"):
+            try:
+                call_linnworks("Inventory/GetInventoryItem", {"sku": m["sku"]})
+                row["archived"] = False   # still resolves → not archived
+            except RuntimeError:
+                row["archived"] = True    # no longer resolves → archived
+        else:
+            try:
+                gi = call_linnworks("Inventory/GetInventoryItem",
+                                    {"stockItemId": m["stock_item_id"]})
+                row["active"] = bool(gi.get("StockItemId"))
+            except RuntimeError:
+                row["active"] = None      # couldn't confirm via GUID lookup
+        results.append(row)
+
+    verb = "archived" if archive else "unarchived"
+    confirmed = sum(1 for r in results if (r.get("archived") if archive else r.get("active")))
+    return {
+        "dry_run": False, **base_out, "results": results,
+        "message": (
+            f"{verb.capitalize()} {len(ids)} item(s); {confirmed} confirmed by read-back. "
+            + ("Archived SKUs no longer resolve." if archive
+               else "Unarchived items now resolve as active.")
         ),
     }
 
