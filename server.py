@@ -9407,10 +9407,12 @@ def refresh_channel_listing(
     a live run on tpl 39076 overwrote the current £89.95 selling price with
     the template's stale £79.95 and left the stale compare-at in place, and
     the storefront had to be repaired. GLT's `NextSuggestedAction: "Update"`
-    does NOT mean the template body is fresh. Until a template-field refresh
-    step exists in this tool, only live-run a template you know is fresh (the
-    UI listing screen rebuilds fields on open; the API path does not), and
-    read the live listing back immediately after every push.
+    does NOT mean the template body is fresh, and `action="Revise"` behaves
+    IDENTICALLY to "Update" (both push the stored snapshot — live-proven).
+    No public API refreshes a variation template's fields (#27): only
+    live-run a template you know is fresh (the UI listing screen rebuilds
+    fields on open; the API path does not), and read the live listing back
+    immediately after every push.
 
     For batches larger than 25 SKUs this tool stages: it returns the plan and asks
     you to confirm with confirmed_count=<N> before executing.
