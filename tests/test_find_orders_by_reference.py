@@ -112,7 +112,7 @@ class TestFindOrdersByReference:
 
         def side_effect(path, payload, **kwargs):
             if "SearchOrders" in path:
-                captured["term"] = payload.get("request", {}).get("SearchTerm")
+                captured["term"] = payload.get("SearchTerm")
                 return SEARCH_RESPONSE_EMPTY
             return []
 
@@ -196,7 +196,7 @@ class TestFindOrdersByReference:
 
         def side_effect(path, payload, **kwargs):
             if "SearchOrders" in path:
-                captured["inc"] = payload.get("request", {}).get("IncludeProcessed")
+                captured["inc"] = payload.get("IncludeProcessed")
                 return SEARCH_RESPONSE_EMPTY
             return []
 
@@ -224,8 +224,10 @@ class TestFindOrdersByReference:
 
         assert batch_guids.count(GUID_1) == 1, "GUID_1 should only be fetched once"
 
-    def test_search_orders_payload_uses_request_wrapper(self):
-        """SearchOrders must use the {'request': {...}} wrapper (OpenOrders convention)."""
+    def test_search_orders_payload_is_unwrapped(self):
+        """SearchOrders must be sent UNWRAPPED — the {'request': {...}} wrapper
+        returns HTTP 400 'Must provide a search term.' (live-tested 15 Jun 2026,
+        see CLAUDE.md confirmed-endpoints table)."""
         import server
 
         captured = {}
@@ -239,10 +241,13 @@ class TestFindOrdersByReference:
         with patch("server.call_linnworks", side_effect=side_effect):
             server.find_orders_by_reference("123")
 
-        assert "request" in captured["payload"], (
-            "SearchOrders payload must use {'request': {...}} wrapper"
+        assert "request" not in captured["payload"], (
+            "SearchOrders payload must be UNWRAPPED — the wrapper 400s "
+            "'Must provide a search term.'"
         )
-        assert "SearchTerm" in captured["payload"]["request"]
+        assert captured["payload"]["SearchTerm"] == "123"
+        assert "LocationId" in captured["payload"]
+        assert "IncludeProcessed" in captured["payload"]
 
     def test_result_includes_expected_fields(self):
         """Each order in results must include the documented fields."""
