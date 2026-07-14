@@ -345,6 +345,7 @@ WRITE_THRESHOLDS: dict[str, int] = {
     "set_extended_properties":        50,   # metadata, lower blast radius
     "set_inventory_item_descriptions": 50,  # content, lower blast radius
     "set_inventory_item_titles":      50,   # channel title overrides, lower blast radius
+    "set_inventory_item_suppliers":   50,   # purchasing metadata, lower blast radius
     "add_inventory_item_images":      100,  # additive-only, no overwrites
     "delete_inventory_item":          10,   # IRREVERSIBLE — lowest threshold of all
     "list_to_shopify":                25,   # creates live customer-facing channel listings
@@ -7084,6 +7085,292 @@ def set_inventory_item_titles(
         "errors":     errors,
         "results":    results,
         "manifest":   manifest,
+    }
+
+
+@mcp.tool()
+def get_inventory_item_suppliers(sku: str) -> dict:
+    """
+    Read the purchasable supplier links for ONE inventory item — answers
+    "which supplier(s) can this item be bought from, at what code and cost,
+    and which is the primary/default?".
+
+    Reads the StockItemSuppliers table (Inventory/GetStockSupplierStat). This
+    is the per-item link table that purchase ordering and supplier reporting
+    key off — `get_sales_by_supplier` attributes sales via the IsDefault row
+    here. It is distinct from `get_suppliers` (the global supplier list, no
+    per-item association) and from the flat `purchase_price` on the item.
+
+    An item with zero rows is invisible to supplier-keyed exports and restock
+    tooling — use `set_inventory_item_suppliers` to attach one.
+
+    Args:
+        sku: Exact SKU / ItemNumber of the item.
+
+    Returns:
+        A dict with:
+          - sku, stock_item_id, title
+          - supplier_count:   number of supplier links
+          - default_supplier: name of the IsDefault row (None if none is default)
+          - suppliers: rows with supplier, supplier_id, code, barcode,
+            purchase_price, lead_time, min_order_qty, pack_size, currency,
+            is_default
+    """
+    stock_item_id = _resolve_sku_to_id(sku)
+    item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+    rows = call_linnworks_get(
+        "Inventory/GetStockSupplierStat", params={"inventoryItemId": stock_item_id}
+    )
+    rows = rows if isinstance(rows, list) else []
+    suppliers = [
+        {
+            "supplier":       r.get("Supplier"),
+            "supplier_id":    r.get("SupplierID"),
+            "code":           r.get("Code"),
+            "barcode":        r.get("SupplierBarcode"),
+            "purchase_price": r.get("PurchasePrice"),
+            "lead_time":      r.get("LeadTime"),
+            "min_order_qty":  r.get("SupplierMinOrderQty"),
+            "pack_size":      r.get("SupplierPackSize"),
+            "currency":       r.get("SupplierCurrency"),
+            "is_default":     bool(r.get("IsDefault")),
+        }
+        for r in rows
+    ]
+    default_row = next((s for s in suppliers if s["is_default"]), None)
+    return {
+        "sku":              sku,
+        "stock_item_id":    stock_item_id,
+        "title":            item.get("ItemTitle"),
+        "supplier_count":   len(suppliers),
+        "default_supplier": default_row["supplier"] if default_row else None,
+        "suppliers":        suppliers,
+    }
+
+
+# Fields a caller may set on a supplier link, mapped to the Linnworks
+# StockItemSupplierStat field they write. Used by set_inventory_item_suppliers.
+_SUPPLIER_LINK_FIELDS = {
+    "supplier_code": "Code",
+    "cost":          "PurchasePrice",
+    "is_default":    "IsDefault",
+    "lead_time":     "LeadTime",
+    "min_order_qty": "SupplierMinOrderQty",
+    "pack_size":     "SupplierPackSize",
+    "barcode":       "SupplierBarcode",
+    "currency":      "SupplierCurrency",
+}
+
+
+@mcp.tool()
+def set_inventory_item_suppliers(
+    links: list[dict],
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Add or update purchasable supplier links on inventory items — "this item
+    can be bought from supplier X, under code Y, at cost Z".
+
+    Upserts the StockItemSuppliers table keyed by (item, supplier): an existing
+    link for that supplier is UPDATED (only the fields you pass change — the
+    tool reads the current row first and carries every other field through,
+    because Linnworks CLEARS any field omitted from an update); a new supplier
+    gets a CREATED link. Existing links to other suppliers are never touched,
+    except that Linnworks itself auto-flips the previous default row to
+    IsDefault=false when a new default is written (live-confirmed).
+
+    The supplier is matched by name (case-insensitive) against the configured
+    supplier list (`get_suppliers`) — a supplier GUID is also accepted. An
+    unknown supplier becomes a per-item error row; it never sinks the batch.
+
+    Why this matters: purchase ordering and supplier reporting key off this
+    table — `get_sales_by_supplier` attributes sales via the IsDefault link, so
+    an item with no default supplier link is invisible to supplier-keyed
+    exports and restock tooling. Give an item's primary supplier
+    is_default=True.
+
+    For batches larger than 50 links this tool requires confirmed_count=<N>.
+
+    Args:
+        links: List of dicts, each with:
+            - sku (str):            Item SKU  [required]
+            - supplier (str):       Supplier name (case-insensitive) or GUID  [required]
+            - supplier_code (str):  The supplier's own SKU/code for this item
+            - cost (float):         Purchase price from this supplier
+            - is_default (bool):    Make this the primary supplier (see above)
+            - lead_time (int):      Lead time in days
+            - min_order_qty (int):  Minimum order quantity
+            - pack_size (int):      Supplier pack size
+            - barcode (str):        Supplier barcode
+            - currency (str):       Supplier currency (e.g. "GBP")
+          Only sku and supplier are required; on update, omitted fields keep
+          their current values.
+        confirmed_count: For batches > 50, pass len(links) here.
+        dry_run: If True (default), returns the manifest without writing.
+
+    Returns:
+        A dict with:
+          - dry_run, item_count
+          - manifest: per-link preview (action create/update, old vs new values)
+          - results:  per-link outcome incl. read-back verification (live only)
+          - created / updated / errors counts (live only)
+    """
+    # ── Validate + injection check ────────────────────────────────────────────
+    for i, l in enumerate(links):
+        if not l.get("sku"):
+            raise ValueError(f"links[{i}] is missing 'sku'.")
+        if not l.get("supplier"):
+            raise ValueError(f"links[{i}] (SKU '{l.get('sku')}') is missing 'supplier'.")
+        for field in ("supplier", "supplier_code", "barcode", "currency"):
+            _check_injection(field, str(l.get(field) or ""))
+
+    # ── Resolve supplier names → GUIDs (one catalogue fetch) ──────────────────
+    supplier_rows = get_suppliers().get("suppliers", [])
+    by_name = {(s.get("name") or "").strip().lower(): s for s in supplier_rows}
+    by_id   = {(s.get("supplier_id") or "").lower(): s for s in supplier_rows}
+
+    sku_cache: dict[str, str] = {}
+    existing_stats: dict[str, list] = {}
+
+    # ── Read existing + build manifest ────────────────────────────────────────
+    manifest = []
+    for l in links:
+        sku = l["sku"].strip()
+        sup_input = str(l["supplier"]).strip()
+        sup = by_name.get(sup_input.lower()) or by_id.get(sup_input.lower())
+        if sup is None:
+            manifest.append({
+                "sku": sku, "supplier": sup_input,
+                "error": (
+                    f"supplier '{sup_input}' not found in the configured supplier "
+                    f"list — see get_suppliers. Known: "
+                    f"{sorted(s.get('name') or '' for s in supplier_rows)}"
+                ),
+            })
+            continue
+
+        try:
+            stock_item_id = _resolve_sku_to_id(sku, sku_cache)
+        except ValueError as exc:
+            manifest.append({"sku": sku, "supplier": sup["name"], "error": str(exc)})
+            continue
+
+        if stock_item_id not in existing_stats:
+            rows = call_linnworks_get(
+                "Inventory/GetStockSupplierStat",
+                params={"inventoryItemId": stock_item_id},
+            )
+            existing_stats[stock_item_id] = rows if isinstance(rows, list) else []
+
+        match = next(
+            (r for r in existing_stats[stock_item_id]
+             if (r.get("SupplierID") or "").lower() == (sup["supplier_id"] or "").lower()),
+            None,
+        )
+
+        changes = {
+            api_field: l[user_field]
+            for user_field, api_field in _SUPPLIER_LINK_FIELDS.items()
+            if user_field in l and l[user_field] is not None
+        }
+        manifest.append({
+            "sku":           sku,
+            "stock_item_id": stock_item_id,
+            "supplier":      sup["name"],
+            "supplier_id":   sup["supplier_id"],
+            "action":        "update" if match else "create",
+            "old":           {
+                "code":           match.get("Code"),
+                "purchase_price": match.get("PurchasePrice"),
+                "is_default":     match.get("IsDefault"),
+            } if match else None,
+            "changes":       changes,
+            "_existing_row": match,
+        })
+
+    # ── Write guard ───────────────────────────────────────────────────────────
+    public_manifest = [{k: v for k, v in m.items() if k != "_existing_row"} for m in manifest]
+    guard = _write_guard("set_inventory_item_suppliers", links, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, "manifest": public_manifest}
+
+    if dry_run:
+        return {
+            "dry_run":    True,
+            "item_count": len(links),
+            "manifest":   public_manifest,
+            "message":    "Dry run — no supplier links changed. Set dry_run=False to execute.",
+        }
+
+    # ── Live execution (Create/Update return 204 No Content → void calls) ─────
+    results = []
+    created = updated = errors = 0
+    touched_ids: dict[str, str] = {}  # stock_item_id -> sku (for read-back)
+
+    for m in manifest:
+        if m.get("error"):
+            errors += 1
+            results.append({"sku": m["sku"], "supplier": m.get("supplier"),
+                            "action": "error", "error": m["error"]})
+            continue
+
+        if m["action"] == "update":
+            # Carry the FULL existing row and overlay only the requested changes —
+            # Linnworks clears any field omitted from UpdateStockSupplierStat.
+            row = dict(m["_existing_row"])
+            row.pop("StockItemIntId", None)
+            row.update(m["changes"])
+            row["StockItemId"] = m["stock_item_id"]
+            row["SupplierID"]  = m["supplier_id"]
+            endpoint = "Inventory/UpdateStockSupplierStat"
+        else:
+            row = {
+                "StockItemId": m["stock_item_id"],
+                "SupplierID":  m["supplier_id"],
+                "Supplier":    m["supplier"],
+                **m["changes"],
+            }
+            endpoint = "Inventory/CreateStockSupplierStat"
+
+        try:
+            call_linnworks_void(endpoint, {"itemSuppliers": [row]})
+        except RuntimeError as exc:
+            errors += 1
+            results.append({"sku": m["sku"], "supplier": m["supplier"],
+                            "action": "error", "error": str(exc)})
+            continue
+
+        touched_ids[m["stock_item_id"]] = m["sku"]
+        if m["action"] == "update":
+            updated += 1
+        else:
+            created += 1
+        results.append({
+            "sku": m["sku"], "supplier": m["supplier"], "action": f"{m['action']}d",
+        })
+
+    # ── Read back after write ─────────────────────────────────────────────────
+    read_back = {}
+    for sid, sku in touched_ids.items():
+        rows = call_linnworks_get(
+            "Inventory/GetStockSupplierStat", params={"inventoryItemId": sid}
+        )
+        read_back[sku] = [
+            {"supplier": r.get("Supplier"), "code": r.get("Code"),
+             "purchase_price": r.get("PurchasePrice"), "is_default": r.get("IsDefault")}
+            for r in (rows if isinstance(rows, list) else [])
+        ]
+
+    return {
+        "dry_run":    False,
+        "item_count": len(links),
+        "created":    created,
+        "updated":    updated,
+        "errors":     errors,
+        "results":    results,
+        "read_back":  read_back,
+        "manifest":   public_manifest,
     }
 
 
