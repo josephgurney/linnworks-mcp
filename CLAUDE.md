@@ -2,6 +2,58 @@
 
 **Current version: 1.27.1** — 75 tools. See `pyproject.toml` for full metadata.
 
+---
+
+## ⚠️ Assumptions to check on ANY new Linnworks endpoint (read first)
+
+Linnworks is a decade of accreted legacy — the same class of quirk resurfaces on
+endpoint after endpoint. Before trusting a new endpoint, and ESPECIALLY before a
+live write, run down this list. Every item here has already cost this project a
+real debugging session; each is expanded with its evidence somewhere below.
+
+1. **Current data or a stored/cached copy?** — The single highest-value question.
+   Many endpoints operate on a *snapshot*, not live state: GLT `ProcessTemplates`
+   pushes the template's stored fields (stale unless rebuilt in the UI — v1.27.1);
+   `GetStockItemsFullByIds` returns empty `Suppliers[]` unless you pass
+   `DataRequirements:[1]`; archived items are invisible to every list/search
+   endpoint. Ask what the endpoint reads from before believing its output.
+2. **2xx ≠ the right thing happened.** — A success status only means the call was
+   accepted. GLT returned 2xx while pushing 5-month-old prices to the live store.
+   Read back against the REAL surface (the Shopify listing, a fresh GET), not just
+   the write's return value. This is why read-before-write + read-back is
+   non-negotiable on write tools.
+3. **Does UPDATE clear fields you omit?** — Many updates overwrite the whole record
+   with what you send, nulling anything absent: `UpdateInventoryItem`,
+   `Update_PurchaseOrderHeader`, `UpdateCategory`, `UpdateStockSupplierStat`. Read
+   the existing row first and carry every field through, overlaying only changes.
+4. **Wrapped `{"request":{…}}` or unwrapped?** — No consistent rule, and getting it
+   wrong often FAILS SILENTLY: OpenOrders `GetOrdersLowFidelity` needs the wrapper;
+   `SearchOrders` and `Search_PurchaseOrders2` must be UNWRAPPED (the wrapper is
+   accepted but ignores all filters / 400s "must provide a search term").
+5. **How is success signalled?** — Some endpoints return an empty 2xx body, some a
+   204 (use `call_linnworks_void`), some a non-JSON 2xx string
+   (`Create/UpdateInventoryItemExtendedProperties`). `call_linnworks` tolerates all
+   three now, but confirm which you're dealing with.
+6. **Query-string array shape.** — Repeated params, comma-join, and JSON-array-string
+   are NOT interchangeable: `GetStockSupplierStatsBulk` only accepts
+   `?inventoryItemIds=["guid","guid"]` (a JSON string); the other two 400.
+7. **Active-only or includes archived?** — `GetStockItems`, `GetStockItemsFull` and
+   friends silently return active stock only (~32k of ~93k here). "Not found" can
+   mean "archived", not "doesn't exist".
+8. **A 404 may be the wrong NAME, not a missing capability.** — `GetStockSupplierStat`
+   existed for years while `GetInventoryItemSupplierStat`/`GetInventoryItemSuppliers`
+   404'd. Before declaring something impossible, `grep -i <noun>` the relevant spec
+   file (`inventory.json`, `stock.json`, …) for the real name.
+9. **Client-generated GUID or server-minted?** — Sub-entity `Create*` endpoints
+   (prices, descriptions, titles, ext-props) need a client `pkRowId`; `AddInventoryItem`
+   needs a client `StockItemId`; but `CreateCategory` and `CreateStockSupplierStat`
+   mint the id server-side. Omitting a required one → PK-collision 400.
+
+Prefer endpoint families already proven in this tenant (see the confirmed-endpoints
+table). When in doubt, dry-run and read back before trusting anything.
+
+---
+
 > **v1.27.1 — ⚠️ `ProcessTemplates Update` LIVE-RUN for the first time: it pushes a STALE TEMPLATE SNAPSHOT, not current item data (14 Jul 2026):** The first live revise (catnip parent tpl 39076, the issue-#26 fix) **updated the live Shopify listing with the template's STORED field values, frozen at its `LastModificationTime` (2026-02-16)** — it overwrote the current £89.95 selling price with the template's stale £79.95 on all 6 variants and left compare-at at the stale £94.95 (the `special_price`=99.95 edit never reached the template body). **GLT's `NextSuggestedAction:"Update"` does NOT mean the template body is fresh** — it only means GLT knows a change is pending; the UI listing screen evidently rebuilds template fields on open, but the API path (`OpenTemplatesByInventory` → `ProcessTemplates`) does NOT refresh them. **Remediation (same session):** selling price £89.95 + compare-at £99.95 restored on all 6 variants directly via the Shopify Admin API (`productVariantsBulkUpdate` — the SWH Shopify MCP), verified by read-back; exposure window ~15 min at £79.95. A Linnworks-side re-push via `set_inventory_item_prices` was also queued (same value, harmless when it lands). **Net state: catnip bundle now shows exactly what issue #26 wanted** (89.95 / was 99.95) — but achieved via Shopify direct, not the GLT. **Consequences:** `refresh_channel_listing`'s docstring + live-run message now carry a stale-snapshot hazard warning (only live-run a template known to be fresh; read the live listing back after EVERY push); the variation-fallback selection logic from v1.26.0 is UNCHANGED and correct (right template found, action accepted, listing updated — the defect is upstream in what GLT pushes). **Open lead:** `GenericListings/SaveTemplateFields` (`{"request":{ChannelType,ChannelName,TemplateId,"FieldsToSave":{key:value}}}`) exists and could write fresh values into the template before processing, but its field-key format is undocumented — deliberately NOT probed against a live template; filed as a follow-up issue. No tool count change; tests unaffected (186 green).
 
 > **v1.27.1 addendum — #27 investigation: NO public-API path can refresh a variation template's fields (live-probed 14 Jul 2026):** Four experiments, all against the catnip test bed: (1) **`ProcessTemplates Revise` behaves identically to `Update`** — it pushed the same stale Feb-2026 snapshot (price → 79.95 again); no rebuild semantics. (2) That second push also **proved compare-at IS included in a revise** (the template's stale 94.95 overwrote the live 99.95) — so a FRESH template would deliver the strikethrough correctly; template freshness is the sole blocker, not the `IsProductCreationOnly` flag on the configurator's `compare_at_price` attribute. (3) **`CreateTemplates` on an already-listed item does NOT adopt/rebuild** — it mints a NEW UNLINKED template (Status "Not listed", no ActiveListingId, NextSuggestedAction "Create"; pushing it would duplicate the listing — the #18 dedupe assumption is now empirically confirmed). The orphan was safely removed with `ProcessTemplates Delete` (on an unlinked template it deletes just the template; live listing untouched — verified). (4) **`SaveTemplateFields` validates `FieldsToSave` keys against the `ShopifyTemplateProperties` model** — top-level scalars `Price`/`Title` are accepted, but `Variations`/`Attributes`/`Description`/`compare_at_price`/`special_price` are all rejected ("Property is not found by info key …"), so **per-variant price/compare-at cannot be written into a template via the public API.** Also useful: `GetConfiguratorData` `DataKey:"Attributes"` dumps a configurator's field mappings (confirmed conf 129 maps `compare_at_price` ← `special_price`, per-variant). ⇒ **#27 is blocked for variation listings**; the working fixes for stale-template variants are the Shopify Admin API (proven: catnip repaired twice, final state 89.95/compare-at 99.95) or the Linnworks UI (which rebuilds fields on open). Listing was re-repaired and the sandbox template cleaned up in-session; net tenant state is correct. **Outcome (same day): ALL 84 bundle variants across all 14 Shopify products were fixed via the Shopify Admin API** (13 products in one aliased `productVariantsBulkUpdate` sweep + catnip) — every variant read back at price £89.95 / compare_at £99.95; the #26 repricing is fully live. **⚠️ STANDING WARNING: those 14 GLT templates (incl. catnip tpl 39076) STILL hold the stale Feb-2026 snapshot (price 79.95 / compare-at 94.95).** Any future `ProcessTemplates Update`/`Revise` on them — via `refresh_channel_listing` OR the GLT bulk actions — will revert the live listings to those values. Before any GLT revise of a `vnm-*-bundle` listing, open it in the Linnworks GLT UI first (which rebuilds the template fields), or re-check the live listing immediately after.
