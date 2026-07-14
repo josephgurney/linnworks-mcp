@@ -9399,9 +9399,18 @@ def refresh_channel_listing(
     Revise is allowed, are reported in `unresolved` rather than force-pushed.
 
     ⚠️  A live run (dry_run=False) changes REAL customer-facing Shopify listings.
-    The read/selection path (channel check + OpenTemplatesByInventory) is
-    live-confirmed; the ProcessTemplates revise push is built to the OpenAPI spec
-    but NOT yet live-exercised in this tenant — start with a single SKU.
+
+    ⚠️⚠️  STALE-SNAPSHOT HAZARD (live-proven 14 Jul 2026): ProcessTemplates
+    Update pushes the template's STORED field snapshot, NOT the item's current
+    data. A template whose fields were last built months ago (see
+    `LastModificationTime` on the open template) will push those old values —
+    a live run on tpl 39076 overwrote the current £89.95 selling price with
+    the template's stale £79.95 and left the stale compare-at in place, and
+    the storefront had to be repaired. GLT's `NextSuggestedAction: "Update"`
+    does NOT mean the template body is fresh. Until a template-field refresh
+    step exists in this tool, only live-run a template you know is fresh (the
+    UI listing screen rebuilds fields on open; the API path does not), and
+    read the live listing back immediately after every push.
 
     For batches larger than 25 SKUs this tool stages: it returns the plan and asks
     you to confirm with confirmed_count=<N> before executing.
@@ -9756,9 +9765,10 @@ def refresh_channel_listing(
         "results": results,
         "message": (
             f"{pushed}/{len(plan)} Shopify listing(s) on '{sub_source}' revised and pushed. "
-            "ProcessTemplates returns no body, so success is inferred from a 2xx — verify the "
-            "updated values in your Shopify admin / the Linnworks GLT. Per-item errors are in "
-            "results[].error."
+            "ProcessTemplates returns no body, so success is inferred from a 2xx — READ THE LIVE "
+            "LISTING BACK NOW: the push sends the template's STORED field snapshot, which can be "
+            "stale and overwrite current prices/content (live-proven 14 Jul 2026). Per-item "
+            "errors are in results[].error."
         ),
     }
 
