@@ -859,6 +859,7 @@ def _resolve_variation(sku: str, stock_item_id: str) -> dict:
             "role": "parent",
             "group_name": group.get("VariationGroupName"),
             "parent_sku": sku,
+            "parent_stock_item_id": stock_item_id,
             "children": [_format_variation_member(m) for m in members],
             "siblings": [],
             "reverse_lookup_confirmed": True,
@@ -887,6 +888,10 @@ def _resolve_variation(sku: str, stock_item_id: str) -> dict:
                     "role": "child",
                     "group_name": cand.get("VariationGroupName"),
                     "parent_sku": cand.get("VariationSKU"),
+                    # The parent's StockItemId IS the group's pkVariationItemId
+                    # (confirmed live, issue #17) — carried so callers can reach
+                    # the parent without a second SKU resolution.
+                    "parent_stock_item_id": cand.get("pkVariationItemId"),
                     "children": [],
                     "siblings": [
                         r for r in member_rows
@@ -9081,6 +9086,22 @@ def refresh_channel_listing(
       4. (live run) GenericListings/ProcessTemplates with the revise action →
          pushes the current item data to the live Shopify listing.
 
+    Variation groups (issue #26): GLT variation listings hang off the variation
+    PARENT — the parent holds the template (and usually no channel-SKU row),
+    the children hold the channel-SKU mappings (and no templates). Both
+    directions are handled automatically:
+      - Passing CHILD SKUs: a child with no template of its own falls back to
+        its variation parent's template (`via_variation_parent: true` in the
+        plan). Several children of one group dedupe to ONE parent-template push
+        (`covers_skus` lists the inputs it covers). Revising the parent
+        template pushes ALL variants of the multi-variant Shopify product.
+      - Passing the PARENT SKU: it counts as listed when any of its children is
+        mapped on the store (`listed_via_children` in the plan).
+    This is how a Shopify "Compare at price" (compare_at_price, mapped from the
+    `special_price` extended property) is pushed for variant listings: update
+    `special_price` on the children, then refresh — the parent-template revise
+    carries the new compare-at to the live listing.
+
     Action selection (per template, data-driven):
       - action=None (default, "auto"): use the template's own
         `NextSuggestedAction` when GLT marks it allowed — this is the action the
@@ -9113,9 +9134,11 @@ def refresh_channel_listing(
         A dict with:
           - dry_run, item_count, target_sub_source, target_channel_id,
             available_sub_sources
-          - plan: per-SKU rows that would be revised (sku, stock_item_id, title,
-            template_id, configurator_id, active_listing_id, status, action,
-            next_suggested_action, is_allowed_to_revise)
+          - plan: per-TEMPLATE rows that would be revised (sku, stock_item_id,
+            title, template_id, configurator_id, active_listing_id, status,
+            action, next_suggested_action, is_allowed_to_revise, covers_skus;
+            plus via_variation_parent / listed_via_children where a variation
+            group was resolved). Deduped: inputs sharing one template = one row.
           - unresolved: per-SKU error rows (not found / not listed on the store /
             no template / locked / no allowed revise action)
           - results: per-SKU push outcome (live run only)
@@ -9150,8 +9173,46 @@ def refresh_channel_listing(
         }
 
     # ── Resolve each SKU + confirm it's listed on the target store ────────────
+    # Variation blind spot (issue #26): GLT variation listings hang off the
+    # variation PARENT — the parent holds the template but usually has NO
+    # channel-SKU row of its own, while the children hold the channel-SKU
+    # mappings but NO templates. Both directions are handled below:
+    #   - a parent SKU counts as "listed" when any of its CHILDREN is mapped
+    #     on the target store;
+    #   - a child SKU with no template of its own falls back to its PARENT's
+    #     template (see the plan build).
+    # _variation_cache memoises child->parent lookups per tool call; a confirmed
+    # group also seeds every sibling, so a batch of N children in one group
+    # costs ONE SearchVariationGroups sweep, not N.
     resolved: list[dict] = []
     unresolved: list[dict] = []
+    _variation_cache: dict[str, dict | None] = {}
+
+    def _parent_of_child(child_sku: str, child_sid: str) -> dict | None:
+        """Child SKU -> {'parent_sku','parent_sid'} via the variation table, or None."""
+        key = child_sku.strip().lower()
+        if key in _variation_cache:
+            return _variation_cache[key]
+        rel = _resolve_variation(child_sku, child_sid)
+        entry = None
+        if rel.get("role") == "child" and rel.get("parent_stock_item_id"):
+            entry = {
+                "parent_sku": rel.get("parent_sku"),
+                "parent_sid": rel.get("parent_stock_item_id"),
+            }
+            for sib in rel.get("siblings", []):
+                if sib.get("sku"):
+                    _variation_cache[sib["sku"].strip().lower()] = entry
+        _variation_cache[key] = entry
+        return entry
+
+    def _rows_on_store(rows: list) -> list:
+        return [
+            r for r in (rows if isinstance(rows, list) else [])
+            if _norm_conf_name(r.get("Source")) == _norm_conf_name(GLT_SHOPIFY_CHANNEL_NAME)
+            and _norm_conf_name(r.get("SubSource")) == _norm_conf_name(sub_source)
+        ]
+
     for raw in skus:
         sku = (raw or "").strip()
         if not sku:
@@ -9177,21 +9238,35 @@ def refresh_channel_listing(
                 "error": f"could not read channel listings: {exc}",
             })
             continue
-        on_store = [
-            r for r in (rows if isinstance(rows, list) else [])
-            if _norm_conf_name(r.get("Source")) == _norm_conf_name(GLT_SHOPIFY_CHANNEL_NAME)
-            and _norm_conf_name(r.get("SubSource")) == _norm_conf_name(sub_source)
-        ]
-        if not on_store:
-            unresolved.append({
-                "sku": sku, "stock_item_id": sid, "title": title,
-                "error": (
-                    f"not listed on Shopify store '{sub_source}' — "
-                    "use list_to_shopify to create it first"
-                ),
-            })
+        if _rows_on_store(rows):
+            resolved.append({"sku": sku, "stock_item_id": sid, "title": title})
             continue
-        resolved.append({"sku": sku, "stock_item_id": sid, "title": title})
+
+        # Not mapped itself — a variation PARENT is still revisable when its
+        # children carry the store mapping (the template lives on the parent).
+        rel = _resolve_variation(sku, sid)
+        if rel.get("role") == "parent" and rel.get("children"):
+            child_map = _fetch_channel_skus_for_ids(
+                [c["stock_item_id"] for c in rel["children"] if c.get("stock_item_id")]
+            )
+            listed_children = [
+                c["sku"] for c in rel["children"]
+                if _rows_on_store(child_map.get((c.get("stock_item_id") or "").lower(), []))
+            ]
+            if listed_children:
+                resolved.append({
+                    "sku": sku, "stock_item_id": sid, "title": title,
+                    "listed_via_children": listed_children,
+                })
+                continue
+
+        unresolved.append({
+            "sku": sku, "stock_item_id": sid, "title": title,
+            "error": (
+                f"not listed on Shopify store '{sub_source}' — "
+                "use list_to_shopify to create it first"
+            ),
+        })
 
     # ── Open the existing GLT templates for the resolved items (read) ──────────
     templates_by_sid: dict[str, dict] = {}
@@ -9217,16 +9292,70 @@ def refresh_channel_listing(
             if tsid:
                 templates_by_sid[tsid.lower()] = t
 
+    # ── Variation-child fallback: no own template → use the PARENT's template ──
+    # A child mapped on the store but with no template of its own inherits its
+    # variation parent's template (the multi-variant Shopify product is managed
+    # there). Revising the parent template pushes ALL variants of the listing.
+    child_fallback: dict[str, dict] = {}  # input sku (lower) -> {parent_sku, parent_sid}
+    parent_sids_to_open: list[str] = []
+    for r in resolved:
+        if r["stock_item_id"].lower() in templates_by_sid or "listed_via_children" in r:
+            continue
+        entry = _parent_of_child(r["sku"], r["stock_item_id"])
+        if entry and entry.get("parent_sid"):
+            child_fallback[r["sku"].strip().lower()] = entry
+            if entry["parent_sid"].lower() not in templates_by_sid:
+                parent_sids_to_open.append(entry["parent_sid"])
+    parent_sids_to_open = list(dict.fromkeys(parent_sids_to_open))
+    for i in range(0, len(parent_sids_to_open), 200):
+        chunk = parent_sids_to_open[i:i + 200]
+        resp = call_linnworks(
+            "GenericListings/OpenTemplatesByInventory",
+            {"request": {
+                "ChannelType": GLT_SHOPIFY_CHANNEL_TYPE,
+                "ChannelName": GLT_SHOPIFY_CHANNEL_NAME,
+                "Parameters": {
+                    "SelectedRegions":  [],
+                    "Token":            _ZERO_GUID,
+                    "InventoryItemIds": chunk,
+                    "ChannelId":        target_channel_id,
+                },
+                "PaginationParameters": {"PageNumber": 1, "EntriesPerPage": max(len(chunk), 1)},
+            }},
+        )
+        for t in (resp.get("TemplatesInfo") if isinstance(resp, dict) else None) or []:
+            tsid = t.get("StockItemId")
+            if tsid:
+                templates_by_sid[tsid.lower()] = t
+
     # ── Build the plan, deciding the push action per template ─────────────────
+    # Deduped by template: several input SKUs (e.g. all children of one
+    # variation group) resolving to the SAME template become ONE push, with the
+    # covered inputs listed in covers_skus.
     plan: list[dict] = []
+    plan_by_template: dict = {}
     for r in resolved:
         t = templates_by_sid.get(r["stock_item_id"].lower())
+        via_parent = None
+        if not t:
+            via_parent = child_fallback.get(r["sku"].strip().lower())
+            if via_parent and via_parent.get("parent_sid"):
+                t = templates_by_sid.get(via_parent["parent_sid"].lower())
         if not t:
             unresolved.append({
                 **r,
-                "error": "listed on the channel but no GLT template could be opened for it",
+                "error": (
+                    "listed on the channel but no GLT template could be opened "
+                    "for it (checked the item and its variation parent)"
+                ),
             })
             continue
+
+        existing = plan_by_template.get(t.get("Id"))
+        if existing is not None:
+            existing["covers_skus"].append(r["sku"])
+            continue
+
         if t.get("IsLocked"):
             unresolved.append({
                 **r, "template_id": t.get("Id"),
@@ -9252,9 +9381,9 @@ def refresh_channel_listing(
             continue
 
         info = t.get("Info") if isinstance(t.get("Info"), dict) else {}
-        plan.append({
-            "sku":                   r["sku"],
-            "stock_item_id":         r["stock_item_id"],
+        row = {
+            "sku":                   via_parent["parent_sku"] if via_parent else r["sku"],
+            "stock_item_id":         via_parent["parent_sid"] if via_parent else r["stock_item_id"],
             "title":                 r["title"],
             "template_id":           t.get("Id"),
             "configurator_id":       t.get("ConfiguratorId"),
@@ -9263,7 +9392,14 @@ def refresh_channel_listing(
             "action":                chosen_action,
             "next_suggested_action": next_action,
             "is_allowed_to_revise":  can_revise,
-        })
+            "covers_skus":           [r["sku"]],
+        }
+        if via_parent:
+            row["via_variation_parent"] = True
+        if "listed_via_children" in r:
+            row["listed_via_children"] = r["listed_via_children"]
+        plan.append(row)
+        plan_by_template[t.get("Id")] = row
 
     base_out = {
         "item_count":            len(skus),
