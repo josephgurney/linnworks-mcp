@@ -347,6 +347,8 @@ WRITE_THRESHOLDS: dict[str, int] = {
     "set_inventory_item_titles":      50,   # channel title overrides, lower blast radius
     "set_inventory_item_suppliers":   50,   # purchasing metadata, lower blast radius
     "add_inventory_item_images":      100,  # additive-only, no overwrites
+    "delete_inventory_item_images":   10,   # IRREVERSIBLE — removes images from an item
+    "set_inventory_item_image_order": 25,   # reorders images; main image = storefront hero
     "delete_inventory_item":          10,   # IRREVERSIBLE — lowest threshold of all
     "list_to_shopify":                25,   # creates live customer-facing channel listings
     "refresh_channel_listing":        25,   # re-pushes live customer-facing channel listings
@@ -8946,6 +8948,434 @@ def get_inventory_item_images_bulk(skus: list[str]) -> dict:
         "without_image_count": len(resolved) - with_image,
         "results":            results,
         "unresolved":         unresolved,
+    }
+
+
+def _fetch_raw_images(stock_item_id: str) -> list[dict]:
+    """Fetch one item's RAW image rows (Inventory/GetInventoryItemImages).
+
+    The image write tools need the untouched `StockItemImage` records — not the
+    trimmed shape `_format_image_row` produces — because `Inventory/UpdateImages`
+    overwrites the whole row and clears any field omitted from it (the same
+    nulls-clear behaviour as UpdateInventoryItem / UpdateStockSupplierStat).
+    Carrying the raw row through is what preserves the checksum fields.
+    """
+    rows = call_linnworks_get(
+        "Inventory/GetInventoryItemImages",
+        {"inventoryItemId": stock_item_id},
+    )
+    return rows if isinstance(rows, list) else []
+
+
+def _image_simple_row(raw: dict, stock_item_id: str) -> dict:
+    """Build a StockItemImageSimple payload row from a raw image record.
+
+    Carries every field the model defines so an update never blanks one. Note
+    the GET returns the checksum as `CheckSumValue` while the Simple model that
+    UpdateImages consumes spells it `ChecksumValue` — both are populated from
+    whichever the read supplied.
+    """
+    checksum = raw.get("ChecksumValue") or raw.get("CheckSumValue")
+    return {
+        "pkRowId":        raw.get("pkRowId"),
+        "IsMain":         bool(raw.get("IsMain")),
+        "SortOrder":      raw.get("SortOrder"),
+        "ChecksumValue":  checksum,
+        "RawChecksum":    raw.get("RawChecksum"),
+        "StockItemId":    stock_item_id,
+        "StockItemIntId": raw.get("StockItemIntId"),
+    }
+
+
+@mcp.tool()
+def delete_inventory_item_images(
+    sku: str,
+    image_ids: list[str],
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Delete one or more images from an inventory item — the corrective counterpart
+    to `add_inventory_item_images`.
+
+    Use this when an image on an item is wrong: a bad colourway, a watermarked
+    source, or the same picture added twice. Until now the only fix was editing
+    the item by hand in the Linnworks UI.
+
+    IRREVERSIBLE — a deleted image row is gone; re-adding means calling
+    `add_inventory_item_images` with the original URL again. Batches of more than
+    10 images require confirmed_count=len(image_ids).
+
+    Read-before-write: the item's current images are read first, so the manifest
+    shows exactly which image (with its URL and main/sort flags) each id refers
+    to. An id that isn't on the item is reported in `unresolved` and skipped —
+    it never blocks the ids that are valid. After the write the images are read
+    back to confirm each one is gone.
+
+    Args:
+        sku: The exact SKU / ItemNumber whose images should be deleted.
+        image_ids: Image ids to remove (the `image_id` field returned by
+            `get_inventory_item_images` — call that first to pick them).
+        confirmed_count: For batches > 10, pass len(image_ids) here.
+        dry_run: If True (default), returns the manifest without deleting.
+            Set to False to execute.
+
+    Returns:
+        A dict with:
+          - sku, stock_item_id, dry_run, item_count
+          - manifest:        per-id preview of the image that would be deleted
+          - unresolved:      ids not present on this item (skipped)
+          - deleted:         ids confirmed gone by the read-back (live run only)
+          - still_present:   ids the read-back still finds (live run only)
+          - remaining_count: images left on the item after the delete (live run)
+          - images:          the item's remaining images (live run only)
+    """
+    if not image_ids:
+        raise ValueError("image_ids is empty — nothing to delete.")
+
+    try:
+        item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+    except RuntimeError:
+        return {"error": f"No inventory item found for SKU '{sku}'", "sku": sku}
+
+    stock_item_id = item.get("StockItemId")
+    if not stock_item_id:
+        return {"error": f"Item found for SKU '{sku}' but StockItemId was missing", "sku": sku}
+
+    # ── Read before write ─────────────────────────────────────────────────────
+    current = {
+        (r.get("pkRowId") or "").lower(): r
+        for r in _fetch_raw_images(stock_item_id)
+    }
+
+    manifest, unresolved, to_delete = [], [], []
+    for img_id in image_ids:
+        raw = current.get((img_id or "").strip().lower())
+        if raw is None:
+            unresolved.append({
+                "image_id": img_id,
+                "error":    f"Image id '{img_id}' is not on SKU '{sku}' — skipped.",
+            })
+            continue
+        to_delete.append(raw.get("pkRowId"))
+        manifest.append({
+            **_format_image_row(raw),
+            "action": "delete",
+        })
+
+    if not to_delete:
+        return {
+            "sku":            sku,
+            "stock_item_id":  stock_item_id,
+            "dry_run":        dry_run,
+            "item_count":     len(image_ids),
+            "manifest":       manifest,
+            "unresolved":     unresolved,
+            "message":        "None of the given image ids are on this item — nothing to delete.",
+        }
+
+    # ── Write guard ───────────────────────────────────────────────────────────
+    guard = _write_guard("delete_inventory_item_images", to_delete, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, "sku": sku, "manifest": manifest, "unresolved": unresolved}
+
+    if dry_run:
+        return {
+            "sku":           sku,
+            "stock_item_id": stock_item_id,
+            "dry_run":       True,
+            "item_count":    len(to_delete),
+            "manifest":      manifest,
+            "unresolved":    unresolved,
+            "message":       (
+                f"Dry run — no images deleted. {len(to_delete)} image(s) would be "
+                f"removed from '{sku}'. Set dry_run=False to execute."
+            ),
+        }
+
+    # ── Live execution ────────────────────────────────────────────────────────
+    # DeleteInventoryItemImageBulk (not DeleteImagesFromInventoryItem, which
+    # keys off image URLs) — this one takes image ids, matching what
+    # get_inventory_item_images hands back.
+    resp = call_linnworks(
+        "Inventory/DeleteInventoryItemImageBulk",
+        {"request": [{
+            "InventoryItemId": stock_item_id,
+            "ItemNumber":      sku,
+            "ImageIds":        to_delete,
+        }]},
+    )
+
+    # ── Read back ─────────────────────────────────────────────────────────────
+    remaining = _fetch_raw_images(stock_item_id)
+    remaining_ids = {(r.get("pkRowId") or "").lower() for r in remaining}
+    deleted       = [i for i in to_delete if (i or "").lower() not in remaining_ids]
+    still_present = [i for i in to_delete if (i or "").lower() in remaining_ids]
+
+    images = [_format_image_row(r) for r in remaining]
+    images.sort(key=lambda im: (im["sort_order"] if im["sort_order"] is not None else 0))
+
+    return {
+        "sku":             sku,
+        "stock_item_id":   stock_item_id,
+        "dry_run":         False,
+        "item_count":      len(to_delete),
+        "manifest":        manifest,
+        "unresolved":      unresolved,
+        "deleted":         deleted,
+        "still_present":   still_present,
+        "remaining_count": len(images),
+        "has_main_image":  any(im["is_main"] for im in images),
+        "images":          images,
+        "result_status":   resp.get("ResultStatus") if isinstance(resp, dict) else None,
+    }
+
+
+@mcp.tool()
+def set_inventory_item_image_order(
+    sku: str,
+    image_ids: list[str] | None = None,
+    main_image_id: str | None = None,
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Reorder an inventory item's images and/or set which one is the main image.
+
+    This matters because the main image is the photo channels show as the
+    storefront hero — after `add_inventory_item_images` the ordering isn't
+    controllable, so a secondary shot can end up as the listing's front photo.
+
+    ⚠️ THE MAIN IMAGE IS ALWAYS FIRST — Linnworks pins it to sort_order 0 and you
+    cannot override that (live-proven 17 Jul 2026). The final order is always:
+
+        [main image] + [your requested order, with the main removed]
+
+    So to change which photo leads, pass `main_image_id` — reordering alone can
+    never put a non-main image first. `image_ids` only controls the order of the
+    images BEHIND the main one. If the first id you pass isn't the main image,
+    the write still succeeds but the main is forced ahead of it; the manifest
+    shows the true predicted order and sets `main_forced_first`, so a dry run
+    never promises an order Linnworks won't deliver.
+
+    Pass whichever you need (at least one):
+
+      - image_ids:     desired order. May be PARTIAL — any image you don't name
+                       keeps its existing relative order and follows the ones you
+                       did name.
+      - main_image_id: the image to make the hero. Linnworks clears the main flag
+                       on the others itself.
+
+    Changing the images does NOT push them to a live listing — follow with
+    `refresh_channel_listing` for that, and note the standing warning that a
+    green refresh does not by itself prove the storefront photo changed. Read the
+    live listing back.
+
+    Args:
+        sku: The exact SKU / ItemNumber whose images should be reordered.
+        image_ids: Desired image order (may be partial). Omit to leave order alone.
+        main_image_id: Image id to make the main/hero image. Omit to leave it alone.
+        confirmed_count: For reorders touching > 25 images, pass the number of
+            images on the item.
+        dry_run: If True (default), returns the manifest without writing.
+            Set to False to execute.
+
+    Returns:
+        A dict with:
+          - sku, stock_item_id, dry_run
+          - manifest:          per-image before/after (sort_order, is_main), in
+                               the predicted final order
+          - main_forced_first: True if the main image was pulled ahead of the
+                               first id you asked for
+          - unresolved:        ids not present on this item (skipped)
+          - images:            the item's images in their new order (live run only)
+          - has_main_image:    whether a main image is set (live run only)
+    """
+    if not image_ids and not main_image_id:
+        raise ValueError(
+            "Pass image_ids (to reorder), main_image_id (to set the main image), or both."
+        )
+
+    try:
+        item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+    except RuntimeError:
+        return {"error": f"No inventory item found for SKU '{sku}'", "sku": sku}
+
+    stock_item_id = item.get("StockItemId")
+    if not stock_item_id:
+        return {"error": f"Item found for SKU '{sku}' but StockItemId was missing", "sku": sku}
+
+    # ── Read before write ─────────────────────────────────────────────────────
+    raw_rows = _fetch_raw_images(stock_item_id)
+    if not raw_rows:
+        return {
+            "sku":           sku,
+            "stock_item_id": stock_item_id,
+            "dry_run":       dry_run,
+            "message":       f"SKU '{sku}' has no images — nothing to reorder.",
+            "images":        [],
+        }
+
+    by_id = {(r.get("pkRowId") or "").lower(): r for r in raw_rows}
+    unresolved = []
+
+    for label, given in (("image_ids", image_ids or []), ("main_image_id", [main_image_id] if main_image_id else [])):
+        for img_id in given:
+            if (img_id or "").strip().lower() not in by_id:
+                unresolved.append({
+                    "image_id": img_id,
+                    "field":    label,
+                    "error":    f"Image id '{img_id}' is not on SKU '{sku}' — skipped.",
+                })
+
+    if main_image_id and any(u["field"] == "main_image_id" for u in unresolved):
+        return {
+            "sku":           sku,
+            "stock_item_id": stock_item_id,
+            "dry_run":       dry_run,
+            "unresolved":    unresolved,
+            "error":         (
+                f"main_image_id '{main_image_id}' is not an image on SKU '{sku}' — "
+                "refusing to write. Call get_inventory_item_images to list valid ids."
+            ),
+        }
+
+    # ── Work out the order Linnworks will ACTUALLY produce ────────────────────
+    # Named ids lead in the order given; everything else keeps its existing
+    # relative order behind them. A partial list is therefore a promotion, not a
+    # destructive re-sort of the images the caller didn't mention.
+    existing_sorted = sorted(
+        raw_rows,
+        key=lambda r: (r.get("SortOrder") if r.get("SortOrder") is not None else 0),
+    )
+    named = [
+        by_id[(i or "").strip().lower()]
+        for i in (image_ids or [])
+        if (i or "").strip().lower() in by_id
+    ]
+    named_ids = {(r.get("pkRowId") or "").lower() for r in named}
+    requested = named + [
+        r for r in existing_sorted if (r.get("pkRowId") or "").lower() not in named_ids
+    ]
+
+    # The effective main (new one if being set, else the current one) is pinned to
+    # position 0 by the server no matter where the caller put it — so predict that
+    # rather than promise an order Linnworks will override.
+    main_key = (main_image_id or "").strip().lower() or next(
+        ((r.get("pkRowId") or "").lower() for r in raw_rows if r.get("IsMain")), ""
+    )
+    main_row = by_id.get(main_key)
+    new_order = (
+        [main_row] + [r for r in requested if (r.get("pkRowId") or "").lower() != main_key]
+        if main_row else requested
+    )
+    main_forced_first = bool(
+        main_row and requested and (requested[0].get("pkRowId") or "").lower() != main_key
+    )
+
+    manifest = []
+    for position, raw in enumerate(new_order):
+        img_id      = raw.get("pkRowId")
+        old_sort    = raw.get("SortOrder")
+        old_is_main = bool(raw.get("IsMain"))
+        new_is_main = (img_id or "").lower() == main_key
+        manifest.append({
+            "image_id":       img_id,
+            "full_url":       raw.get("FullSource"),
+            "old_sort_order": old_sort,
+            "new_sort_order": position,
+            "old_is_main":    old_is_main,
+            "new_is_main":    new_is_main,
+            "changed":        old_sort != position or new_is_main != old_is_main,
+        })
+
+    main_changing = bool(main_row) and not main_row.get("IsMain")
+    order_changing = [m["image_id"] for m in manifest] != [
+        r.get("pkRowId") for r in existing_sorted
+    ] or any(m["old_sort_order"] != m["new_sort_order"] for m in manifest)
+
+    warning = None
+    if main_forced_first:
+        warning = (
+            f"Image '{requested[0].get('pkRowId')}' was requested first, but Linnworks "
+            f"pins the MAIN image to position 0 — it will lead instead. Pass "
+            f"main_image_id to change which image is the hero."
+        )
+
+    if not order_changing and not main_changing:
+        return {
+            "sku":               sku,
+            "stock_item_id":     stock_item_id,
+            "dry_run":           dry_run,
+            "manifest":          manifest,
+            "unresolved":        unresolved,
+            "main_forced_first": main_forced_first,
+            "warning":           warning,
+            "message":           "Images are already in the requested order — nothing to change.",
+        }
+
+    # ── Write guard ───────────────────────────────────────────────────────────
+    guard = _write_guard(
+        "set_inventory_item_image_order", new_order, confirmed_count, dry_run
+    )
+    if guard is not None:
+        return {**guard, "sku": sku, "manifest": manifest, "unresolved": unresolved}
+
+    if dry_run:
+        return {
+            "sku":               sku,
+            "stock_item_id":     stock_item_id,
+            "dry_run":           True,
+            "manifest":          manifest,
+            "unresolved":        unresolved,
+            "main_forced_first": main_forced_first,
+            "warning":           warning,
+            "message":           (
+                "Dry run — nothing written. Images would be ordered as shown in the "
+                "manifest"
+                + (f" and the main image set to '{main_image_id}'" if main_changing else "")
+                + ". Set dry_run=False to execute."
+            ),
+        }
+
+    # ── Live execution ────────────────────────────────────────────────────────
+    # Set the main image FIRST, so the sort write that follows agrees with the
+    # server's "main is position 0" rule instead of fighting it. Then submit the
+    # FULL set main-first — a full, main-first payload is honoured exactly, while
+    # a partial one gets re-normalised (live-proven 17 Jul 2026). Each row carries
+    # every field: UpdateImages clears anything omitted. Both calls return 204.
+    if main_changing:
+        call_linnworks_void(
+            "Inventory/SetInventoryItemImageAsMain",
+            {"inventoryItemId": stock_item_id, "mainImageId": main_row.get("pkRowId")},
+        )
+
+    if order_changing:
+        rows = []
+        for position, raw in enumerate(new_order):
+            row = _image_simple_row(raw, stock_item_id)
+            row["SortOrder"] = position
+            row["IsMain"] = (raw.get("pkRowId") or "").lower() == main_key
+            rows.append(row)
+        call_linnworks_void("Inventory/UpdateImages", {"images": rows})
+
+    # ── Read back ─────────────────────────────────────────────────────────────
+    images = [_format_image_row(r) for r in _fetch_raw_images(stock_item_id)]
+    images.sort(key=lambda im: (im["sort_order"] if im["sort_order"] is not None else 0))
+
+    return {
+        "sku":               sku,
+        "stock_item_id":     stock_item_id,
+        "dry_run":           False,
+        "reordered_count":   len(new_order) if order_changing else 0,
+        "main_image_set":    main_row.get("pkRowId") if main_changing else None,
+        "main_forced_first": main_forced_first,
+        "warning":           warning,
+        "manifest":          manifest,
+        "unresolved":        unresolved,
+        "order_matches_plan": [im["image_id"] for im in images] == [m["image_id"] for m in manifest],
+        "has_main_image":    any(im["is_main"] for im in images),
+        "images":            images,
     }
 
 
