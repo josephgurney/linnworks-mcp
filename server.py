@@ -350,6 +350,7 @@ WRITE_THRESHOLDS: dict[str, int] = {
     "delete_inventory_item_images":   10,   # IRREVERSIBLE — removes images from an item
     "set_inventory_item_image_order": 25,   # reorders images; main image = storefront hero
     "delete_inventory_item":          10,   # IRREVERSIBLE — lowest threshold of all
+    "delete_purchase_order":          10,   # IRREVERSIBLE — deletes whole PO (header + all lines)
     "list_to_shopify":                25,   # creates live customer-facing channel listings
     "refresh_channel_listing":        25,   # re-pushes live customer-facing channel listings
     "unpublish_channel_listing":      10,   # TAKES DOWN live customer-facing listings — destructive
@@ -5044,6 +5045,201 @@ def remove_purchase_order_item(
             "Check the PO in the Linnworks UI."
         )
     return result
+
+
+@mcp.tool()
+def delete_purchase_order(
+    purchase_ids: list[str],
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    PERMANENTLY delete one or more entire purchase orders (header + all lines).
+
+    ⚠️  IRREVERSIBLE.  Deleting a PO destroys its header, every line item, and
+    its notes — there is no API to restore it.  This is the whole-PO counterpart
+    to remove_purchase_order_item (which removes a single line).  Use it to clear
+    out mistaken, duplicate, or abandoned draft POs.
+
+    The dry-run manifest and the staging gate are the main safety nets.  Always
+    run dry_run=True first and read the manifest carefully before setting
+    dry_run=False.
+
+    ⚠️  A DELIVERED (or partially delivered) PO records goods actually received
+    into stock — deleting it loses that history.  This tool BLOCKS PENDING/OPEN
+    deletion only when you have not confirmed; DELIVERED and PARTIAL POs are
+    flagged in the manifest with a "delivered" warning so you can decide, but are
+    NOT auto-blocked (Linnworks itself allows the delete).  Prefer to only delete
+    PENDING/OPEN draft POs.
+
+    For batches larger than 10 POs this tool enters a staging mode: it returns a
+    manifest of exactly what would be destroyed and asks you to confirm with
+    confirmed_count=<N> before executing.
+
+    Uses PurchaseOrder/Delete_PurchaseOrder (payload sent UNWRAPPED as
+    {"pkPurchaseId": "<guid>"} — empty 2xx body on success; a subsequent
+    Get_PurchaseOrder then returns HTTP 400 "Purchase Order does not exist",
+    which is used as the per-PO read-back confirmation).
+
+    Args:
+        purchase_ids: List of purchase order UUIDs (pkPurchaseID), as returned by
+            search_purchase_orders.  Each is read back first to capture a summary;
+            a PO id that does not resolve is reported as an error row and does NOT
+            abort the rest of the batch.
+        confirmed_count: For batches > 10, pass len(purchase_ids) here after
+            reviewing the manifest to confirm the destruction.
+        dry_run: If True (default), returns the manifest of what would be deleted
+            without writing.  Set to False to execute.
+
+    Returns:
+        A dict with:
+          - dry_run:     whether this was a dry run
+          - po_count:    number of PO ids in the batch
+          - manifest:    per-PO preview (purchase_id, status, supplier_id,
+                         line_count, total_cost, date_of_purchase, delivered flag,
+                         resolved/error) — always present
+          - results:     per-PO outcome with deleted flag (live run only)
+          - deleted:     count of POs confirmed gone (live run only)
+          - errors:      count of PO ids that failed to resolve or delete
+    """
+    if not purchase_ids:
+        raise ValueError("purchase_ids must contain at least one PO id.")
+
+    # ── Read-before-write: read each PO header for the manifest ───────────────
+    manifest: list[dict] = []
+
+    for pid in purchase_ids:
+        pid = (pid or "").strip()
+        if not pid:
+            manifest.append({
+                "purchase_id": pid, "resolved": False, "error": "empty PO id",
+            })
+            continue
+        try:
+            current = call_linnworks(
+                "PurchaseOrder/Get_PurchaseOrder", {"pkPurchaseId": pid}
+            )
+        except RuntimeError as exc:
+            manifest.append({
+                "purchase_id": pid, "resolved": False,
+                "error": f"not found: {exc}",
+            })
+            continue
+
+        header = current.get("PurchaseOrderHeader") or {}
+        status = header.get("Status", "")
+        live_lines = [
+            i for i in (current.get("PurchaseOrderItem") or [])
+            if not i.get("IsDeleted")
+        ]
+        row = {
+            "purchase_id":      header.get("pkPurchaseID") or pid,
+            "status":           status,
+            "status_label":     _PO_STATUS_LABELS.get(status, status),
+            "supplier_id":      header.get("fkSupplierId"),
+            "supplier_reference": header.get("SupplierReferenceNumber"),
+            "line_count":       len(live_lines),
+            "total_cost":       header.get("TotalCost"),
+            "currency":         header.get("Currency"),
+            "date_of_purchase": header.get("DateOfPurchase"),
+            "delivered":        status in ("DELIVERED", "PARTIAL"),
+            "resolved":         True,
+        }
+        if row["delivered"]:
+            row["warning"] = (
+                f"PO is {row['status_label']} — deleting loses received-stock "
+                "history. Confirm this is intentional."
+            )
+        manifest.append(row)
+
+    resolved_rows = [m for m in manifest if m.get("resolved")]
+    resolve_errors = [m for m in manifest if not m.get("resolved")]
+
+    # ── Write guard (threshold 10) ────────────────────────────────────────────
+    guard = _write_guard("delete_purchase_order", purchase_ids, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, "manifest": manifest}
+
+    if dry_run:
+        delivered_n = sum(1 for m in resolved_rows if m.get("delivered"))
+        return {
+            "dry_run":  True,
+            "po_count": len(purchase_ids),
+            "manifest": manifest,
+            "message": (
+                f"Dry run — nothing deleted. {len(resolved_rows)} PO(s) would be "
+                f"PERMANENTLY deleted ({delivered_n} of them delivered/partial), "
+                f"{len(resolve_errors)} could not be resolved. Review the manifest, "
+                "then set dry_run=False to execute. This cannot be undone."
+            ),
+        }
+
+    if not resolved_rows:
+        return {
+            "dry_run":  False,
+            "po_count": len(purchase_ids),
+            "deleted":  0,
+            "errors":   len(resolve_errors),
+            "results":  [],
+            "manifest": manifest,
+            "message":  "No PO ids resolved; nothing was deleted.",
+        }
+
+    # ── Live execution: delete each resolved PO, then read back ───────────────
+    results = []
+    deleted = 0
+    errors = len(resolve_errors)
+    for m in resolved_rows:
+        pid = m["purchase_id"]
+        delete_error: str | None = None
+        try:
+            call_linnworks(
+                "PurchaseOrder/Delete_PurchaseOrder", {"pkPurchaseId": pid}
+            )
+        except RuntimeError as exc:
+            delete_error = str(exc)
+
+        # Read-back: a deleted PO makes Get_PurchaseOrder raise ("does not exist")
+        gone = False
+        try:
+            call_linnworks("PurchaseOrder/Get_PurchaseOrder", {"pkPurchaseId": pid})
+            gone = False  # still exists
+        except RuntimeError:
+            gone = True   # not found => deleted
+
+        if gone:
+            deleted += 1
+        else:
+            errors += 1
+
+        row = {
+            "purchase_id":  pid,
+            "status_label": m.get("status_label"),
+            "line_count":   m.get("line_count"),
+            "total_cost":   m.get("total_cost"),
+            "deleted":      gone,
+        }
+        if delete_error is not None:
+            row["delete_error"] = delete_error
+        if not gone:
+            row["note"] = "still exists after delete call"
+        results.append(row)
+
+    for m in resolve_errors:
+        results.append({
+            "purchase_id": m["purchase_id"],
+            "deleted":     False,
+            "error":       m.get("error"),
+        })
+
+    return {
+        "dry_run":  False,
+        "po_count": len(purchase_ids),
+        "deleted":  deleted,
+        "errors":   errors,
+        "results":  results,
+        "manifest": manifest,
+    }
 
 
 # ---------- Purchase orders ----------
