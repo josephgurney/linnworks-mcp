@@ -830,6 +830,38 @@ def _format_variation_member(m: dict) -> dict:
     }
 
 
+def _find_variation_group_by_name(name: str) -> dict | None:
+    """
+    Find a variation group by its exact name, returning the group row
+    {VariationSKU, pkVariationItemId, VariationGroupName} or None.
+
+    Stock/GetVariationGroupByName is UNRELIABLE on this tenant — it returns
+    HTTP 200 `null` even for a group that demonstrably exists (live-confirmed
+    28 Jul 2026, immediately after creating a group). So this searches
+    Stock/SearchVariationGroups (searchType=VariationName, a SUBSTRING match)
+    and confirms an EXACT case-insensitive name match to avoid false positives.
+    """
+    target = (name or "").strip().lower()
+    if not target:
+        return None
+    page: int | None = 1
+    pages_scanned = 0
+    while page and pages_scanned < 10:
+        res = call_linnworks_get(
+            "Stock/SearchVariationGroups",
+            {"searchType": "VariationName", "searchText": name,
+             "pageNumber": page, "entriesPerPage": 100},
+        )
+        data = res.get("Data", []) if isinstance(res, dict) else []
+        total_pages = res.get("TotalPages", 1) if isinstance(res, dict) else 1
+        for row in data:
+            if (row.get("VariationGroupName") or "").strip().lower() == target:
+                return row
+        pages_scanned += 1
+        page = page + 1 if page < total_pages else None
+    return None
+
+
 def _resolve_variation(sku: str, stock_item_id: str) -> dict:
     """
     Resolve a SKU's variation-group relationship in BOTH directions.
@@ -7697,48 +7729,69 @@ def create_variation_group(
     dry_run: bool = True,
 ) -> dict:
     """
-    Create a variation group in Linnworks, linking a parent item to its children.
+    Create a variation group in Linnworks, linking a NEW variation parent to
+    its existing child items.
 
     A variation group connects items that are variants of the same product
-    (e.g. a T-shirt in different sizes/colours).  The parent item becomes the
-    variation template; child SKUs are the individual sellable variants.
+    (e.g. a T-shirt in different sizes/colours). The parent is the variation
+    template that carries the group; the child SKUs are the individual sellable
+    variants.
 
-    All SKUs must already exist in Linnworks before creating the group.
-    If a group with the same name already exists this tool reports it and
-    does not create a duplicate.
+    ⚠️ The `parent_sku` is a NEW variation SKU that Linnworks MINTS as it
+    creates the group — it must NOT already exist as a normal stock item.
+    (Live-confirmed 28 Jul 2026: passing an existing item's SKU returns HTTP 400
+    "Chosen variation SKU already exists as a normal stock item.") The child
+    SKUs, by contrast, MUST already exist. To add more children to a group that
+    already exists, use `add_variation_group_items` instead.
 
     Args:
-        group_name: The name for the variation group.  [required]
-        parent_sku: SKU of the item that will be the variation parent.  [required]
-        child_skus: List of SKUs that are children (variants) of the parent.
-            The parent SKU should NOT be included here.  [required]
-        dry_run: If True (default), validates all SKUs and shows what would be
-            created without writing. Set to False to execute.
+        group_name: The name / title for the variation group.  [required]
+        parent_sku: The NEW variation-parent SKU to create (must not already
+            exist as a stock item or variation).  [required]
+        child_skus: List of EXISTING SKUs that are children (variants) of the
+            parent. The parent SKU is not included here.  [required]
+        dry_run: If True (default), validates the parent is free + children
+            exist and shows what would be created without writing. Set to False
+            to execute.
 
     Returns:
         A dict with:
           - dry_run:          whether this was a dry run
           - group_name:       the requested group name
-          - parent_sku:       the parent SKU
+          - parent_sku:       the new parent variation SKU
           - child_skus:       the child SKUs
-          - parent_id:        resolved parent StockItemId
+          - pk_variation_item_id: the minted group id (live run)
           - child_ids:        resolved child StockItemIds
           - status:           "dry_run", "created", "already_exists", or "error"
           - message:          human-readable outcome
     """
     _check_injection("group_name", group_name)
 
-    # ── Resolve all SKUs ──────────────────────────────────────────────────────
-    sku_cache: dict[str, str] = {}
+    # ── The parent SKU must be a NEW variation SKU, not an existing item ───────
     try:
-        parent_id = _resolve_sku_to_id(parent_sku, sku_cache)
-    except ValueError as exc:
+        parent_state = call_linnworks_get(
+            "Stock/CheckVariationParentSKUExists", {"parentSKU": parent_sku}
+        )
+    except RuntimeError:
+        parent_state = None
+    if parent_state and str(parent_state).strip() != "NotExists":
+        hint = (
+            "it is already a variation parent — use add_variation_group_items "
+            "to add children to it"
+            if str(parent_state).strip() == "AlreadyVariation"
+            else "it already exists as a normal stock item; the variation "
+                 "parent SKU must be a brand-new SKU"
+        )
         return {
             "dry_run": dry_run, "group_name": group_name,
-            "parent_sku": parent_sku, "status": "error",
-            "message": f"Parent SKU resolution failed: {exc}",
+            "parent_sku": parent_sku, "child_skus": child_skus,
+            "status": "error",
+            "message": f"Cannot use '{parent_sku}' as the variation parent — {hint}.",
+            "parent_sku_state": str(parent_state).strip(),
         }
 
+    # ── Resolve child SKUs (they MUST already exist) ──────────────────────────
+    sku_cache: dict[str, str] = {}
     child_ids = []
     child_errors = []
     for sku in child_skus:
@@ -7756,34 +7809,29 @@ def create_variation_group(
             "child_errors": child_errors,
         }
 
-    # ── Check if group already exists ─────────────────────────────────────────
-    try:
-        existing_group = call_linnworks_get(
-            "Stock/GetVariationGroupByName",
-            params={"variationGroupName": group_name},
-        )
-        if existing_group and existing_group.get("VariationGroupName"):
-            return {
-                "dry_run":    dry_run,
-                "group_name": group_name,
-                "parent_sku": parent_sku,
-                "child_skus": child_skus,
-                "status":     "already_exists",
-                "message": (
-                    f"A variation group named '{group_name}' already exists "
-                    f"in Linnworks. No new group was created."
-                ),
-                "existing_group": existing_group,
-            }
-    except RuntimeError:
-        pass  # 404 or similar means the group does not exist — proceed
+    # ── Check if a group with this name already exists ────────────────────────
+    existing_group = _find_variation_group_by_name(group_name)
+    if existing_group:
+        return {
+            "dry_run":    dry_run,
+            "group_name": group_name,
+            "parent_sku": parent_sku,
+            "child_skus": child_skus,
+            "status":     "already_exists",
+            "message": (
+                f"A variation group named '{group_name}' already exists "
+                f"in Linnworks (parent '{existing_group.get('VariationSKU')}'). "
+                f"No new group was created — use add_variation_group_items to "
+                f"add children to it."
+            ),
+            "existing_group": existing_group,
+        }
 
     base = {
         "dry_run":    dry_run,
         "group_name": group_name,
         "parent_sku": parent_sku,
         "child_skus": child_skus,
-        "parent_id":  parent_id,
         "child_ids":  child_ids,
     }
 
@@ -7792,41 +7840,280 @@ def create_variation_group(
             **base,
             "status":  "dry_run",
             "message": (
-                f"Dry run — would create variation group '{group_name}' "
-                f"with parent '{parent_sku}' and {len(child_skus)} child(ren). "
-                f"Set dry_run=False to create."
+                f"Dry run — would create variation group '{group_name}' with a "
+                f"new parent '{parent_sku}' and {len(child_skus)} existing "
+                f"child(ren). Set dry_run=False to create."
             ),
         }
 
-    # ── Create the group ──────────────────────────────────────────────────────
-    call_linnworks(
+    # ── Create the group (Linnworks mints the parent StockItemId; pass the ────
+    #    zero-GUID and read the minted id back from the response) ──────────────
+    created = call_linnworks(
         "Stock/CreateVariationGroup",
         {
             "template": {
                 "VariationGroupName": group_name,
                 "ParentSKU":          parent_sku,
-                "ParentStockItemId":  parent_id,
+                "ParentStockItemId":  "00000000-0000-0000-0000-000000000000",
                 "VariationItemIds":   child_ids,
             }
         },
     )
+    pk = created.get("pkVariationItemId") if isinstance(created, dict) else None
 
-    # Read back to confirm
-    try:
-        confirmed = call_linnworks_get(
-            "Stock/GetVariationGroupByName",
-            params={"variationGroupName": group_name},
-        )
-    except RuntimeError:
-        confirmed = None
+    # Read back the members to confirm
+    members = []
+    if pk:
+        members = call_linnworks_get(
+            "Stock/GetVariationItems", {"pkVariationItemId": pk}
+        ) or []
 
     return {
         **base,
-        "status":         "created",
-        "confirmed_group": confirmed,
+        "status":              "created",
+        "pk_variation_item_id": pk,
+        "confirmed_group":     created,
+        "member_count":        len(members),
         "message": (
-            f"Variation group '{group_name}' created with parent '{parent_sku}' "
-            f"and {len(child_ids)} child item(s)."
+            f"Variation group '{group_name}' created with new parent "
+            f"'{parent_sku}' and {len(child_ids)} child item(s)."
+        ),
+    }
+
+
+@mcp.tool()
+def add_variation_group_items(
+    child_skus: list[str],
+    parent_sku: str | None = None,
+    group_name: str | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Add one or more child SKUs to an EXISTING variation group.
+
+    The counterpart to `create_variation_group`, which is create-only: it
+    no-ops the moment a group with that name exists and has no code path that
+    would ever attach a new child. Use THIS tool to link an extra size/colour
+    into a group that already exists.
+
+    Why this is needed: supplier feeds add new variants over time (e.g. a
+    product launches S/M/L, the supplier adds XS weeks later). The CSV import
+    creates the new child item but does not reliably re-link it into an
+    already-live group — it stays orphaned (an item, not a member) until
+    someone opens the product in the Linnworks UI and revises the group. This
+    tool is the API path to do that link. Detect the gap first with
+    `get_item_relationships` (compare the group's live children against the
+    expected set), then close it here.
+
+    Identify the group by EITHER `parent_sku` OR `group_name` (at least one is
+    required). If both are given they must resolve to the same group or the
+    call errors. The group id used by Linnworks is the PARENT item's
+    StockItemId (== the group's `pkVariationItemId`, confirmed issue #17).
+
+    Idempotent: only child SKUs not already in the group are added. SKUs
+    already linked are reported under `already_present` and skipped, so it is
+    safe to re-run with the full expected child set. A child SKU that cannot be
+    resolved becomes a row in `child_errors` and does NOT abort the others.
+
+    Args:
+        child_skus: SKUs to add as children of the group. The parent SKU should
+            not be included. [required]
+        parent_sku: SKU of the variation parent identifying the group.
+        group_name: Name of the variation group identifying it (alternative or
+            complement to parent_sku).
+        dry_run: If True (default), resolves SKUs, diffs against the current
+            members and shows what would be added without writing. Set to False
+            to execute.
+
+    Returns:
+        A dict with:
+          - dry_run:               whether this was a dry run
+          - status:                "dry_run", "added", "no_op", or "error"
+          - group_name:            the resolved group name
+          - parent_sku:            the resolved parent SKU
+          - pk_variation_item_id:  the group id (parent StockItemId)
+          - current_members:       SKUs already in the group before the write
+          - to_add:                child SKUs that would be / were added
+          - already_present:       requested SKUs already in the group (skipped)
+          - child_errors:          [{sku, error}] for SKUs that failed to resolve
+          - added:                 (live run) read-back per SKU {sku, added: bool}
+          - message:               human-readable outcome
+    """
+    if group_name:
+        _check_injection("group_name", group_name)
+
+    if not parent_sku and not group_name:
+        return {
+            "dry_run": dry_run, "status": "error",
+            "message": "Provide at least one of parent_sku or group_name to "
+                       "identify the existing variation group.",
+        }
+
+    sku_cache: dict[str, str] = {}
+
+    # ── Resolve the target group → pk_variation_item_id + parent_sku + name ────
+    pk_variation_item_id: str | None = None
+    resolved_parent_sku: str | None = None
+    resolved_group_name: str | None = None
+
+    if parent_sku:
+        try:
+            parent_id = _resolve_sku_to_id(parent_sku, sku_cache)
+        except ValueError as exc:
+            return {
+                "dry_run": dry_run, "status": "error",
+                "parent_sku": parent_sku, "group_name": group_name,
+                "message": f"Parent SKU resolution failed: {exc}",
+            }
+        group = call_linnworks_get(
+            "Stock/GetVariationGroupByParentId", {"pkStockItemId": parent_id}
+        )
+        if not group or not group.get("pkVariationItemId"):
+            return {
+                "dry_run": dry_run, "status": "error",
+                "parent_sku": parent_sku, "group_name": group_name,
+                "message": (
+                    f"'{parent_sku}' is not a variation parent (no existing "
+                    f"group hangs off it). Use create_variation_group to make a "
+                    f"new group, or pass the correct parent SKU."
+                ),
+            }
+        pk_variation_item_id = group.get("pkVariationItemId")
+        resolved_parent_sku = parent_sku
+        resolved_group_name = group.get("VariationGroupName")
+
+        # If a group_name was ALSO supplied, it must match the parent's group.
+        if group_name and (resolved_group_name or "").strip().lower() != group_name.strip().lower():
+            return {
+                "dry_run": dry_run, "status": "error",
+                "parent_sku": parent_sku, "group_name": group_name,
+                "message": (
+                    f"parent_sku '{parent_sku}' belongs to group "
+                    f"'{resolved_group_name}', which does not match the "
+                    f"group_name '{group_name}' you supplied."
+                ),
+            }
+    else:
+        # Identify by name only (GetVariationGroupByName is unreliable — use
+        # the SearchVariationGroups-backed exact-match helper).
+        existing = _find_variation_group_by_name(group_name)
+        if not existing or not existing.get("pkVariationItemId"):
+            return {
+                "dry_run": dry_run, "status": "error",
+                "group_name": group_name,
+                "message": (
+                    f"No variation group named '{group_name}' exists in "
+                    f"Linnworks. Use create_variation_group to make it."
+                ),
+            }
+        pk_variation_item_id = existing.get("pkVariationItemId")
+        resolved_parent_sku = existing.get("VariationSKU")
+        resolved_group_name = existing.get("VariationGroupName")
+
+    # ── Read current members (read-before-write) ──────────────────────────────
+    members = call_linnworks_get(
+        "Stock/GetVariationItems", {"pkVariationItemId": pk_variation_item_id}
+    ) or []
+    current_member_skus = [
+        (m.get("ItemNumber") or m.get("SKU") or "") for m in members
+    ]
+    current_lower = {s.strip().lower() for s in current_member_skus if s}
+
+    # ── Diff requested children against current members ───────────────────────
+    to_add: list[str] = []
+    to_add_ids: list[str] = []
+    already_present: list[str] = []
+    child_errors: list[dict] = []
+    seen_in_request: set[str] = set()
+
+    for sku in child_skus:
+        key = (sku or "").strip().lower()
+        if not key or key in seen_in_request:
+            continue  # skip blanks and duplicates within the request
+        seen_in_request.add(key)
+        if key in current_lower:
+            already_present.append(sku)
+            continue
+        try:
+            to_add_ids.append(_resolve_sku_to_id(sku, sku_cache))
+            to_add.append(sku)
+        except ValueError as exc:
+            child_errors.append({"sku": sku, "error": str(exc)})
+
+    base = {
+        "dry_run":              dry_run,
+        "group_name":           resolved_group_name,
+        "parent_sku":           resolved_parent_sku,
+        "pk_variation_item_id": pk_variation_item_id,
+        "current_members":      current_member_skus,
+        "to_add":               to_add,
+        "already_present":      already_present,
+        "child_errors":         child_errors,
+    }
+
+    # ── Nothing to add ────────────────────────────────────────────────────────
+    if not to_add:
+        msg_bits = []
+        if already_present:
+            msg_bits.append(f"{len(already_present)} already in the group")
+        if child_errors:
+            msg_bits.append(f"{len(child_errors)} could not be resolved")
+        detail = "; ".join(msg_bits) if msg_bits else "no valid children supplied"
+        return {
+            **base,
+            "status": "no_op" if not child_errors else "error",
+            "message": (
+                f"No children to add to '{resolved_group_name}' ({detail})."
+            ),
+        }
+
+    # ── Dry run ───────────────────────────────────────────────────────────────
+    if dry_run:
+        return {
+            **base,
+            "status": "dry_run",
+            "message": (
+                f"Dry run — would add {len(to_add)} child(ren) to variation "
+                f"group '{resolved_group_name}' "
+                f"({len(already_present)} already present, "
+                f"{len(child_errors)} unresolved). Set dry_run=False to add."
+            ),
+        }
+
+    # ── Add the missing children ──────────────────────────────────────────────
+    call_linnworks(
+        "Stock/AddVariationItems",
+        {
+            "pkVariationItemId": pk_variation_item_id,
+            "pkStockItemIds":    to_add_ids,
+        },
+    )
+
+    # ── Read back to confirm each requested add actually landed ───────────────
+    after = call_linnworks_get(
+        "Stock/GetVariationItems", {"pkVariationItemId": pk_variation_item_id}
+    ) or []
+    after_lower = {
+        (m.get("ItemNumber") or m.get("SKU") or "").strip().lower()
+        for m in after
+    }
+    added = [
+        {"sku": sku, "added": (sku or "").strip().lower() in after_lower}
+        for sku in to_add
+    ]
+    added_ok = sum(1 for a in added if a["added"])
+
+    return {
+        **base,
+        "status":          "added",
+        "added":           added,
+        "member_count_after": len(after),
+        "message": (
+            f"Added {added_ok}/{len(to_add)} child(ren) to variation group "
+            f"'{resolved_group_name}'. "
+            f"{len(already_present)} were already present"
+            + (f", {len(child_errors)} could not be resolved" if child_errors else "")
+            + "."
         ),
     }
 
