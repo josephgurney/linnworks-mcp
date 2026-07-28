@@ -1,3 +1,6 @@
+# Brain — private project intelligence layer, never push
+.brain/
+
 # Credentials — never commit
 .env
 

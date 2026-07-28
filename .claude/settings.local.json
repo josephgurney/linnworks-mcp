@@ -37,7 +37,13 @@
       "Bash(curl -s \"https://raw.githubusercontent.com/LinnSystems/PublicApiSpecs/master/1.0/\")",
       "Bash(curl -s \"https://api.github.com/repos/LinnSystems/PublicApiSpecs/contents/1.0\")",
       "Bash(curl -Ls \"https://api.github.com/repos/LinnSystems/PublicApiSpecs/contents/1.0\")",
-      "Bash(curl -s \"https://raw.githubusercontent.com/LinnSystems/PublicApiSpecs/master/1.0/returnsrefunds.json\")"
+      "Bash(curl -s \"https://raw.githubusercontent.com/LinnSystems/PublicApiSpecs/master/1.0/returnsrefunds.json\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/LinnSystems/PublicApiSpecs/master/1.0/importexport.json\")",
+      "Bash(.venv/bin/python3 -m pytest tests/test_run_import_export.py -v)",
+      "Bash(.venv/bin/python3 -m pytest tests/test_write_protection.py -v)",
+      "Bash(.venv/bin/python3 -m pytest tests/ -v --tb=short)",
+      "Bash(curl -s \"https://raw.githubusercontent.com/LinnSystems/PublicApiSpecs/master/1.0/inventory.json\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/LinnSystems/PublicApiSpecs/master/1.0/stock.json\")"
     ]
   }
 }

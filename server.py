@@ -73,6 +73,35 @@ _ORDER_STATUS_LABELS: dict[int, str] = {
     7: "Cancelled",
 }
 
+# Payment/order-status enum used by Orders/ChangeStatus. This is the nStatus
+# enum documented in the ChangeStatus endpoint description (orders.json) and is
+# DISTINCT from the GetOrdersLowFidelity display codes in _ORDER_STATUS_LABELS
+# above — do not conflate the two. GetOrdersById's GeneralInfo.Status uses THIS
+# enum (a live PAID order reads back as 1), so it is what set_order_status reads
+# and writes for the paid/unpaid actions.
+_PAYMENT_STATUS_LABELS: dict[int, str] = {
+    0: "UNPAID",
+    1: "PAID",
+    2: "RETURN",
+    3: "PENDING",
+    4: "RESEND",
+}
+
+# Order-status actions supported by set_order_status → (endpoint, value).
+#   lock/unlock  → Orders/LockOrder   (lockOrder boolean)
+#   paid/unpaid  → Orders/ChangeStatus (status int, per _PAYMENT_STATUS_LABELS)
+_ORDER_STATUS_ACTIONS: dict[str, tuple[str, object]] = {
+    "lock":   ("LockOrder", True),
+    "unlock": ("LockOrder", False),
+    "paid":   ("ChangeStatus", 1),
+    "unpaid": ("ChangeStatus", 0),
+}
+
+# Actions users may ask for that the public Linnworks API does NOT expose.
+# Park/unpark exist only as a RulesEngine action (ChangeOrderParkStatus) with no
+# standalone endpoint — GeneralInfo.IsParked is READ-only via the API.
+_UNSUPPORTED_STATUS_ACTIONS: set[str] = {"park", "unpark"}
+
 # Matches GUID-style pkOrderID values returned by Linnworks order endpoints.
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
@@ -359,6 +388,7 @@ WRITE_THRESHOLDS: dict[str, int] = {
     "delete_empty_categories":        10,   # IRREVERSIBLE — bulk-deletes empty categories
     "archive_inventory_items":        25,   # hides items from channels; reversible via unarchive
     "unarchive_inventory_items":      25,   # restores items to active; reversible via archive
+    "set_order_status":               25,   # lock/unlock/paid/unpaid — reversible order-state changes
     "default":                        25,   # fallback for any unlisted operation
 }
 
@@ -2368,6 +2398,233 @@ def cancel_order(
         "status": "cancelled",
         "linnworks_response": result,
         **summary,
+    }
+
+
+@mcp.tool()
+def set_order_status(
+    order_ids: list[str],
+    action: str,
+    confirmed_count: Optional[int] = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Change the workflow status of one or more Linnworks orders.
+
+    Supported actions (case-insensitive):
+      - "lock"   → hold the order so it CANNOT be picked/dispatched (Orders/LockOrder)
+      - "unlock" → release a held order back into normal processing
+      - "paid"   → mark the order PAID   (Orders/ChangeStatus, status 1)
+      - "unpaid" → mark the order UNPAID (Orders/ChangeStatus, status 0)
+
+    The primary use case is HOLDING an order before it dispatches — e.g. a
+    customer has requested cancellation in Shopify and you want to stop the
+    pickwave until a human confirms. Use "lock" for that; a locked order stays
+    in the open-orders queue but is barred from processing (padlock in the UI).
+
+    ⚠️ Stock allocation side effect: LOCKING an order RELEASES the stock it had
+    allocated back to available — so that stock can be re-allocated to (and sold
+    on) other orders while this one is held. PARKING would KEEP the stock
+    allocated, but parking is not reachable via the API (below). If you hold an
+    order you intend to keep, be aware its stock is no longer ring-fenced.
+
+    ⚠️ "park"/"unpark" are NOT supported — Linnworks exposes no public endpoint
+    for parking (it exists only as a RulesEngine action; GeneralInfo.IsParked is
+    read-only via the API). Requesting them returns an error suggesting "lock".
+    Note parking is also the only state that KEEPS stock allocated (see above),
+    so this API gap has a real operational cost, not just a naming one.
+
+    ⚠️ Lock read-back limitation: the Linnworks API exposes no lock-status field
+    on the order model, so this tool CANNOT verify a lock/unlock landed by
+    reading it back — it reports the API's write response and asks you to confirm
+    the padlock in the Linnworks UI. Paid/unpaid ARE read-back verified against
+    GeneralInfo.Status.
+
+    Read-before-write: every order is resolved and its current status, parked
+    flag, processed flag, customer and reference captured into a manifest. An
+    order id that can't be resolved becomes a resolve_error row and never aborts
+    the batch. Bulk-capable: all resolvable orders are changed in a single API
+    call (both endpoints take an id list). Staging threshold 25 (reversible).
+    dry_run defaults to True.
+
+    Args:
+        order_ids: One or more order identifiers. Each may be a GUID pkOrderID
+            or a numeric order number (e.g. "607046"); both are accepted and a
+            single string is also accepted for convenience.
+        action: One of "lock", "unlock", "paid", "unpaid".
+        confirmed_count: For batches above the staging threshold, echo back the
+            exact order count to execute (see the write-safety framework).
+        dry_run: If True (default), returns the manifest without changing
+            anything. Set to False to execute.
+
+    Returns:
+        A dict with dry_run, action, endpoint, order_count, resolved_count,
+        the per-order manifest (dry run) or per-order read-back results (live),
+        and resolve_errors for any unresolved ids.
+    """
+    action_norm = (action or "").strip().lower()
+
+    if action_norm in _UNSUPPORTED_STATUS_ACTIONS:
+        return {
+            "error": (
+                f"Action '{action_norm}' is not supported — the Linnworks public "
+                f"API has no park/unpark endpoint (parking exists only as a "
+                f"RulesEngine action; GeneralInfo.IsParked is read-only). To hold "
+                f"an order from dispatch, use action='lock' instead."
+            ),
+            "action": action_norm,
+            "supported_actions": list(_ORDER_STATUS_ACTIONS.keys()),
+        }
+
+    if action_norm not in _ORDER_STATUS_ACTIONS:
+        return {
+            "error": (
+                f"Unknown action {action!r}. Supported actions: "
+                f"{', '.join(_ORDER_STATUS_ACTIONS.keys())}."
+            ),
+            "supported_actions": list(_ORDER_STATUS_ACTIONS.keys()),
+        }
+
+    # Normalise order_ids → clean list (accept a bare string too).
+    if isinstance(order_ids, str):
+        order_ids = [order_ids]
+    order_ids = [str(o).strip() for o in (order_ids or []) if str(o).strip()]
+    if not order_ids:
+        return {"error": "No order_ids provided.", "action": action_norm}
+
+    endpoint, value = _ORDER_STATUS_ACTIONS[action_norm]
+
+    # ---- Read-before-write: resolve every order, build the manifest. ----
+    resolved: list[tuple[str, dict]] = []   # (guid, manifest_row)
+    manifest: list[dict] = []
+    resolve_errors: list[dict] = []
+    guid_list: list[str] = []
+
+    for oid in order_ids:
+        try:
+            guid, raw = _resolve_order_guid(oid)
+        except RuntimeError as exc:
+            resolve_errors.append({"order_id_input": oid, "error": str(exc)})
+            manifest.append({"order_id_input": oid, "resolved": False, "error": str(exc)})
+            continue
+
+        fmt = _format_order_detail(raw)
+        cur = fmt.get("status")
+        row = {
+            "order_id_input":       oid,
+            "order_id":             guid,
+            "num_order_id":         fmt.get("num_order_id"),
+            "customer_name":        fmt.get("customer_name"),
+            "reference_num":        fmt.get("reference_num"),
+            "external_reference":   fmt.get("external_reference"),
+            "source":               fmt.get("source"),
+            "processed":            fmt.get("processed"),
+            "is_parked":            fmt.get("is_parked"),
+            "current_status":       cur,
+            "current_status_label": _PAYMENT_STATUS_LABELS.get(cur, f"Unknown({cur})"),
+            "action":               action_norm,
+            "resolved":             True,
+        }
+
+        if endpoint == "LockOrder":
+            row["intent"] = (
+                "Lock (hold from picking/dispatch)" if value
+                else "Unlock (release for processing)"
+            )
+            if fmt.get("processed"):
+                row["warning"] = (
+                    "Order is already processed/dispatched — locking has no "
+                    "effect on a dispatched order."
+                )
+        else:  # ChangeStatus (paid/unpaid)
+            row["new_status"] = value
+            row["new_status_label"] = _PAYMENT_STATUS_LABELS.get(value)
+            row["intent"] = f"Set payment status → {_PAYMENT_STATUS_LABELS.get(value)}"
+
+        resolved.append((guid, row))
+        guid_list.append(guid)
+        manifest.append(row)
+
+    # ---- Staging gate (based on the batch the caller passed). ----
+    guard = _write_guard("set_order_status", order_ids, confirmed_count, dry_run)
+    if guard is not None:
+        return {
+            **guard,
+            "action": action_norm,
+            "endpoint": f"Orders/{endpoint}",
+            "manifest": manifest,
+            "resolve_errors": resolve_errors,
+        }
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "action": action_norm,
+            "endpoint": f"Orders/{endpoint}",
+            "order_count": len(order_ids),
+            "resolved_count": len(guid_list),
+            "manifest": manifest,
+            "resolve_errors": resolve_errors,
+            "message": "Set dry_run=False to execute this status change.",
+        }
+
+    if not guid_list:
+        return {
+            "dry_run": False,
+            "action": action_norm,
+            "endpoint": f"Orders/{endpoint}",
+            "order_count": len(order_ids),
+            "resolved_count": 0,
+            "results": [],
+            "resolve_errors": resolve_errors,
+            "message": "No resolvable orders to act on.",
+        }
+
+    # ---- Execute: a single call handles the whole resolved id list. ----
+    if endpoint == "LockOrder":
+        payload = {"orderIds": guid_list, "lockOrder": bool(value)}
+    else:
+        payload = {"orderIds": guid_list, "status": int(value)}
+    write_resp = call_linnworks(f"Orders/{endpoint}", payload)
+
+    # ---- Read-back per order. ----
+    results: list[dict] = []
+    for guid, row in resolved:
+        rb = {
+            "order_id":     guid,
+            "num_order_id": row["num_order_id"],
+            "reference_num": row["reference_num"],
+            "action":       action_norm,
+        }
+        try:
+            _, raw2 = _resolve_order_guid(guid)
+            fmt2 = _format_order_detail(raw2)
+            if endpoint == "ChangeStatus":
+                new = fmt2.get("status")
+                rb["status_after"] = new
+                rb["status_after_label"] = _PAYMENT_STATUS_LABELS.get(new, f"Unknown({new})")
+                rb["changed"] = (new == value)
+            else:  # LockOrder — no readable lock field on the order model
+                rb["is_parked"] = fmt2.get("is_parked")
+                rb["lock_readback"] = "unavailable"
+                rb["note"] = (
+                    "The Linnworks API exposes no lock-status field, so the lock "
+                    "cannot be verified by read-back — confirm the padlock in the "
+                    "Linnworks UI."
+                )
+        except RuntimeError as exc:
+            rb["readback_error"] = str(exc)
+        results.append(rb)
+
+    return {
+        "dry_run": False,
+        "action": action_norm,
+        "endpoint": f"Orders/{endpoint}",
+        "order_count": len(order_ids),
+        "resolved_count": len(guid_list),
+        "linnworks_response": write_resp,
+        "results": results,
+        "resolve_errors": resolve_errors,
     }
 
 
