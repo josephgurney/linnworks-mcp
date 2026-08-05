@@ -384,6 +384,7 @@ WRITE_THRESHOLDS: dict[str, int] = {
     "refresh_channel_listing":        25,   # re-pushes live customer-facing channel listings
     "unpublish_channel_listing":      10,   # TAKES DOWN live customer-facing listings — destructive
     "delist_all_shopify_listings":    10,   # TAKES DOWN every Shopify listing for an item — destructive
+    "delist_all_channel_listings":    10,   # TAKES DOWN every GLT listing (all channels) — destructive
     "delete_categories":              10,   # IRREVERSIBLE — deletes categories (non-empty → items reassigned)
     "delete_empty_categories":        10,   # IRREVERSIBLE — bulk-deletes empty categories
     "archive_inventory_items":        25,   # hides items from channels; reversible via unarchive
@@ -9259,6 +9260,71 @@ GLT_SHOPIFY_CHANNEL_NAME = "SHOPIFY"
 SHOPIFY_CONFIGURATOR_PROPERTY = "Shopify Configurator"
 _ZERO_GUID = "00000000-0000-0000-0000-000000000000"
 
+# ── GLT channel registry (issue #30) ──────────────────────────────────────────
+#
+# The GLT is the ONLY listing-management surface in the public API, and it only
+# covers the channels in its ChannelType enum. `channel_name` is the uppercase
+# *Source* string (same convention as Shopify's "SHOPIFY"), and `source` is what
+# that channel's rows carry in the channel-SKU link table — they match for every
+# channel confirmed live here, but they are kept separate because they are
+# conceptually different fields.
+#
+# Live-probed on this tenant (5 Aug 2026, GetConfiguratorsInfoPaged per type):
+#   Shopify 67 configurators (per-store ChannelId: 18 SWH / 21 Venom / 26 Icarus
+#                             / 29 Lobster / 34 TWG B2B)
+#   Amazon  10 configurators (ONE account — ChannelId 2, SubSource
+#                             "The Warehouse Group")
+#   TikTok   5 configurators (ChannelId 30, SubSource "SKATEWAREHOUSE_UK")
+#   Magento  0 · Walmart 0  → valid ChannelTypes, but nothing GLT-managed here.
+#   eBay / Etsy → HTTP 400 "Invalid parameter request" (NOT GLT channels)
+#   External → 400 "Failed to create a channel"; CDiscount_OBSOLETE → 400 null ref
+#
+# ⚠️  AMAZON REGION SHAPE — the one structural difference from Shopify.
+# Shopify is 1:1 (each store = its own ChannelId AND its own channel-SKU
+# SubSource). Amazon is 1:many: a single account (ChannelId 2, SubSource
+# "The Warehouse Group") fronts SEVEN regional SubSources in the channel-SKU
+# table — "The Warehouse Group", "… - Germany", "… - France", "… - Italy",
+# "… - Spain", "… - Netherlands", "… - Sweden". So a regional sub_source has NO
+# configurator of its own and must resolve to the account's ChannelId — see
+# _resolve_glt_target()'s account-prefix fallback.
+GLT_CHANNELS: dict[str, dict] = {
+    "shopify": {"channel_type": "Shopify", "channel_name": "SHOPIFY", "source": "SHOPIFY",
+                "delete_proven": True},
+    "amazon":  {"channel_type": "Amazon",  "channel_name": "AMAZON",  "source": "AMAZON",
+                "delete_proven": False},
+    "tiktok":  {"channel_type": "TikTok",  "channel_name": "TIKTOK",  "source": "TIKTOK",
+                "delete_proven": False},
+    "magento": {"channel_type": "Magento", "channel_name": "MAGENTO", "source": "MAGENTO",
+                "delete_proven": False},
+    "walmart": {"channel_type": "Walmart", "channel_name": "WALMART", "source": "WALMART",
+                "delete_proven": False},
+}
+
+# Channels seen in this tenant's channel-SKU table that the GLT cannot touch at
+# all — no configurators, no dedicated listing-management spec in the public API.
+# They can only be ended in that channel's own admin, so "delisted everywhere" is
+# never true for them and they are always reported under `skipped_channels`.
+NON_GLT_SOURCES = ("EBAY", "MIRAKL MP", "ETSY", "CDISCOUNT")
+
+
+def _resolve_glt_channel(channel: str) -> dict:
+    """Map a channel name ("Shopify", "amazon", "AMAZON"…) to its GLT identity.
+
+    Returns {key, channel_type, channel_name, source, delete_proven}.
+    Raises ValueError naming the supported channels for anything else — notably
+    eBay / Etsy / Mirakl, which are not GLT channels at all.
+    """
+    key = _norm_conf_name(channel).replace(" ", "")
+    entry = GLT_CHANNELS.get(key)
+    if entry is None:
+        raise ValueError(
+            f"'{channel}' is not a GLT-managed channel. Supported: "
+            f"{sorted(c['channel_type'] for c in GLT_CHANNELS.values())}. "
+            f"Channels like {', '.join(NON_GLT_SOURCES)} have no GLT templates and no public "
+            "listing-management API — they must be ended in that channel's own admin."
+        )
+    return {"key": key, **entry}
+
 
 def _glt_field(info: dict, key: str):
     """Unwrap a GLT ConfiguratorsInfo field.
@@ -9272,21 +9338,23 @@ def _glt_field(info: dict, key: str):
     return f
 
 
-def _fetch_shopify_configurators() -> list[dict]:
-    """Fetch all Shopify GLT configurators for this tenant.
+def _fetch_glt_configurators(channel: str = "Shopify") -> list[dict]:
+    """Fetch all GLT configurators for one channel in this tenant.
 
-    Calls GenericListings/GetConfiguratorsInfoPaged with ChannelType=Shopify,
-    ChannelName="SHOPIFY". Returns a flat list of normalized dicts:
-    {id, name, channel_id, sub_source, show_in_inventory}.
+    Calls GenericListings/GetConfiguratorsInfoPaged with the channel's
+    ChannelType + ChannelName (the uppercase Source string). Returns a flat list
+    of normalized dicts: {id, name, channel_id, sub_source, show_in_inventory}.
 
-    Confirmed live 18 Jun 2026 — 67 configurators in this tenant. A single page
-    of 1000 covers it; tenants with >1000 configurators would need pagination.
+    Confirmed live — Shopify 67 (18 Jun 2026), Amazon 10 / TikTok 5 / Magento 0 /
+    Walmart 0 (5 Aug 2026, issue #30). A single page of 1000 covers it; tenants
+    with >1000 configurators would need pagination.
     """
+    ch = _resolve_glt_channel(channel)
     resp = call_linnworks(
         "GenericListings/GetConfiguratorsInfoPaged",
         {"request": {
-            "ChannelType": GLT_SHOPIFY_CHANNEL_TYPE,
-            "ChannelName": GLT_SHOPIFY_CHANNEL_NAME,
+            "ChannelType": ch["channel_type"],
+            "ChannelName": ch["channel_name"],
             "PaginationParameters": {"PageNumber": 1, "EntriesPerPage": 1000},
         }},
     )
@@ -9304,9 +9372,89 @@ def _fetch_shopify_configurators() -> list[dict]:
     return out
 
 
+def _fetch_shopify_configurators() -> list[dict]:
+    """Shopify-scoped alias of _fetch_glt_configurators (list_to_shopify /
+    refresh_channel_listing are Shopify-only by design)."""
+    return _fetch_glt_configurators("Shopify")
+
+
 def _norm_conf_name(name: str | None) -> str:
     """Normalize a configurator name for case/space-insensitive matching."""
     return (name or "").strip().lower()
+
+
+def _glt_channel_id_for(
+    ss_to_channel: dict[str, int], sub_source: str
+) -> tuple[int | None, str | None]:
+    """Pick the ChannelId to open templates with for one sub_source.
+
+    `ss_to_channel` maps normalized configurator SubSource → ChannelId. Returns
+    (channel_id, resolution) where resolution is "exact" or "account-prefix", or
+    (None, None) if the sub_source doesn't belong to this channel.
+
+    The prefix rule exists for Amazon: the channel-SKU table carries regional
+    sub-sources ("The Warehouse Group - Germany") that have no configurator of
+    their own and must resolve to their account ("The Warehouse Group",
+    ChannelId 2). It is anchored to this channel's own account names, so a
+    sub_source belonging to a different channel still resolves to nothing.
+    """
+    want = _norm_conf_name(sub_source)
+    cid = ss_to_channel.get(want)
+    if cid is not None:
+        return cid, "exact"
+    # Longest account prefix wins, so nested account names can't cross-match.
+    best: tuple[int, str] | None = None
+    for acct, acct_cid in ss_to_channel.items():
+        if acct and want.startswith(acct) and len(want) > len(acct):
+            if best is None or len(acct) > len(best[1]):
+                best = (acct_cid, acct)
+    if best is not None:
+        return best[0], "account-prefix"
+    return None, None
+
+
+def _resolve_glt_target(channel: str, sub_source: str) -> dict:
+    """Resolve (channel, sub_source) → the ChannelId to open templates with.
+
+    Shopify is 1:1 — every store has its own configurator SubSource + ChannelId,
+    so an exact match is expected. Amazon is 1:many — ONE account configurator
+    ("The Warehouse Group", ChannelId 2) fronts several regional channel-SKU
+    SubSources ("The Warehouse Group - Germany", …), which have no configurator
+    of their own. So an exact miss falls back to the account whose SubSource the
+    requested one is a prefix of, and the result records how it resolved.
+
+    Returns {ok, channel, channel_id, resolution, available_sub_sources, error}.
+    `resolution` is "exact" or "account-prefix" (or None on failure). A stray
+    sub_source from a DIFFERENT channel never resolves — the prefix fallback is
+    anchored to this channel's own account names, not to "there is only one id".
+    """
+    ch = _resolve_glt_channel(channel)
+    catalogue = _fetch_glt_configurators(ch["channel_type"])
+    available = sorted({c["sub_source"] for c in catalogue if c.get("sub_source")})
+
+    ss_to_channel: dict[str, int] = {}
+    for c in catalogue:
+        ss, cid = c.get("sub_source"), c.get("channel_id")
+        if ss and cid is not None:
+            ss_to_channel.setdefault(_norm_conf_name(ss), cid)
+
+    base = {"channel": ch, "available_sub_sources": available}
+    cid, resolution = _glt_channel_id_for(ss_to_channel, sub_source)
+    if cid is not None:
+        return {**base, "ok": True, "channel_id": cid, "resolution": resolution}
+
+    if not available:
+        err = (
+            f"{ch['channel_type']} has no GLT configurators in this tenant — nothing on "
+            f"{ch['channel_type']} is GLT-managed here, so its listings cannot be taken down "
+            "via the API."
+        )
+    else:
+        err = (
+            f"sub_source '{sub_source}' is not a known {ch['channel_type']} account/store in "
+            f"this tenant. Available: {available}"
+        )
+    return {**base, "ok": False, "channel_id": None, "resolution": None, "error": err}
 
 
 # ---------- Channel listings (read) ----------
@@ -10950,108 +11098,137 @@ def refresh_channel_listing(
 # The destructive counterpart to list_to_shopify (creates) and
 # refresh_channel_listing (revises). Where those keep a listing alive, this ENDS
 # it — the GLT "Delete" action against the item's existing template retires the
-# live Shopify listing so it stops selling. Built for the duplicate-item cleanup
-# in issue #22: after a SKU-scheme migration leaves an orphaned Linnworks item
-# still live-listed on Shopify at a stale quantity, this takes that listing down
-# in bulk instead of doing it by hand in the Shopify admin, SKU by SKU.
+# live listing so it stops selling. Built for the duplicate-item cleanup in issue
+# #22: after a SKU-scheme migration leaves an orphaned Linnworks item still
+# live-listed at a stale quantity, this takes that listing down in bulk instead
+# of doing it by hand in the channel's admin, SKU by SKU.
 #
 # Same read-before-write selection path as refresh_channel_listing (resolve →
-# confirm the SHOPIFY+sub_source channel-SKU mapping → OpenTemplatesByInventory
+# confirm the Source+sub_source channel-SKU mapping → OpenTemplatesByInventory
 # opens the EXISTING template — never creates one), but it forces Action="Delete"
 # and reads the channel-SKU table back afterwards to confirm the listing is gone.
+#
+# GENERALISED BEYOND SHOPIFY (issue #30). The primitive is channel-agnostic — only
+# ChannelType/ChannelName and the channel-SKU Source change — so `channel` now
+# selects any GLT channel (see GLT_CHANNELS). Two live-probed differences from
+# Shopify that the code has to handle, both surfaced 5 Aug 2026 on Amazon:
+#
+#   1. ONE ITEM CAN HAVE SEVERAL TEMPLATES ON ONE CHANNEL. vnm_bearings_gold
+#      returns TWO Amazon templates (32115 = the ".FBA" channel SKU, 32381 = the
+#      merchant one) for a single StockItemId — Shopify returns one per store.
+#      Keying templates by StockItemId (as this tool used to) silently dropped all
+#      but the last, so a "successful" take-down would leave the other listing
+#      live. Templates are now collected as a LIST per item and every one of them
+#      is planned and processed.
+#   2. Info.ActiveListingId is not a product id on Amazon — it is the channel SKU
+#      ("vnm_bearings_gold.FBA"). It is still the right identity to show in the
+#      manifest, just don't read it as a Shopify-style numeric product id.
+#
+# Read-back is done ONCE PER ITEM after all of its templates are processed —
+# with multiple templates feeding one channel-SKU row set, a per-template
+# read-back would report still_listed for a row a later template still owns.
 
 
 @mcp.tool()
 def unpublish_channel_listing(
     skus: list[str],
     sub_source: str = "SWH Shopify",
+    channel: str = "Shopify",
     confirmed_count: int | None = None,
     dry_run: bool = True,
 ) -> dict:
     """
-    Take an EXISTING Shopify listing DOWN — unpublish/retire the storefront
-    listing so it stops selling. Shopify only (v1).
+    Take an EXISTING channel listing DOWN — unpublish/retire the listing so it
+    stops selling. Works on any GLT-managed channel: Shopify, Amazon, TikTok
+    (also Magento/Walmart where a tenant lists through the GLT).
 
     This is the destructive counterpart to `list_to_shopify` (which CREATES
     listings) and `refresh_channel_listing` (which REVISES them). It ends the
     live listing via the GLT "Delete" action against the item's existing
     template. Use it to retire an orphaned/duplicate listing — e.g. after a
-    SKU-scheme migration leaves a stale Linnworks item still live on Shopify at a
-    frozen quantity, silently able to oversell.
+    SKU-scheme migration leaves a stale Linnworks item still live at a frozen
+    quantity, silently able to oversell — or as the take-down step of a
+    dead-product cleanup (delist → wait for channel sync → archive).
 
-    ⚠️  DESTRUCTIVE and customer-facing. A live run removes a REAL Shopify
-    listing (with its reviews, ranking and URL). Point it only at the orphan you
-    mean to retire — NOT the good listing you want to keep. Re-listing later is
-    possible via `list_to_shopify`, but the original listing's channel history
-    (reviews / SEO) is not recoverable.
+    ⚠️  DESTRUCTIVE and customer-facing. A live run removes a REAL listing (with
+    its reviews, ranking and URL). Point it only at the orphan you mean to
+    retire — NOT the good listing you want to keep. Re-listing later is possible,
+    but the original listing's channel history (reviews / SEO) is not recoverable.
+
+    ⚠️  AMAZON / TIKTOK ARE NOT YET LIVE-PROVEN. `ProcessTemplates` Delete is
+    live-proven on SHOPIFY only (v1.25.0). The Amazon read/selection path is
+    live-probed and the delete payload is identical bar ChannelType/ChannelName,
+    but the delete SEMANTICS on Amazon are unverified — prove it on ONE throwaway
+    Amazon listing before any bulk run, exactly as Shopify was proven. Each plan
+    row carries `delete_proven` so an unproven channel is never silently assumed.
+
+    ⚠️  eBay, Etsy, Mirakl and CDiscount are NOT GLT channels — they have no
+    templates and no public listing-management API, so they can only be ended in
+    that channel's own admin. Passing them raises a ValueError.
 
     Flow per SKU (read-before-write):
       1. Resolve SKU → StockItemId + title.
-      2. Confirm the item has a SHOPIFY channel-SKU mapping on `sub_source`
-         (the channel-SKU link table — see get_channel_listings), and capture
-         its current channel_reference_id + listed_quantity for the manifest.
-         Not listed on that store → unresolved.
+      2. Confirm the item has a channel-SKU mapping for this channel's Source on
+         `sub_source` (see get_channel_listings), and capture its current
+         channel_reference_id + listed_quantity for the manifest. Not listed on
+         that store/account → unresolved.
       3. GenericListings/OpenTemplatesByInventory → open the item's EXISTING GLT
-         template for that store (OPENS the existing template — it does NOT
-         create one). Locked templates → unresolved.
-      4. (live run) GenericListings/ProcessTemplates with Action="Delete" →
-         ends the live Shopify listing.
-      5. (live run) Re-read the channel-SKU table to confirm the SHOPIFY row on
-         `sub_source` is gone / no longer listed (`taken_down` per SKU).
-
-    Live safety: the read/selection path (channel check + OpenTemplatesByInventory)
-    is live-confirmed; the ProcessTemplates Delete push is built to the OpenAPI
-    spec but NOT yet live-exercised in this tenant — it retires a real
-    customer-facing listing, so start with a single SKU on a throwaway/orphan
-    item you are certain about.
+         template(s) (OPENS existing templates — it does NOT create any). An item
+         can have SEVERAL templates on one channel (live-observed on Amazon: a
+         merchant and an ".FBA" template on one item) — ALL of them are planned,
+         because deleting one would leave the other live. Locked → unresolved.
+      4. (live run) GenericListings/ProcessTemplates with Action="Delete" per
+         template → ends the live listing.
+      5. (live run) Re-read the channel-SKU table ONCE PER ITEM (after all its
+         templates are processed) to confirm the rows on `sub_source` are gone
+         (`taken_down`).
 
     Staging: the threshold is 10 (the tightest tier, shared with
     delete_inventory_item). For batches > 10 SKUs this returns the plan + manifest
     and asks you to confirm with confirmed_count=<N> before executing.
 
     Args:
-        skus: Exact SKUs / ItemNumbers whose Shopify listings to take down.
-        sub_source: Shopify store name (default "SWH Shopify"). Scopes both the
-            "is it listed?" check and which store's listing is deleted.
+        skus: Exact SKUs / ItemNumbers whose listings to take down.
+        sub_source: Store / account / region name, scoping both the "is it
+            listed?" check and which listing is deleted. Shopify: the store
+            ("SWH Shopify" default, "Venom Skateboards", …). Amazon: the account
+            ("The Warehouse Group") or a regional sub-source
+            ("The Warehouse Group - Germany"), which resolves to the account's
+            ChannelId. TikTok: "SKATEWAREHOUSE_UK".
+        channel: GLT channel — "Shopify" (default), "Amazon", "TikTok",
+            "Magento", "Walmart".
         confirmed_count: For batches > 10 SKUs, pass len(skus) after reviewing the
             plan to confirm the write.
         dry_run: If True (default), returns the plan without taking anything down.
-            Set to False to delete the listings on Shopify.
+            Set to False to delete the listings on the channel.
 
     Returns:
         A dict with:
-          - dry_run, item_count, target_sub_source, target_channel_id,
+          - dry_run, item_count, target_channel, target_source, target_sub_source,
+            target_channel_id, sub_source_resolution, delete_proven,
             available_sub_sources
-          - plan: per-SKU rows that would be taken down (sku, stock_item_id,
-            title, template_id, configurator_id, active_listing_id, status,
-            channel_reference_id, listed_quantity, action)
-          - unresolved: per-SKU error rows (not found / not listed on the store /
-            no template / locked)
-          - results: per-SKU outcome (live run only — processed, taken_down,
+          - plan: one row PER TEMPLATE to be deleted (sku, stock_item_id, title,
+            template_id, configurator_id, active_listing_id, status,
+            channel_reference_id, listed_quantity, next_suggested_action, action)
+          - unresolved: per-SKU error rows (not found / not listed on the
+            store / no template / locked)
+          - results: per-template outcome (live run only — processed, taken_down,
             still_listed, error)
     """
     if not skus:
         raise ValueError("skus must contain at least one SKU.")
 
     _check_injection("sub_source", sub_source or "")
+    _check_injection("channel", channel or "")
 
-    # ── Resolve target store ChannelId from the configurator catalogue ────────
-    catalogue = _fetch_shopify_configurators()
-    available_sub_sources = sorted({c["sub_source"] for c in catalogue if c.get("sub_source")})
-    ss_to_channel: dict[str, int] = {}
-    for c in catalogue:
-        ss, cid = c.get("sub_source"), c.get("channel_id")
-        if ss and cid is not None:
-            ss_to_channel.setdefault(_norm_conf_name(ss), cid)
-    target_channel_id = ss_to_channel.get(_norm_conf_name(sub_source))
-    if target_channel_id is None:
-        return {
-            "error": (
-                f"sub_source '{sub_source}' is not a Shopify store in this tenant. "
-                f"Available: {available_sub_sources}"
-            ),
-            "available_sub_sources": available_sub_sources,
-        }
+    # ── Resolve the target channel + ChannelId from the configurator catalogue ─
+    target = _resolve_glt_target(channel, sub_source)   # raises on a non-GLT channel
+    ch = target["channel"]
+    available_sub_sources = target["available_sub_sources"]
+    if not target["ok"]:
+        return {"error": target["error"], "available_sub_sources": available_sub_sources}
+    target_channel_id = target["channel_id"]
+    channel_source = ch["source"]
 
     # ── Resolve each SKU + confirm it's listed on the target store ────────────
     resolved: list[dict] = []
@@ -11083,13 +11260,15 @@ def unpublish_channel_listing(
             continue
         on_store = [
             r for r in (rows if isinstance(rows, list) else [])
-            if _norm_conf_name(r.get("Source")) == _norm_conf_name(GLT_SHOPIFY_CHANNEL_NAME)
+            if _norm_conf_name(r.get("Source")) == _norm_conf_name(channel_source)
             and _norm_conf_name(r.get("SubSource")) == _norm_conf_name(sub_source)
         ]
         if not on_store:
             unresolved.append({
                 "sku": sku, "stock_item_id": sid, "title": title,
-                "error": f"not listed on Shopify store '{sub_source}' — nothing to take down",
+                "error": (
+                    f"not listed on {ch['channel_type']} '{sub_source}' — nothing to take down"
+                ),
             })
             continue
         # Capture the current listing identity for the manifest / confirmation.
@@ -11098,67 +11277,85 @@ def unpublish_channel_listing(
             "sku": sku, "stock_item_id": sid, "title": title,
             "channel_reference_id": row0.get("ChannelReferenceId"),
             "listed_quantity":      row0.get("ListedQuantity"),
+            "channel_row_count":    len(on_store),
         })
 
     # ── Open the existing GLT templates for the resolved items (read) ──────────
-    templates_by_sid: dict[str, dict] = {}
+    # An item can have MORE THAN ONE template on a channel (live-observed on
+    # Amazon: a merchant template and an ".FBA" template on one StockItemId), so
+    # templates are collected as a LIST per item — keying by id would drop all
+    # but the last and leave the other listing live after a "successful" run.
+    templates_by_sid: dict[str, list[dict]] = {}
     ids = [r["stock_item_id"] for r in resolved]
     for i in range(0, len(ids), 200):
         chunk = ids[i:i + 200]
         resp = call_linnworks(
             "GenericListings/OpenTemplatesByInventory",
             {"request": {
-                "ChannelType": GLT_SHOPIFY_CHANNEL_TYPE,
-                "ChannelName": GLT_SHOPIFY_CHANNEL_NAME,
+                "ChannelType": ch["channel_type"],
+                "ChannelName": ch["channel_name"],
                 "Parameters": {
                     "SelectedRegions":  [],
                     "Token":            _ZERO_GUID,
                     "InventoryItemIds": chunk,
                     "ChannelId":        target_channel_id,
                 },
-                "PaginationParameters": {"PageNumber": 1, "EntriesPerPage": max(len(chunk), 1)},
+                # One item can return several templates, so ask for headroom
+                # rather than exactly len(chunk) entries.
+                "PaginationParameters": {"PageNumber": 1, "EntriesPerPage": max(len(chunk) * 4, 10)},
             }},
         )
         for t in (resp.get("TemplatesInfo") if isinstance(resp, dict) else None) or []:
             tsid = t.get("StockItemId")
             if tsid:
-                templates_by_sid[tsid.lower()] = t
+                templates_by_sid.setdefault(tsid.lower(), []).append(t)
 
-    # ── Build the take-down plan ───────────────────────────────────────────────
+    # ── Build the take-down plan (one row per TEMPLATE) ────────────────────────
     plan: list[dict] = []
     for r in resolved:
-        t = templates_by_sid.get(r["stock_item_id"].lower())
-        if not t:
+        templates = templates_by_sid.get(r["stock_item_id"].lower()) or []
+        if not templates:
             unresolved.append({
                 **r,
                 "error": "listed on the channel but no GLT template could be opened for it",
             })
             continue
-        if t.get("IsLocked"):
-            unresolved.append({
-                **r, "template_id": t.get("Id"),
-                "error": "GLT template is locked — cannot take it down right now",
-            })
-            continue
+        for t in templates:
+            if t.get("IsLocked"):
+                unresolved.append({
+                    **r, "template_id": t.get("Id"),
+                    "error": "GLT template is locked — cannot take it down right now",
+                })
+                continue
 
-        info = t.get("Info") if isinstance(t.get("Info"), dict) else {}
-        plan.append({
-            "sku":                  r["sku"],
-            "stock_item_id":        r["stock_item_id"],
-            "title":                r["title"],
-            "template_id":          t.get("Id"),
-            "configurator_id":      t.get("ConfiguratorId"),
-            "active_listing_id":    _glt_field(info, "ActiveListingId"),
-            "status":               _glt_field(info, "Status"),
-            "channel_reference_id": r["channel_reference_id"],
-            "listed_quantity":      r["listed_quantity"],
-            "action":               "Delete",
-        })
+            info = t.get("Info") if isinstance(t.get("Info"), dict) else {}
+            plan.append({
+                "sku":                   r["sku"],
+                "stock_item_id":         r["stock_item_id"],
+                "title":                 r["title"],
+                "channel":               ch["channel_type"],
+                "sub_source":            sub_source,
+                "template_id":           t.get("Id"),
+                "configurator_id":       t.get("ConfiguratorId"),
+                # On Amazon this is the channel SKU ("…​.FBA"), not a product id.
+                "active_listing_id":     _glt_field(info, "ActiveListingId"),
+                "status":                _glt_field(info, "Status"),
+                "channel_reference_id":  r["channel_reference_id"],
+                "listed_quantity":       r["listed_quantity"],
+                "next_suggested_action": t.get("NextSuggestedAction"),
+                "templates_on_item":     len(templates),
+                "delete_proven":         ch["delete_proven"],
+                "action":                "Delete",
+            })
 
     base_out = {
         "item_count":            len(skus),
+        "target_channel":        ch["channel_type"],
+        "target_source":         channel_source,
         "target_sub_source":     sub_source,
         "target_channel_id":     target_channel_id,
+        "sub_source_resolution": target["resolution"],
+        "delete_proven":         ch["delete_proven"],
         "available_sub_sources": available_sub_sources,
         "plan":                  plan,
         "unresolved":            unresolved,
@@ -11169,16 +11366,26 @@ def unpublish_channel_listing(
     if guard is not None:
         return {**guard, **base_out}
 
+    unproven_note = (
+        ""
+        if ch["delete_proven"]
+        else (
+            f" ⚠️  ProcessTemplates Delete is NOT yet live-proven on {ch['channel_type']} "
+            "(only Shopify is) — prove it on ONE throwaway listing before any bulk run."
+        )
+    )
+
     if dry_run:
         return {
             "dry_run": True,
             **base_out,
             "message": (
-                f"Dry run — nothing taken down. {len(plan)} listing(s) on '{sub_source}' would be "
-                f"DELETED (unpublished from Shopify); {len(unresolved)} SKU(s) could not be taken "
-                "down (see unresolved). Review the plan — confirm each channel_reference_id / "
-                "listed_quantity is the orphan you mean to retire, NOT a listing you want to keep — "
-                "then set dry_run=False. A live run removes real customer-facing Shopify listings."
+                f"Dry run — nothing taken down. {len(plan)} {ch['channel_type']} template(s) on "
+                f"'{sub_source}' would be DELETED (listing ended); {len(unresolved)} SKU(s) could "
+                "not be taken down (see unresolved). Review the plan — confirm each "
+                "channel_reference_id / listed_quantity is the orphan you mean to retire, NOT a "
+                "listing you want to keep — then set dry_run=False. A live run removes real "
+                f"customer-facing listings.{unproven_note}"
             ),
         }
 
@@ -11187,15 +11394,23 @@ def unpublish_channel_listing(
             "dry_run": False,
             **base_out,
             "results": [],
-            "message": "Nothing to take down — no SKU resolved to an existing Shopify template.",
+            "message": (
+                f"Nothing to take down — no SKU resolved to an existing {ch['channel_type']} "
+                "template."
+            ),
         }
 
-    # ── Live execution: ProcessTemplates Delete, then read-back per item ───────
+    # ── Live execution: ProcessTemplates Delete per template ───────────────────
+    # Read-back is deferred until every template for an item has been processed —
+    # several templates can feed one item's channel-SKU rows (Amazon merchant +
+    # FBA), so a per-template read-back would report still_listed for rows the
+    # next template is about to remove.
     results: list[dict] = []
-    taken = 0
     for row in plan:
         res = {
             "sku":         row["sku"],
+            "channel":     ch["channel_type"],
+            "sub_source":  sub_source,
             "template_id": row["template_id"],
             "action":      "Delete",
             "processed":   False,
@@ -11205,8 +11420,8 @@ def unpublish_channel_listing(
             call_linnworks(
                 "GenericListings/ProcessTemplates",
                 {"request": {
-                    "ChannelType": GLT_SHOPIFY_CHANNEL_TYPE,
-                    "ChannelName": GLT_SHOPIFY_CHANNEL_NAME,
+                    "ChannelType": ch["channel_type"],
+                    "ChannelName": ch["channel_name"],
                     "TemplateRequests": [
                         {"TemplateId": row["template_id"], "Action": "Delete"}
                     ],
@@ -11216,95 +11431,141 @@ def unpublish_channel_listing(
             res["processed"] = True
         except RuntimeError as exc:
             res["error"] = f"ProcessTemplates (Delete) failed: {exc}"
-            results.append(res)
-            continue
+        results.append(res)
 
-        # Read-back: is the SHOPIFY row on this store gone / no longer listed?
+    # ── Read-back: once per item, after all of its templates are processed ─────
+    taken = 0
+    for sid in dict.fromkeys(row["stock_item_id"] for row in plan):
+        rows_for_item = [r for r in results
+                         if any(p["template_id"] == r["template_id"] and p["stock_item_id"] == sid
+                                for p in plan)]
         try:
             rows = call_linnworks_get(
-                "Inventory/GetInventoryItemChannelSKUs",
-                {"inventoryItemId": row["stock_item_id"]},
+                "Inventory/GetInventoryItemChannelSKUs", {"inventoryItemId": sid},
             )
             still = [
                 r for r in (rows if isinstance(rows, list) else [])
-                if _norm_conf_name(r.get("Source")) == _norm_conf_name(GLT_SHOPIFY_CHANNEL_NAME)
+                if _norm_conf_name(r.get("Source")) == _norm_conf_name(channel_source)
                 and _norm_conf_name(r.get("SubSource")) == _norm_conf_name(sub_source)
             ]
-            res["still_listed"] = len(still) > 0
-            res["taken_down"] = len(still) == 0
-            if still:
-                taken += 0  # left up; sync may lag — surface but don't count as done
-            else:
-                taken += 1
+            for r in rows_for_item:
+                r["still_listed"] = len(still) > 0
+                r["taken_down"] = len(still) == 0
+                if len(still) == 0 and r.get("processed"):
+                    taken += 1
         except RuntimeError as exc:
-            res["readback_error"] = f"could not confirm take-down: {exc}"
-        results.append(res)
+            for r in rows_for_item:
+                r["readback_error"] = f"could not confirm take-down: {exc}"
 
     return {
         "dry_run": False,
         **base_out,
         "results": results,
         "message": (
-            f"{taken}/{len(plan)} Shopify listing(s) on '{sub_source}' confirmed taken down. "
-            "ProcessTemplates returns no body, so success is inferred from a 2xx plus a channel-SKU "
-            "read-back; the channel may lag, so a row that is still_listed=true may simply not have "
-            "synced yet — re-check with get_channel_listings, and verify in your Shopify admin. "
-            "Per-item errors are in results[].error."
+            f"{taken}/{len(plan)} {ch['channel_type']} template(s) on '{sub_source}' confirmed "
+            "taken down. ProcessTemplates returns no body, so success is inferred from a 2xx plus "
+            "a channel-SKU read-back; the channel may lag, so a row that is still_listed=true may "
+            "simply not have synced yet — re-check with get_channel_listings, and verify in the "
+            f"channel's own admin. Per-item errors are in results[].error.{unproven_note}"
         ),
     }
 
 
 @mcp.tool()
-def delist_all_shopify_listings(
+def delist_all_channel_listings(
     skus: list[str],
+    channels: list[str] | None = None,
     confirmed_count: int | None = None,
     dry_run: bool = True,
 ) -> dict:
     """
-    Take down EVERY Shopify listing for each given item, across ALL Shopify
-    stores it is listed on — the convenience wrapper over unpublish_channel_listing
-    (which handles one store at a time).
+    Take down EVERY GLT-manageable listing for each given item, across ALL
+    channels and stores/accounts it is listed on — the fan-out wrapper over
+    unpublish_channel_listing (which handles one channel+store at a time).
 
-    Built for archived-item cleanup: after you UNARCHIVE items in the Linnworks UI
-    (they must be ACTIVE — an archived SKU cannot be resolved, so this tool can't
-    see it), run this to retire all their Shopify storefront listings in one pass,
-    then re-archive with archive_inventory_items.
+    Built for dead-product cleanup ("retire this product everywhere, then archive
+    it") and archived-item cleanup: UNARCHIVE items in the Linnworks UI first
+    (they must be ACTIVE — an archived SKU cannot be resolved), run this to retire
+    their listings, let the channels sync, then re-archive with
+    archive_inventory_items.
 
-    Per SKU it reads the channel-SKU link table, finds every distinct SHOPIFY
-    store the item is listed on, and delegates each (SKU, store) to the proven
-    unpublish_channel_listing (GLT ProcessTemplates Delete). It does NOT touch the
-    base item, stock, or non-Shopify channels.
+    Per SKU it reads the channel-SKU link table, groups every listing by
+    (channel, store/account), and delegates each group to unpublish_channel_listing
+    (GLT ProcessTemplates Delete). It does NOT touch the base item or its stock.
 
-    ⚠️  SHOPIFY ONLY. Any listing on a non-Shopify channel (Mirakl, eBay, Amazon,
-    Magento…) is reported under `skipped_channels` and left UP — the GLT delete
-    path cannot retire it. So "all listings gone" is only true for Shopify stores.
+    ⚠️  "EVERYWHERE" IS NEVER LITERALLY TRUE. eBay, Etsy, Mirakl and CDiscount are
+    not GLT channels — no templates, no public listing-management API — so their
+    listings are reported under `skipped_channels` and LEFT UP for manual take-down
+    in that channel's own admin. Same for any channel with no configurators in this
+    tenant (Magento/Walmart here).
 
-    ⚠️  DESTRUCTIVE and customer-facing — removes real Shopify listings (reviews,
-    ranking, URL not recoverable). dry_run=True by default; staging threshold 10
-    on the number of (SKU × store) take-downs.
+    ⚠️  ONLY SHOPIFY DELETES ARE LIVE-PROVEN. Amazon/TikTok rows carry
+    delete_proven=false — prove the Delete on ONE throwaway listing per channel
+    before trusting a bulk run.
+
+    ⚠️  AMAZON REGIONS SHARE ONE ACCOUNT. Amazon's regional sub-sources
+    ("The Warehouse Group - Germany", "- Spain", …) all hang off one account
+    (ChannelId 2) and one set of templates, so they are collapsed into a single
+    take-down per (item, account) with the regions listed under `covers_sub_sources`
+    — deleting once per region would just re-delete the same templates. After a
+    live run the tool re-reads each item's rows for that channel and reports any
+    sub-source still present under `still_listed_sub_sources`.
+
+    ⚠️  DESTRUCTIVE and customer-facing — removes real listings (reviews, ranking,
+    URL not recoverable). dry_run=True by default; staging threshold 10 on the
+    number of planned template deletions.
 
     Args:
-        skus: Exact SKUs / ItemNumbers (must be ACTIVE / resolvable) whose Shopify
-            listings should all be taken down.
+        skus: Exact SKUs / ItemNumbers (must be ACTIVE / resolvable) to delist.
+        channels: GLT channels to act on, e.g. ["Shopify", "Amazon"]. Default
+            (None) = every GLT channel that has configurators in this tenant.
+            Pass ["Shopify"] to keep to the live-proven path.
         confirmed_count: For > 10 planned take-downs, pass the take_down_count from
             the dry-run manifest to confirm.
         dry_run: If True (default), preview only. Set False to execute.
 
     Returns:
-        dict with per-SKU discovery (shopify_stores, skipped_channels), a combined
-        `plan` of (sku, store) take-downs, `unresolved`, and — on a live run —
-        per-(sku, store) `results` (processed / taken_down / still_listed / error).
+        dict with `glt_channels` (what is actionable in this tenant), per-SKU
+        `discovery` (targets + skipped_channels), a combined `plan` of template
+        take-downs, `unresolved`, and — on a live run — per-template `results`
+        plus `still_listed_sub_sources`.
     """
     if not skus:
         raise ValueError("skus must contain at least one SKU.")
 
-    catalogue = _fetch_shopify_configurators()
-    shopify_stores = {_norm_conf_name(c["sub_source"]) for c in catalogue if c.get("sub_source")}
+    # ── Which GLT channels are actionable in this tenant? ─────────────────────
+    if channels is None:
+        wanted = list(GLT_CHANNELS.keys())
+    else:
+        wanted = []
+        for c in channels:
+            _check_injection("channels", c or "")
+            wanted.append(_resolve_glt_channel(c)["key"])   # raises on non-GLT
 
-    # ── Discover, per SKU, which Shopify stores (and which non-Shopify channels) ─
+    # One catalogue fetch per channel; a channel with zero configurators is not
+    # GLT-managed here and everything on it must be skipped, not attempted.
+    channel_state: dict[str, dict] = {}
+    for key in dict.fromkeys(wanted):
+        entry = GLT_CHANNELS[key]
+        try:
+            cat = _fetch_glt_configurators(entry["channel_type"])
+        except (RuntimeError, ValueError):
+            cat = []
+        ss_to_channel: dict[str, int] = {}
+        for c in cat:
+            ss, cid = c.get("sub_source"), c.get("channel_id")
+            if ss and cid is not None:
+                ss_to_channel.setdefault(_norm_conf_name(ss), cid)
+        channel_state[_norm_conf_name(entry["source"])] = {
+            **entry, "key": key,
+            "ss_to_channel": ss_to_channel,
+            "accounts": sorted({c["sub_source"] for c in cat if c.get("sub_source")}),
+        }
+
+    # ── Discover, per SKU, what is actionable and what must be skipped ────────
     discovery: list[dict] = []
     unresolved: list[dict] = []
-    work: list[tuple[str, str]] = []   # (sku, actual store sub_source)
+    work: list[dict] = []    # {sku, channel_type, sub_source}
     for raw in skus:
         sku = (raw or "").strip()
         if not sku:
@@ -11334,37 +11595,82 @@ def delist_all_shopify_listings(
                                "error": f"could not read channel listings: {exc}"})
             continue
         rows = rows if isinstance(rows, list) else []
-        stores_here: list[str] = []
+
+        # Collapse to one take-down per (channel, resolved ChannelId): Amazon's
+        # regional sub-sources share one account and one template set.
+        targets: dict[tuple[str, int], dict] = {}
         skipped: list[dict] = []
-        seen_stores: set[str] = set()
         for r in rows:
             src, ss = r.get("Source"), r.get("SubSource")
-            if _norm_conf_name(src) == _norm_conf_name(GLT_SHOPIFY_CHANNEL_NAME):
-                key = _norm_conf_name(ss)
-                if key in shopify_stores and key not in seen_stores:
-                    seen_stores.add(key)
-                    stores_here.append(ss)
-                    work.append((sku, ss))
-            else:
-                skipped.append({"source": src, "sub_source": ss,
-                                "channel_reference_id": r.get("ChannelReferenceId")})
+            state = channel_state.get(_norm_conf_name(src))
+            if state is None:
+                skipped.append({
+                    "source": src, "sub_source": ss,
+                    "channel_reference_id": r.get("ChannelReferenceId"),
+                    "reason": (
+                        "not a GLT channel — no template, no public listing API; end it in the "
+                        "channel's own admin"
+                        if _norm_conf_name(src) in {_norm_conf_name(s) for s in NON_GLT_SOURCES}
+                        else "channel not selected / not GLT-manageable in this tenant"
+                    ),
+                })
+                continue
+            cid, resolution = _glt_channel_id_for(state["ss_to_channel"], ss or "")
+            if cid is None:
+                skipped.append({
+                    "source": src, "sub_source": ss,
+                    "channel_reference_id": r.get("ChannelReferenceId"),
+                    "reason": (
+                        f"no {state['channel_type']} GLT configurator matches this sub-source "
+                        f"(accounts here: {state['accounts'] or 'none'})"
+                    ),
+                })
+                continue
+            k = (state["channel_type"], cid)
+            t = targets.setdefault(k, {
+                "channel": state["channel_type"],
+                "channel_id": cid,
+                "sub_source": ss,                 # representative (delete target)
+                "sub_source_resolution": resolution,
+                "covers_sub_sources": [],
+                "delete_proven": state["delete_proven"],
+            })
+            if ss and ss not in t["covers_sub_sources"]:
+                t["covers_sub_sources"].append(ss)
+            # Prefer an exactly-matching account as the representative, so the
+            # delegated call resolves without relying on the prefix fallback.
+            if resolution == "exact" and t["sub_source_resolution"] != "exact":
+                t["sub_source"] = ss
+                t["sub_source_resolution"] = "exact"
+
+        for t in targets.values():
+            work.append({"sku": sku, "channel_type": t["channel"], "sub_source": t["sub_source"]})
         discovery.append({
             "sku": sku, "stock_item_id": sid, "title": item.get("ItemTitle"),
-            "shopify_stores": stores_here, "skipped_channels": skipped,
+            "targets": list(targets.values()), "skipped_channels": skipped,
         })
 
-    # ── Build the combined plan by dry-running the proven tool per (sku, store) ──
+    # ── Build the combined plan by dry-running the single-channel tool ────────
     plan: list[dict] = []
-    for sku, store in work:
-        sub = unpublish_channel_listing(skus=[sku], sub_source=store, dry_run=True)
-        for p in sub.get("plan", []):
-            plan.append({**p, "sub_source": store})
+    for w in work:
+        sub = unpublish_channel_listing(
+            skus=[w["sku"]], sub_source=w["sub_source"], channel=w["channel_type"], dry_run=True
+        )
+        if sub.get("error"):
+            unresolved.append({**w, "error": sub["error"]})
+            continue
+        plan.extend(sub.get("plan", []))
         for u in sub.get("unresolved", []):
-            unresolved.append({**u, "sub_source": store})
+            unresolved.append({**u, "channel": w["channel_type"], "sub_source": w["sub_source"]})
 
+    glt_channels = [
+        {"channel": s["channel_type"], "accounts": s["accounts"],
+         "actionable": bool(s["accounts"]), "delete_proven": s["delete_proven"]}
+        for s in channel_state.values()
+    ]
     base_out = {
         "item_count":       len(skus),
-        "shopify_stores_in_tenant": sorted(shopify_stores),
+        "glt_channels":     glt_channels,
         "discovery":        discovery,
         "plan":             plan,
         "unresolved":       unresolved,
@@ -11374,9 +11680,16 @@ def delist_all_shopify_listings(
     }
 
     # ── Write guard (threshold 10) on the number of take-downs ─────────────────
-    guard = _write_guard("delist_all_shopify_listings", plan, confirmed_count, dry_run)
+    guard = _write_guard("delist_all_channel_listings", plan, confirmed_count, dry_run)
     if guard is not None:
         return {**guard, **base_out}
+
+    unproven = sorted({p["channel"] for p in plan if not p.get("delete_proven")})
+    unproven_note = (
+        f" ⚠️  {', '.join(unproven)} Delete is NOT live-proven — prove it on one throwaway "
+        "listing per channel first."
+        if unproven else ""
+    )
 
     if dry_run:
         return {
@@ -11384,30 +11697,96 @@ def delist_all_shopify_listings(
             **base_out,
             "take_down_count": len(plan),
             "message": (
-                f"Dry run — nothing taken down. {len(plan)} Shopify listing(s) across "
-                f"{len({(p['sku'], p['sub_source']) for p in plan})} (item×store) would be DELETED; "
-                f"{len(base_out['skipped_channels'])} non-Shopify listing(s) can't be taken down "
-                "(see skipped_channels) and will stay up. Review the plan, then set dry_run=False."
+                f"Dry run — nothing taken down. {len(plan)} template(s) across "
+                f"{len({(p['sku'], p['channel'], p['sub_source']) for p in plan})} "
+                f"(item×channel×account) would be DELETED; "
+                f"{len(base_out['skipped_channels'])} listing(s) can't be taken down (see "
+                f"skipped_channels) and will stay up. Review the plan, then set "
+                f"dry_run=False.{unproven_note}"
             ),
         }
 
-    # ── Live execution: delegate each (sku, store) to the proven tool ──────────
+    # ── Live execution: delegate each (sku, channel, account) ─────────────────
     results: list[dict] = []
-    for sku, store in work:
-        sub = unpublish_channel_listing(skus=[sku], sub_source=store, dry_run=False)
-        for r in sub.get("results", []):
-            results.append({**r, "sub_source": store})
+    for w in work:
+        sub = unpublish_channel_listing(
+            skus=[w["sku"]], sub_source=w["sub_source"], channel=w["channel_type"], dry_run=False
+        )
+        results.extend(sub.get("results", []))
+
+    # ── Honest read-back: which sub-sources are STILL listed per (sku, channel)?
+    # The delegated read-back only sees its own representative sub-source; Amazon
+    # regions have to be re-checked explicitly.
+    still_listed: list[dict] = []
+    for d in discovery:
+        if not d["targets"]:
+            continue
+        try:
+            rows = call_linnworks_get(
+                "Inventory/GetInventoryItemChannelSKUs", {"inventoryItemId": d["stock_item_id"]}
+            )
+        except RuntimeError as exc:
+            still_listed.append({"sku": d["sku"], "readback_error": str(exc)})
+            continue
+        rows = rows if isinstance(rows, list) else []
+        for t in d["targets"]:
+            src = GLT_CHANNELS[_norm_conf_name(t["channel"])]["source"]
+            remaining = sorted({
+                r.get("SubSource") for r in rows
+                if _norm_conf_name(r.get("Source")) == _norm_conf_name(src)
+                and r.get("SubSource") in t["covers_sub_sources"]
+            })
+            if remaining:
+                still_listed.append({
+                    "sku": d["sku"], "channel": t["channel"], "sub_sources": remaining,
+                })
+
     taken = sum(1 for r in results if r.get("taken_down"))
     return {
         "dry_run": False,
         **base_out,
         "results": results,
+        "still_listed_sub_sources": still_listed,
         "message": (
-            f"{taken}/{len(results)} Shopify listing(s) confirmed taken down across all stores. "
-            f"{len(base_out['skipped_channels'])} non-Shopify listing(s) left up (see "
-            "skipped_channels). Channel sync may lag — re-check with get_channel_listings."
+            f"{taken}/{len(results)} template(s) confirmed taken down across all selected "
+            f"channels. {len(base_out['skipped_channels'])} listing(s) left up (see "
+            "skipped_channels) — those need ending in the channel's own admin. "
+            "still_listed_sub_sources lists any store/region whose channel-SKU row survived; "
+            "channel sync can lag, so re-check with get_channel_listings before concluding the "
+            f"take-down failed.{unproven_note}"
         ),
     }
+
+
+@mcp.tool()
+def delist_all_shopify_listings(
+    skus: list[str],
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Take down every SHOPIFY listing for each given item, across all Shopify stores
+    it is listed on — the Shopify-scoped, live-proven slice of
+    delist_all_channel_listings.
+
+    Identical behaviour and safety posture, with `channels` pinned to Shopify:
+    non-Shopify listings (Amazon, TikTok, eBay, Mirakl…) are reported under
+    `skipped_channels` and LEFT UP. Use `delist_all_channel_listings` to also
+    retire Amazon/TikTok (GLT) listings — noting those deletes are not yet
+    live-proven.
+
+    ⚠️  DESTRUCTIVE and customer-facing. dry_run=True by default; staging
+    threshold 10 on the number of planned take-downs.
+
+    Args:
+        skus: Exact SKUs / ItemNumbers (must be ACTIVE / resolvable).
+        confirmed_count: For > 10 planned take-downs, pass the take_down_count
+            from the dry-run manifest to confirm.
+        dry_run: If True (default), preview only. Set False to execute.
+    """
+    return delist_all_channel_listings(
+        skus=skus, channels=["Shopify"], confirmed_count=confirmed_count, dry_run=dry_run
+    )
 
 
 @mcp.tool()
