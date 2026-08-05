@@ -9290,8 +9290,13 @@ _ZERO_GUID = "00000000-0000-0000-0000-000000000000"
 GLT_CHANNELS: dict[str, dict] = {
     "shopify": {"channel_type": "Shopify", "channel_name": "SHOPIFY", "source": "SHOPIFY",
                 "delete_proven": True},
+    # Amazon Delete LIVE-PROVEN 5 Aug 2026 on MOB-GRP-3080 (template 31703, ASIN
+    # B0B311TFG3): ProcessTemplates Delete → 2xx, the AMAZON channel-SKU row and
+    # the template both disappeared, eBay/Shopify rows and stock untouched. NB it
+    # succeeded even though the template read NextSuggestedAction:"NotAllowed" —
+    # that flag describes the SUGGESTED action, it does not gate a forced Delete.
     "amazon":  {"channel_type": "Amazon",  "channel_name": "AMAZON",  "source": "AMAZON",
-                "delete_proven": False},
+                "delete_proven": True},
     "tiktok":  {"channel_type": "TikTok",  "channel_name": "TIKTOK",  "source": "TIKTOK",
                 "delete_proven": False},
     "magento": {"channel_type": "Magento", "channel_name": "MAGENTO", "source": "MAGENTO",

@@ -191,7 +191,8 @@ def test_amazon_plans_every_template_on_the_item():
     assert r["target_source"] == "AMAZON"
     assert r["target_channel_id"] == 2
     assert r["sub_source_resolution"] == "exact"
-    assert r["delete_proven"] is False
+    # Amazon Delete was live-proven 5 Aug 2026 (MOB-GRP-3080 / tpl 31703).
+    assert r["delete_proven"] is True
     assert sorted(p["template_id"] for p in r["plan"]) == [32115, 32381]
     assert all(p["templates_on_item"] == 2 for p in r["plan"])
     # Amazon ActiveListingId is the channel SKU, not a numeric product id.
@@ -374,7 +375,7 @@ def test_fanout_skips_non_glt_channels_with_a_reason():
     assert not any(p["channel"] in ("EBAY", "Mirakl MP") for p in r["plan"])
 
 
-def test_fanout_channels_filter_and_unproven_warning():
+def test_fanout_channels_filter_scopes_the_plan():
     import server
     patches, _ = _mock()
     for p in patches: p.start()
@@ -385,10 +386,39 @@ def test_fanout_channels_filter_and_unproven_warning():
         for p in patches: p.stop()
 
     assert sorted(p["template_id"] for p in r["plan"]) == [32115, 32381]
-    assert all(p["delete_proven"] is False for p in r["plan"])
-    assert "not live-proven" in r["message"].lower() or "NOT live-proven" in r["message"]
     # Shopify/TikTok rows are reported as skipped, not silently dropped.
     assert {s["source"] for s in r["skipped_channels"]} >= {"SHOPIFY", "TIKTOK"}
+
+
+def test_unproven_channel_is_flagged_and_warned_about():
+    """Shopify and Amazon Deletes are live-proven; TikTok is not, so its rows
+    must carry delete_proven=false and the message must say so."""
+    import server
+    patches, _ = _mock()
+    for p in patches: p.start()
+    try:
+        r = server.delist_all_channel_listings(
+            ["vnm_bearings_gold"], channels=["TikTok"], dry_run=True)
+    finally:
+        for p in patches: p.stop()
+
+    assert [p["template_id"] for p in r["plan"]] == [30181]
+    assert all(p["delete_proven"] is False for p in r["plan"])
+    assert "not live-proven" in r["message"].lower()
+
+
+def test_proven_channels_carry_no_warning():
+    import server
+    patches, _ = _mock()
+    for p in patches: p.start()
+    try:
+        r = server.delist_all_channel_listings(
+            ["vnm_bearings_gold"], channels=["Shopify", "Amazon"], dry_run=True)
+    finally:
+        for p in patches: p.stop()
+
+    assert all(p["delete_proven"] is True for p in r["plan"])
+    assert "not live-proven" not in r["message"].lower()
 
 
 def test_fanout_rejects_a_non_glt_channel_argument():
