@@ -852,6 +852,328 @@ def search_inventory_items(
     }
 
 
+# ---------------------------------------------------------------------------
+# Bulk active-inventory enumeration (Stock/GetStockItemsFull)
+# ---------------------------------------------------------------------------
+#
+# The "give me EVERYTHING" counterpart to search_inventory_items' keyword search,
+# built for catalogue-cleanup sweeps: find every active item sitting at zero across
+# ALL locations, then hand those to the delist/archive tools.
+#
+# Four behaviours of Stock/GetStockItemsFull were live-probed for this (5 Aug 2026,
+# issue #32) and every one of them changes what the tool can promise:
+#
+#   • loadCompositeParents / loadVariationParents are INCLUDE flags, NOT
+#     "load extra detail" flags. With both false — the payload previously recorded
+#     in CLAUDE.md as the "full active-item enumerator" — composite and variation
+#     parents are silently ABSENT from the results. Live: the vnm-catnip family
+#     returns 8 items with both true and 1 with both false. So that documented
+#     sweep was never the full catalogue. Both default to True here.
+#   • dataRequirements is a STRING enum on this endpoint
+#     ("StockLevels"/"Pricing"/"Supplier"/…), not the integer [1] that
+#     GetStockItemsFullByIds wants for Suppliers[]. "StockLevels" populates a
+#     PER-LOCATION StockLevels array — which is what makes "out of stock
+#     EVERYWHERE" answerable in one sweep rather than one sweep per location.
+#   • There is NO TotalEntries/TotalPages and NO top-level Quantity on this model.
+#     Paging past the end returns HTTP 400 "No items found with given filter" —
+#     an end-of-results signal, not a failure — and quantities must be derived by
+#     summing the per-location rows. Cross-checked live against the GET endpoint:
+#     Default 1 + Keen 6 == GET Quantity 7; InOrders == GET InOrder.
+#   • There is NO IsCompositeParent field on this model (only IsVariationParent).
+#     That flag lives on the Stock/GetStockItems GET rows instead, so it is filled
+#     here only on request, from the cached composite index (see
+#     flag_composite_parents below).
+#
+# ⚠️  ACTIVE ITEMS ONLY — like every other list/search endpoint, this never returns
+# archived items (~32k active vs ~93k including archived on this tenant). "Every
+# stock item" means every ACTIVE one.
+
+_STOCK_LEVEL_SUM_FIELDS = {
+    "quantity": "StockLevel",
+    "available": "Available",
+    "in_order":  "InOrders",
+    "due":       "Due",
+}
+
+
+def _fetch_full_stock_page(
+    page: int,
+    per_page: int,
+    include_composite_parents: bool,
+    include_variation_parents: bool,
+    data_requirements: list[str],
+) -> list | None:
+    """
+    Fetch one page of Stock/GetStockItemsFull, with a 429 backoff.
+
+    Returns the page's rows, or None when the page is past the end of the
+    catalogue — Linnworks signals that with HTTP 400 "No items found with given
+    filter" rather than an empty list, so auto-paging terminates on None instead
+    of surfacing a spurious error.
+    """
+    payload = {
+        "keyword": "",
+        "loadCompositeParents": include_composite_parents,
+        "loadVariationParents": include_variation_parents,
+        "entriesPerPage": per_page,
+        "pageNumber": page,
+        "dataRequirements": data_requirements,
+        "searchTypes": [],
+    }
+    for _ in range(6):
+        try:
+            resp = call_linnworks("Stock/GetStockItemsFull", payload)
+            return resp if isinstance(resp, list) else []
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "No items found with given filter" in msg:
+                return None  # past the last page — a clean end, not a failure
+            if "429" in msg or "quota" in msg.lower():
+                time.sleep(15)
+                continue
+            raise
+    raise RuntimeError(
+        f"Inventory sweep aborted: repeated rate-limit (429) on page {page}. "
+        "No partial result is returned — a truncated sweep would under-report "
+        "items and could wrongly clear stock as dead."
+    )
+
+
+def _format_full_stock_row(
+    row: dict,
+    location_id: str | None,
+    stock_levels_loaded: bool,
+) -> dict:
+    """
+    Map a Stock/GetStockItemsFull row to the MCP-facing shape.
+
+    Quantities are DERIVED from the per-location StockLevels array (this model has
+    no top-level Quantity): summed across every location, or taken from just one
+    when location_id scopes the view.
+
+    stock_levels_loaded must be passed rather than inferred from the row — the
+    endpoint returns "StockLevels": [] BOTH when levels weren't requested and when
+    an item genuinely has no stock rows, and those must not read the same. Levels
+    unread give None ("not read"); levels read but empty give 0 (really no stock).
+    Conflating them would let an unread figure pass a zero-stock cleanup filter.
+    """
+    levels = row.get("StockLevels") or []
+    if location_id:
+        wanted = location_id.strip().lower()
+        levels = [
+            l for l in levels
+            if ((l.get("Location") or {}).get("StockLocationId") or "").lower() == wanted
+        ]
+
+    if not stock_levels_loaded:
+        levels = []
+        totals = {k: None for k in _STOCK_LEVEL_SUM_FIELDS}
+    else:
+        totals = {
+            key: sum((l.get(field) or 0) for l in levels)
+            for key, field in _STOCK_LEVEL_SUM_FIELDS.items()
+        }
+
+    return {
+        "sku": row.get("ItemNumber"),
+        "stock_item_id": row.get("StockItemId"),
+        "title": row.get("ItemTitle"),
+        "barcode": row.get("BarcodeNumber"),
+        "category_name": row.get("CategoryName"),
+        "category_id": row.get("CategoryId"),
+        "purchase_price": row.get("PurchasePrice"),
+        "quantity": totals["quantity"],
+        "available": totals["available"],
+        "in_order": totals["in_order"],
+        "due": totals["due"],
+        "is_variation_parent": row.get("IsVariationParent", False),
+        # Not on this model — filled only when flag_composite_parents=True.
+        "is_composite_parent": None,
+        "locations": [
+            {
+                "location_id": (l.get("Location") or {}).get("StockLocationId"),
+                "location_name": (l.get("Location") or {}).get("LocationName"),
+                "stock_level": l.get("StockLevel"),
+                "available": l.get("Available"),
+                "in_order": l.get("InOrders"),
+                "due": l.get("Due"),
+                "minimum_level": l.get("MinimumLevel"),
+            }
+            for l in levels
+        ],
+    }
+
+
+@mcp.tool()
+def list_inventory_items(
+    page: int = 1,
+    per_page: int = 200,
+    all_pages: bool = False,
+    include_stock_levels: bool = True,
+    location_id: str | None = None,
+    zero_stock_only: bool = False,
+    include_composite_parents: bool = True,
+    include_variation_parents: bool = True,
+    flag_composite_parents: bool = False,
+    max_items: int = 5000,
+) -> dict:
+    """
+    Enumerate ACTIVE inventory items with their stock levels — the bulk
+    "give me everything" counterpart to search_inventory_items (keyword) and
+    find_inventory_item (exact SKU).
+
+    Built for the catalogue-cleanup sweep: "give me every active stock item with
+    its current quantity, so I can find everything that's out of stock across all
+    locations", then feed those SKUs to find_composite_parents (the archive gate),
+    delist_all_channel_listings, and archive_inventory_items.
+
+    PER-LOCATION STOCK is the point. With include_stock_levels=True (default) each
+    item carries a `locations` breakdown, and `quantity`/`available`/`in_order` are
+    the SUM across every location. That is what makes "out of stock EVERYWHERE"
+    answerable — on this tenant stock sits at ~28 per-supplier locations as well as
+    Default, so a Default-only zero is NOT dead stock. Pass `location_id` to scope
+    the figures to one location instead.
+
+    ⚠️ ACTIVE ITEMS ONLY. Like every Linnworks list/search endpoint, this never
+    returns archived items (~32k active vs ~93k including archived here). "Every
+    stock item" means every ACTIVE one; there is no endpoint that enumerates
+    archived stock (only a UI/Data export).
+
+    COST. One API call per 200 items. all_pages=True sweeps the whole catalogue —
+    ~170 calls / ~90s on this tenant — so it is an AUTOPAGINATING tool: never run
+    it in parallel with another one (get_top_skus, find_composite_parents, the
+    category sweep …), they will rate-limit each other. It throttles under the
+    150/min limit and backs off on 429.
+
+    Args:
+        page: 1-based page number (ignored when all_pages=True).
+        per_page: Items per page (default 200, the Linnworks maximum).
+        all_pages: Sweep the entire catalogue instead of one page. Expensive —
+            see COST above. Pair with zero_stock_only / max_items to keep the
+            response manageable.
+        include_stock_levels: Load the per-location StockLevels (default True).
+            Set False for a faster metadata-only listing — quantities then come
+            back as None (meaning "not read", NOT zero).
+        location_id: Scope quantities to one location's stock only (from
+            get_locations; Default is the zero-GUID). Requires
+            include_stock_levels. Items with no stock row at that location report
+            zero and an empty `locations` list.
+        zero_stock_only: Return only items whose quantity is zero in the scope
+            being measured — i.e. across ALL locations by default, or at
+            `location_id` when scoped. This is the cleanup-candidate filter.
+            Requires include_stock_levels.
+        include_composite_parents: Include composite/bundle parent items
+            (default True). These are INCLUDE flags on the Linnworks side —
+            setting this False makes bundle parents ABSENT from the results, which
+            is what a cleanup sweep usually wants (a parent carries no stock of
+            its own), but means the listing is no longer the full catalogue.
+        include_variation_parents: Same, for variation-group parents (default True).
+        flag_composite_parents: Fill each item's `is_composite_parent`. The
+            endpoint behind this tool does NOT carry that field, so it is derived
+            from the composite index used by find_composite_parents — which costs
+            ~215 extra API calls to build the first time, then is cached for 15
+            minutes. Leave False (the default) and `is_composite_parent` stays
+            None, meaning "not determined". `is_variation_parent` is always real.
+        max_items: Safety cap on how many item rows are RETURNED (default 5000).
+            The sweep still completes and the counts still cover everything
+            scanned — only the `items` detail is truncated, flagged by
+            `truncated: true`.
+
+    Returns:
+        A dict with:
+          - scope:          active_only / location / parent-flag settings in force
+          - pages_fetched:  API pages read
+          - scanned_count:  items examined across those pages
+          - matched_count:  items passing zero_stock_only (== scanned when off)
+          - count:          item rows actually returned
+          - truncated:      True when max_items clipped the returned rows
+          - complete:       True when the whole catalogue was swept (all_pages)
+          - items:          sku, stock_item_id, title, barcode, category_name,
+                            category_id, purchase_price, quantity, available,
+                            in_order, due, is_variation_parent,
+                            is_composite_parent, locations[]
+    """
+    per_page = max(1, min(per_page, 200))
+    page = max(1, page)
+    max_items = max(1, max_items)
+
+    if location_id and not include_stock_levels:
+        raise ValueError(
+            "location_id requires include_stock_levels=True — quantities are "
+            "derived from the per-location StockLevels array."
+        )
+    if zero_stock_only and not include_stock_levels:
+        raise ValueError(
+            "zero_stock_only requires include_stock_levels=True — with stock "
+            "levels unread, quantity is None (not read) and cannot be tested "
+            "for zero."
+        )
+
+    data_requirements = ["StockLevels"] if include_stock_levels else []
+
+    items: list[dict] = []
+    scanned = 0
+    matched = 0
+    pages_fetched = 0
+    truncated = False
+    current = page
+
+    while True:
+        rows = _fetch_full_stock_page(
+            current, per_page,
+            include_composite_parents, include_variation_parents,
+            data_requirements,
+        )
+        if rows is None:  # past the last page — clean end, not an error
+            break
+        pages_fetched += 1
+        scanned += len(rows)
+
+        for row in rows:
+            formatted = _format_full_stock_row(row, location_id, include_stock_levels)
+            # Guarded above: zero_stock_only requires include_stock_levels, so
+            # quantity here is a real number, never an unread None.
+            if zero_stock_only and formatted["quantity"] != 0:
+                continue
+            matched += 1
+            if len(items) < max_items:
+                items.append(formatted)
+            else:
+                truncated = True
+
+        if not all_pages or not rows or len(rows) < per_page:
+            break
+        current += 1
+        time.sleep(0.42)  # stay under the 150/min rate limit
+
+    if flag_composite_parents and items:
+        parents = _get_composite_index().get("parents") or {}
+        for it in items:
+            sid = (it.get("stock_item_id") or "").lower()
+            it["is_composite_parent"] = sid in parents
+
+    return {
+        "scope": {
+            "active_only": True,
+            "location_id": location_id,
+            "stock_levels_loaded": include_stock_levels,
+            "zero_stock_only": zero_stock_only,
+            "includes_composite_parents": include_composite_parents,
+            "includes_variation_parents": include_variation_parents,
+            "composite_parent_flag_resolved": flag_composite_parents,
+        },
+        "page": None if all_pages else page,
+        "per_page": per_page,
+        "pages_fetched": pages_fetched,
+        "scanned_count": scanned,
+        "matched_count": matched,
+        "count": len(items),
+        "truncated": truncated,
+        "complete": all_pages,
+        "items": items,
+    }
+
+
 def _format_variation_member(m: dict) -> dict:
     """Map a Stock/GetVariationItems member row to the MCP-facing shape."""
     return {

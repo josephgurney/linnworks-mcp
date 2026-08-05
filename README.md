@@ -1,7 +1,7 @@
 # Linnworks MCP Server
 
-![Version](https://img.shields.io/badge/version-1.33.0-blue)
-![Tools](https://img.shields.io/badge/tools-82-blue)
+![Version](https://img.shields.io/badge/version-1.34.0-blue)
+![Tools](https://img.shields.io/badge/tools-83-blue)
 
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
 
@@ -46,6 +46,7 @@ Once installed, Claude gets access to these tools:
 |---|---|
 | `find_inventory_item` | Look up an inventory item by exact SKU |
 | `search_inventory_items` | Keyword search across title, SKU, and barcode — paged (the UI search box) |
+| `list_inventory_items` | Enumerate ALL active items with per-location stock — the bulk sweep behind "what's out of stock everywhere?". Filter to `zero_stock_only`, scope to one `location_id`, or exclude bundle/variation parents. Autopaginating with `all_pages=True` |
 | `get_stock_level` | Current stock level for a SKU across all locations |
 | `get_item_relationships` | Resolve a SKU's variation/composite parent–child links (parent → children, and child → variation parent) |
 | `find_composite_parents` | The reverse lookup: which bundles/composites CONTAIN these SKUs, and are those parents still listed. The safety gate before archiving or deleting a component. Batch — pass every candidate SKU in one call |
