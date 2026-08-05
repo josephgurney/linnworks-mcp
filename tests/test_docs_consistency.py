@@ -1,0 +1,112 @@
+"""
+Guards the hand-maintained docs against drift from the code.
+
+Every fact checked here has actually gone stale in this repo, silently, for
+several releases at a time — none of it was caught by a human read-through:
+
+  - CLAUDE.md's Tools section still said "51 tools (44 in v1.10.0 + 7 in
+    v1.11.0)" at v1.33.0, when 82 were registered.
+  - server.py's __version__ sat at 1.17.0 through seventeen minor releases.
+  - CLAUDE.md's WRITE_THRESHOLDS table fell 11 rows behind the code — and that
+    table is what tells Claude when a bulk write gets staged for confirmation.
+  - update_order_shipping_address shipped in v1.4.0 and was missing from
+    CLAUDE.md's tools table entirely until v1.34.0.
+
+These are cheap, offline, and require no credentials (conftest sets dummies).
+When one fails, fix the doc — don't relax the test.
+"""
+import asyncio
+import re
+import sys
+import tomllib
+from pathlib import Path
+
+import pytest
+
+import server
+
+ROOT = Path(__file__).resolve().parent.parent
+CLAUDE_MD = (ROOT / "CLAUDE.md").read_text()
+README_MD = (ROOT / "README.md").read_text()
+PYPROJECT_VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+
+TOOL_NAMES = sorted(t.name for t in asyncio.run(server.mcp.list_tools()))
+TOOL_COUNT = len(TOOL_NAMES)
+
+
+# --- version ----------------------------------------------------------------
+
+def test_server_version_matches_pyproject():
+    assert server.__version__ == PYPROJECT_VERSION, (
+        f"server.__version__ is {server.__version__} but pyproject.toml says "
+        f"{PYPROJECT_VERSION} — bump both on release."
+    )
+
+
+def test_claude_md_header_version_matches_pyproject():
+    assert f"**Current version: {PYPROJECT_VERSION}**" in CLAUDE_MD
+
+
+def test_readme_version_badge_matches_pyproject():
+    assert f"badge/version-{PYPROJECT_VERSION}-blue" in README_MD
+
+
+# --- tool count -------------------------------------------------------------
+
+def test_claude_md_header_tool_count_is_current():
+    assert f"— {TOOL_COUNT} tools" in CLAUDE_MD, (
+        f"{TOOL_COUNT} tools are registered; CLAUDE.md's header says otherwise."
+    )
+
+
+def test_claude_md_tools_section_count_is_current():
+    assert f"\n{TOOL_COUNT} tools." in CLAUDE_MD, (
+        f"{TOOL_COUNT} tools are registered; the Tools section says otherwise."
+    )
+
+
+def test_readme_tool_count_badge_is_current():
+    assert f"badge/tools-{TOOL_COUNT}-blue" in README_MD
+
+
+# --- tool coverage ----------------------------------------------------------
+
+def test_every_registered_tool_is_documented_in_claude_md():
+    missing = [t for t in TOOL_NAMES if f"`{t}" not in CLAUDE_MD]
+    assert not missing, f"Tools registered but absent from CLAUDE.md: {missing}"
+
+
+def test_every_registered_tool_is_documented_in_readme():
+    missing = [t for t in TOOL_NAMES if f"`{t}`" not in README_MD]
+    assert not missing, f"Tools registered but absent from README.md: {missing}"
+
+
+# --- write thresholds -------------------------------------------------------
+# Both docs restate WRITE_THRESHOLDS as a markdown table; it is the contract for
+# when a bulk write is staged for confirmation, so a stale row understates risk.
+
+def _threshold_rows(text: str) -> dict:
+    return {k: int(v) for k, v in re.findall(r"^\| \`([a-z_]+)\` \| (\d+)[ |]", text, re.M)}
+
+
+@pytest.mark.parametrize("doc_name", ["CLAUDE.md", "README.md"])
+def test_threshold_tables_match_the_code(doc_name):
+    # Look the text up by name rather than parametrising on it — passing the file
+    # contents as a param makes pytest embed the whole document in the test id,
+    # so a single failure prints ~180KB of markdown.
+    documented = _threshold_rows({"CLAUDE.md": CLAUDE_MD, "README.md": README_MD}[doc_name])
+    code = {k: v for k, v in server.WRITE_THRESHOLDS.items() if k != "default"}
+
+    missing = sorted(k for k in code if k not in documented)
+    assert not missing, f"{doc_name} threshold table is missing: {missing}"
+
+    wrong = {k: (code[k], documented[k]) for k in code if documented[k] != code[k]}
+    assert not wrong, f"{doc_name} threshold mismatches (code, doc): {wrong}"
+
+
+def test_every_documented_threshold_actually_exists_in_code():
+    """Catches the reverse drift: a doc row for a tool that no longer has one."""
+    code = set(server.WRITE_THRESHOLDS)
+    for doc_name, text in (("CLAUDE.md", CLAUDE_MD), ("README.md", README_MD)):
+        stale = sorted(k for k in _threshold_rows(text) if k not in code)
+        assert not stale, f"{doc_name} lists thresholds not in WRITE_THRESHOLDS: {stale}"

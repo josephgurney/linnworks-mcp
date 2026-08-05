@@ -9,7 +9,8 @@ See README.md for setup instructions.
 """
 from __future__ import annotations
 
-__version__ = "1.17.0"
+# Keep in sync with pyproject.toml [project] version on every release.
+__version__ = "1.34.0"
 
 import os
 import sys

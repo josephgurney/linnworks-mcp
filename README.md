@@ -263,6 +263,16 @@ What's the stock level for SKU ABC-123?
 
 ---
 
+## Slow tools — ask for one at a time
+
+A few read tools page through the whole catalogue or a whole date range internally, making hundreds of API calls per question:
+
+`get_top_skus` · `get_sales_by_supplier` · `get_category_report` · `get_revenue_summary` · `get_period_comparison` · `get_component_sales` · `find_composite_parents` (first call — then cached 15 min) · `list_inventory_items(all_pages=True)` · `get_categories(with_counts=True)` · `delete_empty_categories`
+
+Expect roughly 1–2 minutes each. **Ask for one at a time** — two of these running together hit the Linnworks rate limit and the second will time out.
+
+---
+
 ## Write tools and safety
 
 All write tools default to `dry_run=True` — they will describe what they would do without making any changes. Set `dry_run=False` only after reviewing the output.

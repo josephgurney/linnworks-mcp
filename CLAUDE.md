@@ -172,13 +172,26 @@ Thresholds (defined in `WRITE_THRESHOLDS`):
 | `create_or_update_inventory_item` | 50 | Channel sync is async |
 | `set_extended_properties` | 50 | Metadata, lower blast radius |
 | `set_inventory_item_descriptions` | 50 | Content, lower blast radius |
+| `set_inventory_item_titles` | 50 | Content, lower blast radius |
+| `set_inventory_item_suppliers` | 50 | Purchasing metadata |
 | `add_inventory_item_images` | 100 | Additive only, no overwrites |
 | `delete_inventory_item_images` | 10 | Irreversible — removes images from an item |
 | `set_inventory_item_image_order` | 25 | Reorders images; the main image is the storefront hero |
 | `delete_inventory_item` | 10 | Irreversible deletion |
 | `delete_purchase_order` | 10 | Irreversible — deletes whole PO (header + all lines) |
+| `delete_categories` | 10 | Irreversible; non-empty categories reassign items to Default |
+| `delete_empty_categories` | 10 | Irreversible bulk delete |
+| `set_order_status` | 25 | Reversible, but lock RELEASES allocated stock |
+| `archive_inventory_items` | 25 | Reversible (unarchive) |
+| `unarchive_inventory_items` | 25 | Reversible (archive) |
 | `list_to_shopify` | 25 | Creates live customer-facing channel listings |
+| `refresh_channel_listing` | 25 | Re-pushes live listings — may push a STALE template snapshot |
+| `unpublish_channel_listing` | 10 | Destructive — ENDS a live customer-facing listing |
+| `delist_all_channel_listings` | 10 | Destructive — ends listings across every GLT channel |
+| `delist_all_shopify_listings` | 10 | Destructive — ends listings across every Shopify store |
 | `default` | 25 | Fallback for unlisted operations |
+
+This table is hand-maintained against `WRITE_THRESHOLDS` in `server.py` (and duplicated in README.md) — `tests/test_docs_consistency.py` now fails the build if any of the three drift apart. It had fallen 11 rows behind between v1.22.0 and v1.34.0.
 
 There is **no hard cap** — any batch size works once confirmed. The threshold is a staging gate, not a refusal.
 
@@ -231,7 +244,7 @@ def set_stock_levels(updates: list[dict], confirmed_count: int | None = None, dr
 
 ## Tools
 
-51 tools (44 in v1.10.0 + 7 in v1.11.0). See `server.py` for full docstrings and parameter details.
+83 tools. `python server.py --list-tools` is the authoritative count; see `server.py` for full docstrings and parameter details.
 
 > **v1.11.0:** Inventory write suite — `create_or_update_inventory_item`, `set_stock_levels`, `set_inventory_item_prices`, `set_extended_properties`, `set_inventory_item_descriptions`, `add_inventory_item_images`, `create_variation_group`. All protected by `_write_guard` + `_check_injection`. **Live-tested 15 Jun 2026** against an isolated test SKU (create/update/stock/price/description/extended-property all verified by read-back) — this surfaced and fixed the `StockItemId`/`pkRowId`/empty-body/default-price gotchas; see the Inventory writes section. `add_inventory_item_images` and `create_variation_group` not yet exercised live.
 >
@@ -250,7 +263,8 @@ def set_stock_levels(updates: list[dict], confirmed_count: int | None = None, dr
 | `get_item_relationships(sku)` | `Inventory/GetInventoryItem` → `Stock/GetVariationGroupByParentId` + `Stock/GetVariationItems` + `Stock/SearchVariationGroups` (variation) and `Inventory/GetInventoryItemCompositions` (composite) | **Parent/child relationship lookup** for one exact SKU, both directions, both types. Returns `variation` {role parent/child/none, group_name, parent_sku, children[], siblings[], reverse_lookup_confirmed} and `composite` {role parent/none, components[] (sku, linked_stock_item_id, qty, purchase_price), belongs_to[], reverse_lookup_supported, reverse_lookup_tool}. Top-level `is_variation_parent`/`is_composite_parent` are **derived from the live endpoints, not the raw item flags** (the `IsVariationParent` flag is unreliable). Variation reverse (child→parent+siblings) works via `searchType=ItemSKU` + exact-membership confirmation. Composite reverse (component→parents) is **not resolved here** — it needs a catalogue-wide index, so `belongs_to` stays empty and `reverse_lookup_supported` stays False, meaning "not answered by this call" — **use `find_composite_parents` (v1.33.0, issue #31)**, which does answer it. **Live-tested 18 Jun 2026** (closes #17) |
 | `find_composite_parents(skus, include_listing_status=True, max_parents_listed=25, rebuild_index=False)` | `Stock/GetStockItems` (sweep) + `Inventory/GetInventoryItemsCompositionByIds` (invert) + `Inventory/BatchGetInventoryItemChannelSKUs` (listing status) | **Component → composite parents** — the REVERSE of `get_item_relationships`, and the **archive-safety gate**: "is this dead-looking SKU still a component of a live bundle?" Run before `archive_inventory_items` / `delete_inventory_item` / `delist_all_channel_listings`. Per SKU: `is_component`, `parent_count`, `listed_parent_count`, `has_listed_parent`, **`safe_to_retire`**, `parents[]` (parent_sku, parent_title, quantity, parent_is_listed, parent_channels), `parents_truncated`. **Batch-first by design** — Linnworks has no component→parent endpoint, so it enumerates every composite parent (`IsCompositeParent` on the sweep, live-verified reliable) and inverts their component lists: **~215 calls / ~105s** here (34,023 active items → 4,343 parents → 2,908 components), **built once and cached 15 min**, so pass the whole candidate list in ONE call. Counts always span ALL parents even when `parents[]` is capped (some components sit in 3,000+ composites) — the verdict is never truncated. `safe_to_retire` is `None` (not `True`) whenever listing status wasn't read. **⚠️ ACTIVE items only** — archived composite parents are invisible. Don't run in parallel with the other autopaginating tools. **Fully live-tested 5 Aug 2026** (closes #31) |
 | `get_order(order_id)` | `Orders/GetOrdersById` or `GetOrderDetailsByNumOrderId` | GUID → POST; numeric ID → GET; returns `customer_name`, `customer_email`, `delivery_address`, `billing_address`, `notes` list, `totals` (subtotal/postage/tax/total/currency), `fulfilment_location_id`; each item now also includes `row_id` (OrderItemRowId — required by `refund_order_lines`), `price_per_unit`, `cost_inc_tax` |
-| `set_order_address(order_id, ..., dry_run=True)` | `Orders/SetOrderCustomerInfo` | Update delivery address on open orders only; GUID or numeric order_id; pass only the fields to change (None = keep current); read-before-write diff; blocks on processed orders |
+| `set_order_address(order_id, ..., dry_run=True)` | `Orders/SetOrderCustomerInfo` | **Prefer this one** for address changes. Update delivery address on open orders only; GUID or numeric order_id; pass only the fields to change (None = keep current); read-before-write diff; blocks on processed orders |
+| `update_order_shipping_address(order_id, full_name, address1, town, post_code, country_code, ..., dry_run=True)` | `Orders/SetOrderCustomerInfo` | ⚠️ **Overlaps `set_order_address` — same endpoint, older tool (issue #4, v1.4.0), undocumented here until v1.34.0.** Difference: this one REQUIRES the five core address fields on every call (full_name/address1/town/post_code/country_code), so it's a whole-address replacement; `set_order_address` patches individual fields. Use it when a CS flow already has the complete new address (it was built for the Shopify `orderUpdate` pairing); use `set_order_address` for a partial edit. Same read-before-write, processed-order refusal, and `dry_run=True` default. Consolidating the two is an open decision — neither is deprecated |
 | `get_order_notes(order_id)` | `Orders/GetOrderNotes` | Fetch all notes on an order (open or processed); returns note_id, text, internal flag, timestamp, creator; GUID or numeric order_id |
 | `add_order_note(order_id, note, internal=True, dry_run=True)` | `Orders/AddOrdersNote` | Add a note to any order; internal=True by default (staff-only); dry_run default; works on open and processed orders |
 | `update_order_note(order_id, note_id, note, internal=None, dry_run=True)` | `ProcessedOrders/DeleteOrderNote` + `Orders/AddOrdersNote` | No dedicated update endpoint — deletes old note then adds replacement; preserves internal flag if not supplied; before/after diff |
