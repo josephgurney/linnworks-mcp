@@ -989,13 +989,17 @@ def _resolve_composition(sku: str, stock_item_id: str) -> dict:
         Each row's LinkedStockItemId is the COMPONENT's stock item id; the row's
         own StockItemId field is the PARENT's id (do not use it as the component id).
 
-    Reverse (component -> parent composites) is NOT supported: Linnworks exposes no
-        endpoint mapping a component back to the composites that contain it, and no
-        working catalogue-list endpoint exists in this tenant to scan every
-        composite (Inventory/GetInventoryItems and Stock/GetStockItemsFull both 400).
-        So belongs_to is always empty and reverse_lookup_supported is always False —
-        this means a non-parent cannot be positively classified as a "component"
-        (Open Q2, issue #17). Confirmed live 18 Jun 2026.
+    Reverse (component -> parent composites) is not resolved HERE, because there is
+        still no endpoint that maps a component straight back to its parents — it can
+        only be derived by enumerating every composite parent and inverting their
+        component lists, which costs a full catalogue sweep (~105s / ~215 calls) and
+        must not be paid per get_item_relationships call.
+
+        It IS now available: use `find_composite_parents` (issue #31), which builds
+        that index once and answers a whole batch of SKUs from it. So belongs_to
+        stays empty here and reverse_lookup_supported stays False — meaning "not
+        resolved by this call", NOT "impossible" (which is what the original issue
+        #17 Open Q2 note claimed).
     """
     comps = call_linnworks_get(
         "Inventory/GetInventoryItemCompositions",
@@ -1017,6 +1021,7 @@ def _resolve_composition(sku: str, stock_item_id: str) -> dict:
             ],
             "belongs_to": [],
             "reverse_lookup_supported": False,
+            "reverse_lookup_tool": "find_composite_parents",
         }
 
     return {
@@ -1024,9 +1029,11 @@ def _resolve_composition(sku: str, stock_item_id: str) -> dict:
         "components": [],
         "belongs_to": [],
         "reverse_lookup_supported": False,
+        "reverse_lookup_tool": "find_composite_parents",
         "note": ("Not a composite parent. Whether this SKU is a COMPONENT of "
-                 "another composite cannot be determined — Linnworks exposes no "
-                 "component->parent reverse lookup (issue #17, Open Q2)."),
+                 "another composite is NOT resolved by this call (it needs a "
+                 "catalogue-wide index) — use find_composite_parents for that, "
+                 "especially before archiving/delisting/deleting the SKU."),
     }
 
 
@@ -1047,8 +1054,9 @@ def get_item_relationships(sku: str) -> dict:
         working in this tenant, so a child SKU returns its parent and siblings.
       • Composite — forward (bundle/custom-complete parent -> its components, with
         per-component quantity and purchase price). Reverse (component -> the
-        bundles that contain it) is NOT available from the Linnworks API and is
-        always reported empty (composite.reverse_lookup_supported = False).
+        bundles that contain it) is NOT resolved here — it needs a catalogue-wide
+        index, so it lives in `find_composite_parents`. Use that one before
+        archiving/delisting/deleting a SKU that might feed a live bundle.
 
     Args:
         sku: The exact SKU / item number (case-insensitive). Partial SKUs and
@@ -1065,7 +1073,8 @@ def get_item_relationships(sku: str) -> dict:
               children[] (when parent), siblings[] (when child),
               reverse_lookup_confirmed}
           - composite: {role ("parent"|"none"), components[] (when parent),
-              belongs_to[] (always empty), reverse_lookup_supported (always False)}
+              belongs_to[] (always empty here), reverse_lookup_supported (always
+              False here), reverse_lookup_tool ("find_composite_parents")}
         Children/siblings/components each carry sku, stock_item_id/linked id, and
         title; components also carry quantity and purchase_price.
 
@@ -1102,6 +1111,380 @@ def get_item_relationships(sku: str) -> dict:
         "variation": variation,
         "composite": composite,
     }
+
+
+# ---------------------------------------------------------------------------
+# Composite reverse lookup — component -> the composites that contain it
+# ---------------------------------------------------------------------------
+#
+# Linnworks has NO component->parent endpoint, so the reverse direction is
+# derived by enumerating every composite parent and inverting their component
+# lists into a component -> parents index.
+#
+# Issue #17 (Open Q2) declared this infeasible because "Inventory/GetInventoryItems
+# and Stock/GetStockItemsFull both 400". That blocker was stale (issue #31): the
+# GET Stock/GetStockItems sweep already used by _count_items_per_category
+# enumerates the whole active catalogue fine AND carries a per-row
+# IsCompositeParent flag, and Inventory/GetInventoryItemsCompositionByIds resolves
+# compositions in BULK. Two live findings from building this (5 Aug 2026):
+#
+#   • IsCompositeParent on Stock/GetStockItems is RELIABLE — unlike its sibling
+#     IsVariationParent, which is not (see _resolve_variation). Cross-checked on a
+#     200-item page: 96 flagged, 96 with components, zero disagreement either way.
+#     That matters because a false negative here would silently mean "safe to
+#     archive" for an item that still feeds a live bundle.
+#   • GetInventoryItemsCompositionByIds caps at 100 ids per call (HTTP 400 "The
+#     maximum items count for this call is 100" at 200) and OMITS items with no
+#     compositions from the response map rather than returning empty lists.
+#
+# Measured on this tenant: 171 sweep pages + 44 composition calls = 215 API calls,
+# ~105s, yielding 4343 composite parents over 34,023 active items and 2908 distinct
+# components. That is why the index is built ONCE and cached for the process, and
+# why the reverse lookup is a batch tool rather than a per-SKU one.
+#
+# ⚠️  ACTIVE ITEMS ONLY — the sweep endpoint never returns archived items (same
+# blind spot documented above _is_category_in_use). An ARCHIVED composite parent is
+# therefore invisible to the index. That is the safe direction for the archive-gate
+# use case (an archived parent is not a live listing), but it does mean the index
+# cannot tell you a component feeds an archived bundle.
+
+_COMPOSITE_INDEX_TTL_SECONDS = 900  # 15 min — the index costs ~105s to build
+_composite_index_cache: dict | None = None
+
+
+def _build_composite_index() -> dict:
+    """
+    Build the component -> composite-parents index for the whole ACTIVE catalogue.
+
+    Two phases:
+      1. Sweep Stock/GetStockItems (keyWord="", 200/page) across every active item,
+         keeping (a) a SKU -> StockItemId/title map for free resolution and
+         (b) the StockItemIds flagged IsCompositeParent.
+      2. Resolve those parents' component lists in bulk via
+         Inventory/GetInventoryItemsCompositionByIds (chunked at 100 — its hard
+         cap) and invert them into {component_id: [{parent_id, quantity}]}.
+
+    Both phases throttle under their rate limits (150/min sweep, 250/min
+    compositions) and back off on HTTP 429. The sweep always runs to completion —
+    a partial index would under-report parents, i.e. wrongly clear a component for
+    archiving, which is the exact failure this tool exists to prevent.
+
+    Returns {"index", "parents", "sku_to_id", "built_at", "stats"}.
+    """
+    parents: dict[str, dict] = {}     # parent stock_item_id (lower) -> {sku, title}
+    sku_to_id: dict[str, dict] = {}   # sku (lower) -> {stock_item_id, title}
+    total_items = 0
+    page = 1
+    sweep_pages = 0
+
+    while True:
+        resp = None
+        for _ in range(6):
+            try:
+                resp = call_linnworks_get(
+                    "Stock/GetStockItems",
+                    {"keyWord": "", "entriesPerPage": 200, "pageNumber": page},
+                )
+                break
+            except RuntimeError as exc:
+                if "429" in str(exc) or "quota" in str(exc).lower():
+                    time.sleep(15)
+                    continue
+                raise
+        if resp is None:
+            raise RuntimeError(
+                f"Composite index build aborted: repeated rate-limit (429) on sweep "
+                f"page {page}. No partial index is returned — a partial sweep would "
+                "under-report composite parents and could wrongly clear a component "
+                "as safe to archive."
+            )
+
+        data = resp.get("Data") or []
+        sweep_pages += 1
+        for it in data:
+            sid = it.get("StockItemId")
+            if not sid:
+                continue
+            sid = sid.lower()
+            total_items += 1
+            sku = it.get("ItemNumber")
+            title = it.get("ItemTitle")
+            if sku:
+                sku_to_id[sku.strip().lower()] = {"stock_item_id": sid, "title": title}
+            if it.get("IsCompositeParent"):
+                parents[sid] = {"sku": sku, "title": title}
+
+        total_pages = resp.get("TotalPages") or 1
+        if page >= total_pages or not data:
+            break
+        page += 1
+        time.sleep(0.42)  # stay under the 150/min sweep limit
+
+    # --- Phase 2: bulk-resolve each parent's components and invert ---
+    index: dict[str, list] = {}
+    parent_ids = list(parents)
+    composition_calls = 0
+    for i in range(0, len(parent_ids), 100):  # hard cap: 100 ids per call
+        chunk = parent_ids[i:i + 100]
+        resp = None
+        for _ in range(6):
+            try:
+                resp = call_linnworks(
+                    "Inventory/GetInventoryItemsCompositionByIds",
+                    {"request": {"InventoryItemIds": chunk}},
+                )
+                break
+            except RuntimeError as exc:
+                if "429" in str(exc) or "quota" in str(exc).lower():
+                    time.sleep(15)
+                    continue
+                raise
+        if resp is None:
+            raise RuntimeError(
+                "Composite index build aborted: repeated rate-limit (429) resolving "
+                "compositions. No partial index is returned."
+            )
+        composition_calls += 1
+        # Items with no compositions are OMITTED from the map, not returned empty.
+        for pid, comps in (resp.get("InventoryItemsCompositionByIds") or {}).items():
+            pid = (pid or "").lower()
+            for c in comps or []:
+                cid = (c.get("LinkedStockItemId") or "").lower()
+                if not cid:
+                    continue
+                index.setdefault(cid, []).append(
+                    {"parent_id": pid, "quantity": c.get("Quantity")}
+                )
+        time.sleep(0.25)  # stay under the 250/min composition limit
+
+    return {
+        "index":     index,
+        "parents":   parents,
+        "sku_to_id": sku_to_id,
+        "built_at":  time.time(),
+        "stats": {
+            "active_items":       total_items,
+            "composite_parents":  len(parents),
+            "indexed_components": len(index),
+            "api_calls":          sweep_pages + composition_calls,
+            "sweep_pages":        sweep_pages,
+            "composition_calls":  composition_calls,
+        },
+    }
+
+
+def _get_composite_index(rebuild: bool = False) -> dict:
+    """
+    Return the composite reverse index, building it if absent/stale/forced.
+
+    Cached for the process for _COMPOSITE_INDEX_TTL_SECONDS so that one bulk
+    screening run — the intended use — pays the ~105s build once. Pass
+    rebuild=True when composites may have changed since the last build.
+    """
+    global _composite_index_cache
+    cache = _composite_index_cache
+    if (not rebuild and cache
+            and (time.time() - cache["built_at"]) < _COMPOSITE_INDEX_TTL_SECONDS):
+        return cache
+    _composite_index_cache = _build_composite_index()
+    return _composite_index_cache
+
+
+@mcp.tool()
+def find_composite_parents(
+    skus: list[str],
+    include_listing_status: bool = True,
+    max_parents_listed: int = 25,
+    rebuild_index: bool = False,
+) -> dict:
+    """
+    For each SKU, find the composite/bundle parents that CONTAIN it — the reverse
+    of get_item_relationships' forward parent -> components lookup.
+
+    Answers the archive-safety question the rest of the toolset cannot:
+    "before I archive/delist/delete this dead-looking SKU, is it a component of a
+    bundle that is still live?" A component can read as dead stock on its own
+    while still feeding a selling composite (pooled multipacks, kids' complete
+    bundles, custom completes) — retiring it silently breaks the parent.
+
+    Run this as a gate before archive_inventory_items, delete_inventory_item,
+    delist_all_channel_listings, or any bulk operation that retires items.
+
+    HOW IT WORKS / COST. Linnworks has no component -> parent endpoint, so this
+    enumerates every composite parent in the ACTIVE catalogue and inverts their
+    component lists into an index. On this tenant that is ~215 API calls / ~105
+    seconds (34k items, ~4.3k composite parents). The index is built ONCE and
+    cached for 15 minutes, so pass the whole batch of candidate SKUs in one call
+    rather than calling per SKU. Do not run this in parallel with the other
+    autopaginating tools.
+
+    ⚠️  ACTIVE ITEMS ONLY. The sweep endpoint never returns archived items, so an
+    ARCHIVED composite parent is invisible here. Safe for the archive-gate use
+    (an archived parent is not selling), but it is not a complete history.
+
+    Args:
+        skus: Exact SKUs / ItemNumbers to screen (case-insensitive). Resolved from
+            the sweep itself at no extra cost; anything not in the active
+            catalogue falls back to a direct lookup and, failing that, is
+            reported under `unresolved` (an archived SKU cannot be resolved by
+            SKU at all — that is a Linnworks limitation).
+        include_listing_status: Also report whether each parent is live on a sales
+            channel (Inventory/BatchGetInventoryItemChannelSKUs, ~1 call per 200
+            distinct parents). This is what turns "is a component" into "is a
+            component of something still selling". Default True.
+        max_parents_listed: Cap on how many parent rows are returned per SKU
+            (default 25). Some components sit in thousands of composites, which
+            would swamp the response. `parent_count` and `listed_parent_count`
+            are always counted across ALL parents, never just the returned ones,
+            so the safety verdict is never truncated — only the detail is.
+        rebuild_index: Force a fresh index build instead of using the cached one.
+
+    Returns:
+        A dict with:
+          - item_count, resolved_count
+          - component_count: how many resolved SKUs are a component of anything
+          - blocked_count: how many have at least one LISTED parent — the SKUs
+            you must NOT retire (None-ish when include_listing_status=False)
+          - results: per-SKU rows with sku, stock_item_id, title, is_component,
+            parent_count, listed_parent_count, has_listed_parent,
+            safe_to_retire (False if it feeds a live parent), parents[]
+            (parent_sku, parent_stock_item_id, parent_title, quantity,
+            parent_is_listed, parent_channels), parents_truncated
+          - unresolved: rows for SKUs not found in the active catalogue
+          - index: build/cache stats (built_at, age_seconds, from_cache, and the
+            sweep totals) so a stale answer is visible rather than implicit
+    """
+    if not skus:
+        raise ValueError("skus must contain at least one SKU.")
+
+    was_cached = (
+        not rebuild_index
+        and _composite_index_cache is not None
+        and (time.time() - _composite_index_cache["built_at"]) < _COMPOSITE_INDEX_TTL_SECONDS
+    )
+    idx = _get_composite_index(rebuild=rebuild_index)
+    index, parents, sku_to_id = idx["index"], idx["parents"], idx["sku_to_id"]
+
+    # --- Resolve the requested SKUs (free from the sweep; fall back on a miss) ---
+    resolved: list[tuple[str, str, str | None]] = []  # (sku, stock_item_id, title)
+    unresolved: list[dict] = []
+    for raw in skus:
+        s = (raw or "").strip()
+        if not s:
+            unresolved.append({"sku": raw, "error": "empty SKU"})
+            continue
+        hit = sku_to_id.get(s.lower())
+        if hit:
+            resolved.append((s, hit["stock_item_id"], hit["title"]))
+            continue
+        # Not in the swept active catalogue — could be a newer item than the
+        # cached index, so try a direct lookup before giving up.
+        try:
+            item = call_linnworks("Inventory/GetInventoryItem", {"sku": s})
+            sid = item.get("StockItemId")
+            if sid:
+                resolved.append((s, sid.lower(), item.get("ItemTitle")))
+                continue
+            unresolved.append({"sku": s, "error": "found but returned no StockItemId"})
+        except RuntimeError:
+            unresolved.append({
+                "sku": s,
+                "error": ("not found in the active catalogue — it may be archived "
+                          "(archived SKUs cannot be resolved by SKU in Linnworks)"),
+            })
+
+    # --- Listing status for every DISTINCT parent across the whole batch ---
+    listed_ids: set[str] = set()
+    channels_by_parent: dict[str, list] = {}
+    listing_error: str | None = None
+    if include_listing_status:
+        distinct_parents = sorted({
+            p["parent_id"]
+            for _, sid, _ in resolved
+            for p in index.get(sid, [])
+        })
+        if distinct_parents:
+            try:
+                by_id = _fetch_channel_skus_for_ids(distinct_parents)
+                for pid, rows in by_id.items():
+                    if rows:
+                        listed_ids.add(pid)
+                        channels_by_parent[pid] = sorted(
+                            {r.get("Source") for r in rows if r.get("Source")}
+                        )
+            except RuntimeError as exc:
+                # Degrade safely: the component->parent answer still stands, we
+                # just cannot say which parents are live.
+                listing_error = str(exc)
+
+    results: list[dict] = []
+    component_count = 0
+    blocked_count = 0
+    for s, sid, title in resolved:
+        links = index.get(sid, [])
+        if links:
+            component_count += 1
+
+        rows = []
+        listed_parent_count = 0
+        for link in links:
+            pid = link["parent_id"]
+            meta = parents.get(pid, {})
+            is_listed = (pid in listed_ids) if include_listing_status else None
+            if is_listed:
+                listed_parent_count += 1
+            rows.append({
+                "parent_sku":            meta.get("sku"),
+                "parent_stock_item_id":  pid,
+                "parent_title":          meta.get("title"),
+                "quantity":              link.get("quantity"),
+                "parent_is_listed":      is_listed,
+                "parent_channels":       channels_by_parent.get(pid, []),
+            })
+
+        # Listed parents first so a truncated list still shows what blocks you.
+        rows.sort(key=lambda r: (not r["parent_is_listed"], r["parent_sku"] or ""))
+        has_listed = listed_parent_count > 0
+        if has_listed:
+            blocked_count += 1
+
+        results.append({
+            "sku":                 s,
+            "stock_item_id":       sid,
+            "title":               title,
+            "is_component":        bool(links),
+            "parent_count":        len(links),
+            "listed_parent_count": listed_parent_count if include_listing_status else None,
+            "has_listed_parent":   has_listed if include_listing_status else None,
+            # Only a definite verdict when we actually checked the channels.
+            "safe_to_retire":      (not has_listed) if include_listing_status else None,
+            "parents":             rows[:max_parents_listed],
+            "parents_truncated":   len(rows) > max_parents_listed,
+        })
+
+    out = {
+        "item_count":      len(skus),
+        "resolved_count":  len(resolved),
+        "component_count": component_count,
+        "blocked_count":   blocked_count if include_listing_status else None,
+        "results":         results,
+        "unresolved":      unresolved,
+        "index": {
+            "from_cache":  was_cached,
+            "built_at":    datetime.fromtimestamp(idx["built_at"], timezone.utc)
+                               .isoformat(),
+            "age_seconds": round(time.time() - idx["built_at"]),
+            "ttl_seconds": _COMPOSITE_INDEX_TTL_SECONDS,
+            "scope":       "active items only — archived composite parents are invisible",
+            **idx["stats"],
+        },
+    }
+    if listing_error:
+        out["listing_status_error"] = (
+            f"Parent listing status could not be read ({listing_error}); "
+            "parent_is_listed / safe_to_retire are unreliable for this run."
+        )
+    return out
 
 
 @mcp.tool()
