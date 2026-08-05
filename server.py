@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.34.0"
+__version__ = "1.35.0"
 
 import os
 import sys
@@ -1875,10 +1875,16 @@ def set_order_address(
     phone: Optional[str] = None,
     email: Optional[str] = None,
     save_to_crm: bool = False,
+    require_complete: bool = False,
     dry_run: bool = True,
 ) -> dict:
     """
     Update the delivery address on an open (unprocessed) Linnworks order.
+
+    Handles BOTH kinds of address change:
+      - amend a line or two — pass just those fields (everything else is kept);
+      - replace the whole destination — pass every field, ideally with
+        require_complete=True so a half-supplied address is refused.
 
     Reads the current address first, applies only the fields you provide
     (all others remain unchanged), then writes the change back. Always
@@ -1907,6 +1913,13 @@ def set_order_address(
         email: Email address. Pass None to keep current.
         save_to_crm: If True, saves the updated address into the Linnworks CRM
             record for this customer. Defaults to False.
+        require_complete: Guard for whole-address changes. When True, the call is
+            REFUSED unless you supply all five core fields — full_name, address1,
+            town, postcode, country — non-blank. Use it whenever the destination
+            itself is changing (a customer address correction, a redirect), so a
+            partly-supplied address cannot silently merge with the old one and
+            ship to a hybrid of the two: new street, old town. Leave False
+            (default) when deliberately amending one or two lines.
         dry_run: If True (default), shows the proposed changes without writing
             anything. Set to False to apply the address update.
 
@@ -1949,6 +1962,27 @@ def set_order_address(
         "phone":     phone,
         "email":     email,
     }
+
+    # ---------- Step 0: completeness guard (before any API call) ----------
+    # Checks what the CALLER supplied, not the merged result: a merged address can
+    # be "complete" and still be wrong (new street + old town). Supplying every
+    # core field is the caller stating the whole destination explicitly.
+    if require_complete:
+        missing = sorted(
+            param for param in ("full_name", "address1", "town", "postcode", "country")
+            if not (user_provided[param] or "").strip()
+        )
+        if missing:
+            return {
+                "order_id": order_id,
+                "status": "error",
+                "error": (
+                    "require_complete=True but these core address fields are missing "
+                    f"or blank: {', '.join(missing)}. Supply the whole destination, "
+                    "or set require_complete=False to amend individual lines."
+                ),
+                "missing_fields": missing,
+            }
 
     # ---------- Step 1: fetch current order (read-before-write) ----------
     raw: dict = {}
@@ -2058,196 +2092,6 @@ def set_order_address(
         "status": "updated",
         "before": before,
         "after": confirmed_after or after,
-    }
-
-
-@mcp.tool()
-def update_order_shipping_address(
-    order_id: str,
-    full_name: str,
-    address1: str,
-    town: str,
-    post_code: str,
-    country_code: str,
-    address2: str = "",
-    region: str = "",
-    country: str = "",
-    phone: str = "",
-    email: str = "",
-    company: str = "",
-    dry_run: bool = True,
-) -> dict:
-    """
-    Update the shipping/delivery address on an open Linnworks customer order.
-
-    Designed for CS automation workflows — use when a customer requests an
-    address change before their order ships. Always pair with a Shopify
-    orderUpdate mutation to keep both systems in sync.
-
-    Reads the current address before writing (read-before-write). Refuses to
-    update orders that are already dispatched or processed.
-
-    IMPORTANT: dry_run defaults to True. Set dry_run=False only after
-    confirming the new address with the customer.
-
-    Args:
-        order_id: GUID pkOrderID (e.g. "a1b2c3d4-...") or numeric order
-            number (e.g. "596475"). Same routing as get_order().
-        full_name: Recipient full name (required).
-        address1: First line of the street address (required).
-        town: Town or city (required).
-        post_code: Postcode or ZIP code (required).
-        country_code: ISO 3166-1 alpha-2 country code, e.g. "GB" (required).
-            Echoed back in the response. Provide `country` for the full name
-            if the mapping is not obvious; otherwise the current order country
-            is preserved.
-        address2: Second address line. Defaults to empty.
-        region: County, state, or region. Defaults to empty.
-        country: Full country name, e.g. "United Kingdom". If omitted, the
-            current address country is preserved.
-        phone: Phone number. Defaults to empty (preserves current).
-        email: Email address. Defaults to empty (preserves current).
-        company: Company name. Defaults to empty (preserves current).
-        dry_run: If True (default), shows what would be sent without writing.
-            Set to False to apply the update.
-
-    Returns:
-        A dict with:
-          - success:         True if update succeeded (or would succeed in dry_run)
-          - dry_run:         whether this was a dry run
-          - order_id:        the GUID used in the API call
-          - numeric_id:      human-facing order number (if available)
-          - updated_address: echo of the address fields that were/would be sent
-          - error:           present only on failure
-    """
-    order_id_input = order_id.strip()
-    raw: dict = {}
-    order_guid: str = ""
-    numeric_id: Optional[int] = None
-
-    # ---------- Step 1: fetch current order (read-before-write) ----------
-    if _UUID_RE.match(order_id_input):
-        resp = call_linnworks("Orders/GetOrdersById", {"pkOrderIds": [order_id_input]})
-        if isinstance(resp, list) and resp:
-            raw = resp[0]
-        elif isinstance(resp, dict) and "OrderId" in resp:
-            # Simplified shape returned by test mocks
-            raw = resp
-        elif isinstance(resp, dict):
-            orders = resp.get("Orders") or resp.get("Data") or []
-            if not orders:
-                return {
-                    "success": False,
-                    "order_id": order_id_input,
-                    "dry_run": dry_run,
-                    "error": f"No order found for GUID '{order_id_input}'.",
-                }
-            raw = orders[0]
-        order_guid = raw.get("OrderId") or order_id_input
-        numeric_id = raw.get("NumOrderId")
-    else:
-        resp = call_linnworks_get(
-            "Orders/GetOrderDetailsByNumOrderId", params={"orderId": order_id_input}
-        )
-        if isinstance(resp, dict) and (
-            "GeneralInfo" in resp or "NumOrderId" in resp or "OrderId" in resp
-        ):
-            raw = resp
-        else:
-            return {
-                "success": False,
-                "order_id": order_id_input,
-                "dry_run": dry_run,
-                "error": f"No order found for numeric ID '{order_id_input}'.",
-            }
-        order_guid = raw.get("OrderId", "")
-        numeric_id = raw.get("NumOrderId")
-
-    # ---------- Step 2: refuse if dispatched / processed ----------
-    # `Processed` is the real API boolean; Status == 0 covers test mocks
-    # that represent a processed/dispatched order via a top-level Status field.
-    if raw.get("Processed") is True or raw.get("Status") == 0:
-        return {
-            "success": False,
-            "order_id": order_guid,
-            "numeric_id": numeric_id,
-            "dry_run": dry_run,
-            "error": (
-                "Cannot update address: order is already dispatched or processed. "
-                "Address changes can only be made to open orders."
-            ),
-        }
-
-    # ---------- Step 3: build merged address ----------
-    customer = raw.get("CustomerInfo") or {}
-    current_address = customer.get("Address") or {}
-    current_billing = customer.get("BillingAddress") or {}
-    channel_buyer_name = customer.get("ChannelBuyerName") or ""
-
-    # Full country name: use provided value if given, else keep current
-    resolved_country = country.strip() or current_address.get("Country", "")
-
-    new_address = {
-        "FullName":     full_name,
-        "Address1":     address1,
-        "Address2":     address2 if address2 else current_address.get("Address2", ""),
-        "Address3":     current_address.get("Address3", ""),
-        "Town":         town,
-        "Region":       region if region else current_address.get("Region", ""),
-        "PostCode":     post_code,
-        "Country":      resolved_country,
-        "PhoneNumber":  phone if phone else current_address.get("PhoneNumber", ""),
-        "EmailAddress": email if email else current_address.get("EmailAddress", ""),
-        "Company":      company if company else current_address.get("Company", ""),
-        # Preserve internal Linnworks fields unchanged
-        "Continent":    current_address.get("Continent", ""),
-        "CountryId":    current_address.get("CountryId", ""),
-    }
-
-    updated_address = {
-        "full_name":    full_name,
-        "address1":     address1,
-        "address2":     new_address["Address2"],
-        "town":         town,
-        "region":       new_address["Region"],
-        "post_code":    post_code,
-        "country":      resolved_country,
-        "country_code": country_code,
-        "phone":        new_address["PhoneNumber"],
-        "email":        new_address["EmailAddress"],
-        "company":      new_address["Company"],
-    }
-
-    if dry_run:
-        return {
-            "success": True,
-            "dry_run": True,
-            "order_id": order_guid,
-            "numeric_id": numeric_id,
-            "updated_address": updated_address,
-            "message": "No changes written. Set dry_run=False to apply this update.",
-        }
-
-    # ---------- Step 4: submit ----------
-    call_linnworks(
-        "Orders/SetOrderCustomerInfo",
-        {
-            "orderId": order_guid,
-            "info": {
-                "ChannelBuyerName": channel_buyer_name,
-                "Address": new_address,
-                "BillingAddress": current_billing,
-            },
-            "saveToCrm": False,
-        },
-    )
-
-    return {
-        "success": True,
-        "dry_run": False,
-        "order_id": order_guid,
-        "numeric_id": numeric_id,
-        "updated_address": updated_address,
     }
 
 

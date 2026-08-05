@@ -1,7 +1,7 @@
 # Linnworks MCP Server
 
-![Version](https://img.shields.io/badge/version-1.34.0-blue)
-![Tools](https://img.shields.io/badge/tools-83-blue)
+![Version](https://img.shields.io/badge/version-1.35.0-blue)
+![Tools](https://img.shields.io/badge/tools-82-blue)
 
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
 
@@ -29,8 +29,7 @@ Once installed, Claude gets access to these tools:
 
 | Tool | What it does |
 |---|---|
-| `set_order_address` | Update the delivery address on an open order (pass only the fields you want to change) |
-| `update_order_shipping_address` | Update a shipping address with explicit fields — built for CS address-change workflows (pair with Shopify sync) |
+| `set_order_address` | Update the delivery address on an open order. Pass just the fields you want to change, or the whole address — add `require_complete=True` when the destination itself is changing, so a half-supplied address is refused rather than merged with the old one |
 | `add_order_note` | Add a note to any order (internal or customer-facing) |
 | `update_order_note` | Replace the text of an existing note |
 | `delete_order_note` | Remove a specific note by ID |

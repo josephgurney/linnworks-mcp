@@ -10,7 +10,9 @@ several releases at a time — none of it was caught by a human read-through:
   - CLAUDE.md's WRITE_THRESHOLDS table fell 11 rows behind the code — and that
     table is what tells Claude when a bulk write gets staged for confirmation.
   - update_order_shipping_address shipped in v1.4.0 and was missing from
-    CLAUDE.md's tools table entirely until v1.34.0.
+    CLAUDE.md's tools table entirely until v1.34.0 — documenting it is what
+    exposed it as a redundant near-duplicate of set_order_address, and it was
+    merged away in v1.35.0. An undocumented tool hides design problems too.
 
 These are cheap, offline, and require no credentials (conftest sets dummies).
 When one fails, fix the doc — don't relax the test.
