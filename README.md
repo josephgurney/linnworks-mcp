@@ -1,7 +1,7 @@
 # Linnworks MCP Server
 
-![Version](https://img.shields.io/badge/version-1.24.0-blue)
-![Tools](https://img.shields.io/badge/tools-70-blue)
+![Version](https://img.shields.io/badge/version-1.33.0-blue)
+![Tools](https://img.shields.io/badge/tools-82-blue)
 
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
 
@@ -36,6 +36,7 @@ Once installed, Claude gets access to these tools:
 | `delete_order_note` | Remove a specific note by ID |
 | `delete_order_notes_by_text` | Remove notes matching a text pattern |
 | `cancel_order` | Cancel an open (unprocessed) order |
+| `set_order_status` | Lock/unlock an order (hold it from dispatch) or mark it paid/unpaid — bulk. Note: locking releases the order's allocated stock, and park/unpark has no public API |
 | `refund_order` | Full refund on a processed order |
 | `refund_order_lines` | Partial refund of specific line items |
 
@@ -46,10 +47,12 @@ Once installed, Claude gets access to these tools:
 | `find_inventory_item` | Look up an inventory item by exact SKU |
 | `search_inventory_items` | Keyword search across title, SKU, and barcode — paged (the UI search box) |
 | `get_stock_level` | Current stock level for a SKU across all locations |
-| `get_item_relationships` | Resolve a SKU's variation/composite parent–child links, both directions |
+| `get_item_relationships` | Resolve a SKU's variation/composite parent–child links (parent → children, and child → variation parent) |
+| `find_composite_parents` | The reverse lookup: which bundles/composites CONTAIN these SKUs, and are those parents still listed. The safety gate before archiving or deleting a component. Batch — pass every candidate SKU in one call |
 | `get_extended_properties` | Fetch custom metadata (extended properties) for a product |
 | `get_inventory_item_titles` | Channel-specific listing titles for a SKU (per Source/SubSource) |
 | `get_inventory_item_descriptions` | Channel-specific descriptions for a SKU |
+| `get_inventory_item_suppliers` | Which suppliers an item can be bought from — code, cost, lead time, and which is default |
 | `get_inventory_item_images` | Images on an item — count, main image, URLs |
 | `get_inventory_item_images_bulk` | Image check across many SKUs at once |
 | `get_locations` | List all warehouse and fulfilment locations with their GUIDs |
@@ -64,8 +67,14 @@ Once installed, Claude gets access to these tools:
 | `set_inventory_item_titles` | Set or update channel-specific listing titles (override the base title per channel) |
 | `set_inventory_item_descriptions` | Create or update channel-specific descriptions on items |
 | `set_extended_properties` | Create or update extended property key/value pairs on items |
+| `set_inventory_item_suppliers` | Attach or update an item's supplier links — supplier code, cost, lead time, default flag |
 | `add_inventory_item_images` | Attach images to items by URL |
-| `create_variation_group` | Link a parent item to its variant children (e.g. sizes/colours) |
+| `delete_inventory_item_images` | Remove images from an item by image ID — irreversible, staged |
+| `set_inventory_item_image_order` | Reorder an item's images and set the main/hero image (Linnworks always pins the main image first) |
+| `create_variation_group` | Create a variation group — note the parent SKU must be brand new, not an existing item |
+| `add_variation_group_items` | Add child SKUs to an existing variation group (idempotent) |
+| `archive_inventory_items` | Archive items by SKU — hides them from the active catalogue, reversible |
+| `unarchive_inventory_items` | Restore archived items — takes StockItemId GUIDs, since archived SKUs can't be resolved by SKU |
 | `delete_inventory_item` | Permanently delete items by SKU — irreversible, staged |
 
 **Categories (writes default to dry_run=True)**
@@ -86,7 +95,9 @@ Once installed, Claude gets access to these tools:
 | `get_channel_listings_bulk` | The same listing check across many SKUs at once |
 | `list_to_shopify` | List existing inventory to Shopify via a saved configurator |
 | `refresh_channel_listing` | Re-push edited item data to a live Shopify listing (revise) |
-| `unpublish_channel_listing` | Take down / end a live Shopify listing |
+| `unpublish_channel_listing` | Take down / end a live listing on one channel and store — Shopify, Amazon, TikTok, Magento or Walmart |
+| `delist_all_channel_listings` | Take down every listing for an item across all channels and stores at once. eBay, Etsy and Mirakl are reported as skipped and left up — they can only be ended in their own admin |
+| `delist_all_shopify_listings` | The Shopify-only slice of the above, for when you deliberately want just Shopify |
 
 **Reporting**
 
@@ -114,6 +125,7 @@ Once installed, Claude gets access to these tools:
 | `open_purchase_order` | Move a PO from PENDING → OPEN status |
 | `deliver_purchase_order` | Record delivery of all outstanding items on an OPEN PO |
 | `add_purchase_order_note` | Add a text note to a PO (e.g. tracking number, expected arrival) |
+| `delete_purchase_order` | Delete whole POs — header, lines and notes. Irreversible, staged |
 
 **Rules Engine**
 
@@ -264,11 +276,20 @@ All write tools default to `dry_run=True` — they will describe what they would
 | `set_extended_properties` | 50 items |
 | `set_inventory_item_descriptions` | 50 items |
 | `set_inventory_item_titles` | 50 items |
+| `set_inventory_item_suppliers` | 50 items |
 | `add_inventory_item_images` | 100 items |
+| `set_inventory_item_image_order` | 25 items |
+| `set_order_status` | 25 orders |
+| `archive_inventory_items` | 25 items |
+| `unarchive_inventory_items` | 25 items |
 | `list_to_shopify` | 25 listings |
 | `refresh_channel_listing` | 25 listings |
 | `unpublish_channel_listing` | 10 listings |
+| `delist_all_channel_listings` | 10 listings |
+| `delist_all_shopify_listings` | 10 listings |
+| `delete_inventory_item_images` | 10 images |
 | `delete_inventory_item` | 10 items |
+| `delete_purchase_order` | 10 POs |
 | `delete_categories` | 10 categories |
 | `delete_empty_categories` | 10 categories |
 
