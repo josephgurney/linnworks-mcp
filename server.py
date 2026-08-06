@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.36.0"
+__version__ = "1.37.0"
 
 import os
 import sys
@@ -196,36 +196,107 @@ def call_linnworks_form(method_path: str, payload: dict) -> dict:
     return response.json()
 
 
+# ---------- Rate limiting (issue #34) ----------
+#
+# Linnworks enforces per-endpoint per-minute quotas (150/min on most Inventory
+# reads, 250/min on Stock/GetItemChangesHistory, …). Exceeding one returns
+# HTTP 429 with a body like:
+#
+#   {"Message":"API calls quota exceeded! Maximum admitted 150 per Minute."}
+#
+# That is a TRANSIENT infrastructure failure, not a statement about the data.
+# Before v1.37.0 nothing here retried it, and callers that wrapped errors into
+# a per-item "not found" bucket laundered it into a factual claim about the
+# catalogue — `get_channel_listings_bulk` reported 4,804 SKUs as "not found"
+# when it had simply burned the quota, under-reporting live listings by 88%
+# and, in a delist run, silently skipping 92 of 154 items while reporting
+# success. Because the failure pointed at "this SKU doesn't exist", it pointed
+# toward the destructive answer.
+#
+# Retrying here fixes every endpoint at once rather than one caller at a time.
+# The quota is per MINUTE, so the backoff is sized to outlast a full window.
+
+_RATE_LIMIT_BACKOFF = (5, 10, 20, 30)   # seconds; ~65s total, > one quota window
+
+
+class RateLimitError(RuntimeError):
+    """
+    Raised when a Linnworks call is still rate-limited after the full backoff.
+
+    Subclasses RuntimeError so existing `except RuntimeError` handlers keep
+    working, but callers that classify failures MUST catch this separately —
+    it means "ask again later", never "no such record". See issue #34.
+    """
+
+
+def _is_rate_limited(response) -> bool:
+    """True if a response is a Linnworks quota rejection."""
+    if response.status_code == 429:
+        return True
+    # Belt and braces: the quota message has been observed on non-429 statuses.
+    return "quota exceeded" in (response.text or "").lower()
+
+
+def _rate_limit_pause(method_path: str, response, attempt: int) -> bool:
+    """
+    Sleep out a 429 before the next attempt. Returns False when retries are spent.
+
+    Honours Retry-After when Linnworks sends it; otherwise uses the fixed
+    backoff ladder, which is sized to outlast a one-minute quota window.
+    """
+    if attempt >= len(_RATE_LIMIT_BACKOFF):
+        return False
+    delay = _RATE_LIMIT_BACKOFF[attempt]
+    retry_after = (response.headers or {}).get("Retry-After")
+    if retry_after:
+        try:
+            delay = max(delay, int(float(retry_after)))
+        except (TypeError, ValueError):
+            pass
+    time.sleep(delay)
+    return True
+
+
 def call_linnworks(method_path: str, payload: dict) -> dict:
     """
-    POST a Linnworks API call with one automatic re-auth on token expiry.
-
-    method_path: e.g. "OpenOrders/GetOrdersLowFidelity"
-    payload:     the JSON body, already wrapped if the endpoint requires it
-                 (Open Orders endpoints need {"request": {...}})
+    POST a Linnworks API call with one automatic re-auth on token expiry and
+    bounded retry/backoff on HTTP 429 (issue #34).
     """
     global _token, _server
-    token, server = ensure_auth()
-    url = f"{server.rstrip('/')}/api/{method_path}"
-
-    response = _session.post(
-        url,
-        json=payload,
-        headers={"Authorization": token},  # NB: NO 'Bearer ' prefix
-        timeout=60,
-    )
-
-    # Token expired? Reauth once and retry.
-    if response.status_code == 401:
-        _token, _server = None, None
+    attempt = 0
+    while True:
         token, server = ensure_auth()
         url = f"{server.rstrip('/')}/api/{method_path}"
+
         response = _session.post(
             url,
             json=payload,
-            headers={"Authorization": token},
+            headers={"Authorization": token},  # NB: NO 'Bearer ' prefix
             timeout=60,
         )
+
+        # Token expired? Reauth once and retry.
+        if response.status_code == 401:
+            _token, _server = None, None
+            token, server = ensure_auth()
+            url = f"{server.rstrip('/')}/api/{method_path}"
+            response = _session.post(
+                url,
+                json=payload,
+                headers={"Authorization": token},
+                timeout=60,
+            )
+
+        if _is_rate_limited(response):
+            if _rate_limit_pause(method_path, response, attempt):
+                attempt += 1
+                continue
+            raise RateLimitError(
+                f"Linnworks {method_path} rate-limited: HTTP {response.status_code} — "
+                f"{response.text} (retried {len(_RATE_LIMIT_BACKOFF)}x). This is a quota "
+                "failure, NOT a missing record — retry later or slow the batch down."
+            )
+        break
 
     if not response.ok:
         # Surface the Linnworks error verbatim — the body usually contains the
@@ -259,29 +330,42 @@ def call_linnworks_void(method_path: str, payload: dict) -> None:
     POST a Linnworks API call that returns 204 No Content (no response body).
 
     Used for endpoints like ImportExport/RunNowImport that signal success
-    purely via HTTP 204. Raises RuntimeError on any non-2xx response.
+    purely via HTTP 204. Raises RuntimeError on any non-2xx response, and
+    RateLimitError if still throttled after the full backoff (issue #34).
     """
     global _token, _server
-    token, server = ensure_auth()
-    url = f"{server.rstrip('/')}/api/{method_path}"
-
-    response = _session.post(
-        url,
-        json=payload,
-        headers={"Authorization": token},
-        timeout=60,
-    )
-
-    if response.status_code == 401:
-        _token, _server = None, None
+    attempt = 0
+    while True:
         token, server = ensure_auth()
         url = f"{server.rstrip('/')}/api/{method_path}"
+
         response = _session.post(
             url,
             json=payload,
             headers={"Authorization": token},
             timeout=60,
         )
+
+        if response.status_code == 401:
+            _token, _server = None, None
+            token, server = ensure_auth()
+            url = f"{server.rstrip('/')}/api/{method_path}"
+            response = _session.post(
+                url,
+                json=payload,
+                headers={"Authorization": token},
+                timeout=60,
+            )
+
+        if _is_rate_limited(response):
+            if _rate_limit_pause(method_path, response, attempt):
+                attempt += 1
+                continue
+            raise RateLimitError(
+                f"Linnworks {method_path} rate-limited: HTTP {response.status_code} — "
+                f"{response.text} (retried {len(_RATE_LIMIT_BACKOFF)}x)."
+            )
+        break
 
     if not response.ok:
         raise RuntimeError(
@@ -296,28 +380,43 @@ def call_linnworks_get(method_path: str, params: dict | None = None) -> any:
 
     method_path: e.g. "Orders/GetOrderDetailsByNumOrderId"
     params:      query-string parameters dict, e.g. {"orderId": "596475"}
+
+    Retries HTTP 429 with backoff and raises RateLimitError if still throttled
+    after the full ladder (issue #34).
     """
     global _token, _server
-    token, server = ensure_auth()
-    url = f"{server.rstrip('/')}/api/{method_path}"
-
-    response = _session.get(
-        url,
-        params=params,
-        headers={"Authorization": token},
-        timeout=60,
-    )
-
-    if response.status_code == 401:
-        _token, _server = None, None
+    attempt = 0
+    while True:
         token, server = ensure_auth()
         url = f"{server.rstrip('/')}/api/{method_path}"
+
         response = _session.get(
             url,
             params=params,
             headers={"Authorization": token},
             timeout=60,
         )
+
+        if response.status_code == 401:
+            _token, _server = None, None
+            token, server = ensure_auth()
+            url = f"{server.rstrip('/')}/api/{method_path}"
+            response = _session.get(
+                url,
+                params=params,
+                headers={"Authorization": token},
+                timeout=60,
+            )
+
+        if _is_rate_limited(response):
+            if _rate_limit_pause(method_path, response, attempt):
+                attempt += 1
+                continue
+            raise RateLimitError(
+                f"Linnworks {method_path} rate-limited: HTTP {response.status_code} — "
+                f"{response.text} (retried {len(_RATE_LIMIT_BACKOFF)}x)."
+            )
+        break
 
     if not response.ok:
         raise RuntimeError(
@@ -7336,6 +7435,11 @@ def _resolve_sku_to_id(sku: str, cache: dict | None = None) -> str:
     Uses Inventory/GetInventoryItem (exact SKU match only — no fuzzy search).
     Raises ValueError if the SKU is not found.
 
+    ⚠️  A rate-limited call is NOT a missing SKU. RateLimitError is re-raised
+    unchanged rather than being folded into the "not found" ValueError — the
+    old behaviour turned a transient quota failure into a factual claim that
+    the item didn't exist, which callers then acted on (issue #34).
+
     Args:
         sku:   The exact SKU / item number.
         cache: Optional dict for within-call deduplication.  If provided,
@@ -7345,6 +7449,8 @@ def _resolve_sku_to_id(sku: str, cache: dict | None = None) -> str:
         return cache[sku]
     try:
         item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+    except RateLimitError:
+        raise
     except RuntimeError as exc:
         raise ValueError(f"SKU '{sku}' not found in Linnworks: {exc}") from exc
     stock_item_id = item.get("StockItemId")
@@ -10570,45 +10676,49 @@ def get_channel_listings(sku: str) -> dict:
     }
 
 
-@mcp.tool()
-def get_channel_listings_bulk(skus: list[str]) -> dict:
+def _resolve_bulk_inputs(
+    skus: list[str] | None,
+    stock_item_ids: list[str] | None,
+) -> tuple[list[tuple[str, str]], dict[str, str], list[dict], list[dict]]:
     """
-    Read the existing channel listings for MANY inventory items at once — the
-    batch dedupe companion to `list_to_shopify`.
+    Shared front-end for the bulk read tools: turn SKUs and/or StockItemIds into
+    (resolved, titles, unresolved, rate_limited).
 
-    For each SKU, resolves it to its StockItemId and reads the channel-SKU link
-    table via Inventory/BatchGetInventoryItemChannelSKUs (one batched call per
-    200 items). Use this before a bulk listing run to skip SKUs that are already
-    live on a channel/store, rather than relying on the barcode heuristic.
+    Two things this fixes (issue #34):
 
-    Args:
-        skus: List of exact SKUs / ItemNumbers to check.
-
-    Returns:
-        A dict with:
-          - item_count:     number of SKUs requested
-          - resolved_count: how many resolved to a stock item
-          - listed_count / unlisted_count: split of resolved items by whether
-            they have any channel listing
-          - results: per-SKU rows (sku, stock_item_id, title, is_listed,
-            listing_count, channels, sub_sources, listings) — same listing shape
-            as get_channel_listings
-          - unresolved: per-SKU error rows for SKUs that were not found
+    1. **StockItemIds skip resolution entirely.** The batched read underneath is
+       one call per 200 items; the per-SKU `GetInventoryItem` loop in front of it
+       was the real bottleneck, self-limiting these tools to ~150 SKUs/min. Any
+       caller chaining from `list_inventory_items` / `find_composite_parents`
+       already holds the ids — passing them turns thousands of calls into a
+       handful.
+    2. **A rate-limited SKU is NOT an unresolved SKU.** 429s go to their own
+       `rate_limited` bucket. `unresolved` keeps its original meaning: the
+       catalogue says no.
     """
-    if not skus:
-        raise ValueError("skus must contain at least one SKU.")
-
     resolved: list[tuple[str, str]] = []
     titles: dict[str, str] = {}
     unresolved: list[dict] = []
+    rate_limited: list[dict] = []
 
-    for raw in skus:
+    for raw in (stock_item_ids or []):
+        sid = (raw or "").strip()
+        if not sid:
+            unresolved.append({"stock_item_id": raw, "error": "empty stock_item_id"})
+            continue
+        resolved.append((sid, sid))   # no SKU known; the id doubles as the label
+
+    for raw in (skus or []):
         s = (raw or "").strip()
         if not s:
             unresolved.append({"sku": raw, "error": "empty SKU"})
             continue
         try:
             item = call_linnworks("Inventory/GetInventoryItem", {"sku": s})
+        except RateLimitError as exc:
+            # Transient quota failure — say so. Never "not found".
+            rate_limited.append({"sku": s, "error": str(exc)})
+            continue
         except RuntimeError as exc:
             unresolved.append({"sku": s, "error": f"not found: {exc}"})
             continue
@@ -10618,6 +10728,58 @@ def get_channel_listings_bulk(skus: list[str]) -> dict:
             continue
         resolved.append((s, sid))
         titles[sid.lower()] = item.get("ItemTitle")
+
+    return resolved, titles, unresolved, rate_limited
+
+
+@mcp.tool()
+def get_channel_listings_bulk(
+    skus: list[str] | None = None,
+    stock_item_ids: list[str] | None = None,
+) -> dict:
+    """
+    Read the existing channel listings for MANY inventory items at once — the
+    batch dedupe companion to `list_to_shopify`.
+
+    Reads the channel-SKU link table via Inventory/BatchGetInventoryItemChannelSKUs
+    (one batched call per 200 items). Use before a bulk listing run to skip SKUs
+    already live on a channel/store, or before a delist/archive sweep to find what
+    is still live.
+
+    ⚠️  PREFER `stock_item_ids` FOR LARGE BATCHES. Resolving SKUs costs one
+    `GetInventoryItem` call each against a 150/min quota, so a few thousand SKUs
+    will spend minutes in backoff; the batched read itself is ~1 call per 200.
+    Anything chaining from `list_inventory_items` or `find_composite_parents`
+    already has the ids. Measured: 5,391 items took 187s (and was wrong) by SKU
+    vs 15.6s / 27 calls by id.
+
+    ⚠️  `unresolved` means the catalogue has no such SKU. Rate-limited lookups go
+    to a SEPARATE `rate_limited` list — they are transient and should be retried,
+    NOT treated as missing items. Conflating the two previously under-reported
+    live listings by 88% (issue #34).
+
+    Args:
+        skus: Exact SKUs / ItemNumbers to check.
+        stock_item_ids: StockItemId GUIDs to check (skips resolution — faster and
+            quota-free). Either or both may be given.
+
+    Returns:
+        A dict with:
+          - item_count:     number of inputs requested
+          - resolved_count: how many resolved to a stock item
+          - listed_count / unlisted_count: split of resolved items by whether
+            they have any channel listing
+          - results: per-item rows (sku, stock_item_id, title, is_listed,
+            listing_count, channels, sub_sources, listings) — same listing shape
+            as get_channel_listings
+          - unresolved: rows for inputs the catalogue does not have
+          - rate_limited: rows that hit the quota; re-run these
+          - complete: False when anything was rate-limited (the answer is partial)
+    """
+    if not skus and not stock_item_ids:
+        raise ValueError("Provide at least one of skus or stock_item_ids.")
+
+    resolved, titles, unresolved, rate_limited = _resolve_bulk_inputs(skus, stock_item_ids)
 
     by_id = _fetch_channel_skus_for_ids([sid for _, sid in resolved])
 
@@ -10639,12 +10801,14 @@ def get_channel_listings_bulk(skus: list[str]) -> dict:
         })
 
     return {
-        "item_count":     len(skus),
+        "item_count":     len(skus or []) + len(stock_item_ids or []),
         "resolved_count": len(resolved),
         "listed_count":   listed_count,
         "unlisted_count": len(resolved) - listed_count,
         "results":        results,
         "unresolved":     unresolved,
+        "rate_limited":   rate_limited,
+        "complete":       not rate_limited,
     }
 
 
@@ -10747,57 +10911,52 @@ def get_inventory_item_images(sku: str) -> dict:
 
 
 @mcp.tool()
-def get_inventory_item_images_bulk(skus: list[str]) -> dict:
+def get_inventory_item_images_bulk(
+    skus: list[str] | None = None,
+    stock_item_ids: list[str] | None = None,
+) -> dict:
     """
     Read the images for MANY inventory items at once — the batch pre-listing
     image gate, mirroring `get_channel_listings_bulk`.
 
-    For each SKU, resolves it to its StockItemId (which also yields the title and
-    flags SKUs that don't exist), then batch-reads the image table via
-    Inventory/GetImagesInBulk (one batched call per 200 items). An item that
-    exists but has zero images is reported with has_image=False (a real item to
-    fix), distinct from an `unresolved` SKU (not found in the catalogue).
+    Batch-reads the image table via Inventory/GetImagesInBulk (one batched call
+    per 200 items). An item that exists but has zero images is reported with
+    has_image=False (a real item to fix), distinct from an `unresolved` input
+    (not in the catalogue).
 
     Use this before a bulk listing run to skip/flag SKUs with no image, so you
     only list the genuinely ready ones.
 
+    ⚠️  PREFER `stock_item_ids` FOR LARGE BATCHES — resolving SKUs costs one
+    `GetInventoryItem` call each against a 150/min quota, while the batched read
+    is ~1 call per 200. See `get_channel_listings_bulk` (issue #34).
+
+    ⚠️  `unresolved` means the catalogue has no such SKU; rate-limited lookups go
+    to a separate `rate_limited` list and should be retried, never read as
+    missing items.
+
     Args:
-        skus: List of exact SKUs / ItemNumbers to check.
+        skus: Exact SKUs / ItemNumbers to check.
+        stock_item_ids: StockItemId GUIDs to check (skips resolution). Either or
+            both may be given.
 
     Returns:
         A dict with:
-          - item_count:        number of SKUs requested
+          - item_count:        number of inputs requested
           - resolved_count:    how many resolved to a stock item
           - with_image_count / without_image_count: split of resolved items by
             whether they have any image
-          - results: per-SKU rows (sku, stock_item_id, title, has_image,
+          - results: per-item rows (sku, stock_item_id, title, has_image,
             image_count, has_main_image, images) — same image shape as
             get_inventory_item_images
-          - unresolved: per-SKU error rows for SKUs that were not found
+          - unresolved: rows for inputs the catalogue does not have
+          - rate_limited: rows that hit the quota; re-run these
+          - complete: False when anything was rate-limited (the answer is partial)
     """
-    if not skus:
-        raise ValueError("skus must contain at least one SKU.")
+    if not skus and not stock_item_ids:
+        raise ValueError("Provide at least one of skus or stock_item_ids.")
 
-    resolved: list[tuple[str, str]] = []
-    titles: dict[str, str] = {}
-    unresolved: list[dict] = []
-
-    for raw in skus:
-        s = (raw or "").strip()
-        if not s:
-            unresolved.append({"sku": raw, "error": "empty SKU"})
-            continue
-        try:
-            item = call_linnworks("Inventory/GetInventoryItem", {"sku": s})
-        except RuntimeError as exc:
-            unresolved.append({"sku": s, "error": f"not found: {exc}"})
-            continue
-        sid = item.get("StockItemId")
-        if not sid:
-            unresolved.append({"sku": s, "error": "found but returned no StockItemId"})
-            continue
-        resolved.append((s, sid))
-        titles[sid.lower()] = item.get("ItemTitle")
+    resolved, titles, unresolved, rate_limited = _resolve_bulk_inputs(skus, stock_item_ids)
 
     by_id = _fetch_images_for_ids([sid for _, sid in resolved])
 
@@ -10820,12 +10979,14 @@ def get_inventory_item_images_bulk(skus: list[str]) -> dict:
         })
 
     return {
-        "item_count":         len(skus),
+        "item_count":         len(skus or []) + len(stock_item_ids or []),
         "resolved_count":     len(resolved),
         "with_image_count":   with_image,
         "without_image_count": len(resolved) - with_image,
         "results":            results,
         "unresolved":         unresolved,
+        "rate_limited":       rate_limited,
+        "complete":           not rate_limited,
     }
 
 

@@ -1,6 +1,6 @@
 # Linnworks MCP Server
 
-![Version](https://img.shields.io/badge/version-1.36.0-blue)
+![Version](https://img.shields.io/badge/version-1.37.0-blue)
 ![Tools](https://img.shields.io/badge/tools-83-blue)
 
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
@@ -55,7 +55,7 @@ Once installed, Claude gets access to these tools:
 | `get_inventory_item_descriptions` | Channel-specific descriptions for a SKU |
 | `get_inventory_item_suppliers` | Which suppliers an item can be bought from — code, cost, lead time, and which is default |
 | `get_inventory_item_images` | Images on an item — count, main image, URLs |
-| `get_inventory_item_images_bulk` | Image check across many SKUs at once |
+| `get_inventory_item_images_bulk` | Image check across many SKUs at once — also accepts `stock_item_ids` to skip resolution |
 | `get_locations` | List all warehouse and fulfilment locations with their GUIDs |
 
 **Inventory (write — all default to dry_run=True)**
@@ -93,7 +93,7 @@ Once installed, Claude gets access to these tools:
 | Tool | What it does |
 |---|---|
 | `get_channel_listings` | Check whether a SKU is listed, and on which channel/store |
-| `get_channel_listings_bulk` | The same listing check across many SKUs at once |
+| `get_channel_listings_bulk` | The same listing check across many SKUs at once. Pass `stock_item_ids` instead of SKUs for large batches — it skips per-SKU resolution entirely (5,391 items: 15.6s vs 187s). Rate-limited lookups are reported separately from genuinely-missing ones |
 | `list_to_shopify` | List existing inventory to Shopify via a saved configurator |
 | `refresh_channel_listing` | Re-push edited item data to a live Shopify listing (revise) |
 | `unpublish_channel_listing` | Take down / end a live listing on one channel and store — Shopify, Amazon, TikTok, Magento or Walmart |
