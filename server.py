@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.35.0"
+__version__ = "1.36.0"
 
 import os
 import sys
@@ -3651,6 +3651,441 @@ def get_stock_level(
     if notes:
         result["notes"] = notes
     return result
+
+
+# ---------- Stock change history (issue #33) ----------
+#
+# Stock/GetItemChangesHistory is the audit trail behind a stock level. The public
+# spec's StockItemChangeHistory model has NO ChangeSource field — the source is
+# embedded in the free-text `Note`, so _classify_change_source() derives it. The
+# patterns below were built from ~6,100 live rows across Default, FBA and supplier
+# locations on this tenant (5 Aug 2026).
+#
+# Each entry: (canonical source, tuple of lowercase note prefixes/substrings).
+# Order matters — first match wins, so specific patterns precede general ones.
+_CHANGE_SOURCE_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
+    ("RETURN",       ("customer return for order",)),
+    ("SCRAP",        ("scrapped by",)),
+    ("SALE",         ("order ",)),
+    ("PO_DELIVERY",  ("po delivered", "delivered")),
+    ("STOCKTAKE",    ("stock count adjustment",)),
+    ("ADJUSTMENT",   ("direct adjustment",)),
+    ("FBA_SYNC",     ("fba sync", "no quantity returned from channel")),
+    ("FILE_IMPORT",  ("imported from file", "import ")),
+]
+
+# Sources that are automated/system noise rather than genuine trading movement.
+# Mirrors the ChangeSource exclusions used in this tenant's custom-SQL export
+# ('Imported from file%', 'FBA Sync%', 'Import %') — see issue #33.
+_AUTOMATED_CHANGE_SOURCES = ("FILE_IMPORT", "FBA_SYNC")
+
+# Every canonical source this classifier can emit (used to validate filters).
+_KNOWN_CHANGE_SOURCES = (
+    "SALE", "RETURN", "PO_DELIVERY", "PO_BOOKING", "PO_DELETED", "PO_UPDATE",
+    "STOCKTAKE", "ADJUSTMENT", "FBA_SYNC", "FILE_IMPORT", "SCRAP", "OTHER",
+)
+
+
+def _classify_change_source(note: str | None) -> str:
+    """
+    Derive a canonical change_source from a stock-change Note.
+
+    Linnworks does NOT return a ChangeSource field on Stock/GetItemChangesHistory
+    (despite the underlying StockChange table having one, which is why the custom-SQL
+    export can filter on it). The source has to be recovered from the free-text note.
+
+    Returns one of _KNOWN_CHANGE_SOURCES. Unrecognised notes → "OTHER" rather than
+    being forced into a wrong bucket — the raw `note` is always returned alongside
+    so a caller can reclassify.
+    """
+    n = (note or "").strip().lower()
+    if not n:
+        return "OTHER"
+
+    # PO notes all start "PO" but mean different things; split them before the
+    # general table so a "PO ... delivered" never falls through to another rule.
+    if n.startswith("po "):
+        if "delivered" in n:
+            return "PO_DELIVERY"
+        if "to open" in n or "due " in n:
+            return "PO_BOOKING"
+        if "deleted" in n:
+            return "PO_DELETED"
+        if "update" in n:
+            return "PO_UPDATE"
+        return "OTHER"
+
+    for source, prefixes in _CHANGE_SOURCE_PATTERNS:
+        for p in prefixes:
+            if n.startswith(p) or p in n:
+                return source
+    return "OTHER"
+
+
+def _fetch_change_history_rows(
+    stock_item_id: str,
+    location_id: str,
+    max_pages: int,
+    per_page: int = 200,
+) -> tuple[list[dict], int, bool]:
+    """
+    Page Stock/GetItemChangesHistory for one (item, location), newest-first.
+
+    Returns (rows, total_entries, truncated). Stops early once max_pages is hit —
+    `truncated` then says the trailing history was NOT fully read, which the caller
+    must surface (an out_of_stock_since derived from a truncated tail can only be
+    a lower bound on how long the item has been at zero).
+
+    ⚠️  locationId is REQUIRED despite the spec calling it optional ("If null then
+    combined") — omitting it returns HTTP 400 "The request is invalid.". There is
+    therefore no combined-across-locations mode; scan per location and merge.
+    ⚠️  pageNumber=-1 ("all pages" per the spec) returns HTTP 400 "Value must be at
+    least 1" — real paging is the only option.
+    """
+    rows: list[dict] = []
+    total = 0
+    page = 1
+    while page <= max_pages:
+        resp = call_linnworks_get(
+            "Stock/GetItemChangesHistory",
+            {
+                "stockItemId": stock_item_id,
+                "locationId": location_id,
+                "entriesPerPage": per_page,
+                "pageNumber": page,
+            },
+        )
+        total = resp.get("TotalEntries") or 0
+        batch = resp.get("Data") or []
+        rows.extend(batch)
+        # Past-the-end returns an empty Data array with a 200 (unlike
+        # GetStockItemsFull, which 400s) — a clean stop signal.
+        if len(batch) < per_page:
+            return rows, total, False
+        page += 1
+    return rows, total, len(rows) < total
+
+
+def _format_change_row(row: dict) -> dict:
+    """Normalise one StockItemChangeHistory row into the tool's output shape."""
+    note = row.get("Note")
+    return {
+        "date": row.get("Date"),
+        "change_source": _classify_change_source(note),
+        # `Level` is the level AFTER the change — verified live on 15 consecutive
+        # row pairs (row.Level - row.ChangeQty == the next-older row's Level).
+        "level_after": row.get("Level"),
+        "quantity": row.get("ChangeQty"),
+        "stock_value_after": row.get("StockValue"),
+        "change_value": row.get("ChangeValue"),
+        "note": note,
+    }
+
+
+def _summarise_change_history(
+    rows: list[dict],
+    current_level: int | None,
+    truncated: bool,
+    now: "datetime | None" = None,
+) -> dict:
+    """
+    Derive the dead-stock summary from newest-first movement rows.
+
+    out_of_stock_since is the date of the OLDEST row in the current unbroken
+    trailing run of level_after == 0 — NOT simply the most recent row at zero.
+    That distinction is the whole point: an item sat at zero for a year still
+    receives automated rows (FBA sync, file imports) that write 0 again, and
+    "most recent row where level == 0" would reset the dead-stock clock to today
+    on exactly the items the cleanup job is looking for.
+
+    Deriving it from the raw level series (rather than from source-filtered rows)
+    is also why no filtering happens here: FBA-sync rows in this tenant are
+    genuine decrements (live-observed walking an item 13 → 0), so excluding them
+    from the series would produce a wrong date. Source filtering belongs to
+    last_real_movement_date, which is what the noise actually distorts.
+    """
+    now = now or datetime.now(timezone.utc)
+
+    def _parse(d: str | None):
+        if not d:
+            return None
+        try:
+            return datetime.fromisoformat(str(d).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    def _first(pred):
+        return next((r for r in rows if pred(r)), None)
+
+    # Trailing zero run — walk from newest backwards while level_after == 0.
+    out_of_stock_since = None
+    zero_run_rows = 0
+    zero_run_complete = True
+    if rows and (rows[0].get("level_after") or 0) == 0:
+        for r in rows:
+            if (r.get("level_after") or 0) != 0:
+                break
+            out_of_stock_since = r.get("date")
+            zero_run_rows += 1
+        # The run reaching the end of a truncated read means the true transition
+        # is older than anything we fetched.
+        if zero_run_rows == len(rows) and truncated:
+            zero_run_complete = False
+
+    # If current stock disagrees with the newest history row, the history is not a
+    # safe basis for a zero claim — say so rather than asserting a date.
+    level_from_history = rows[0].get("level_after") if rows else None
+    level_mismatch = (
+        current_level is not None
+        and level_from_history is not None
+        and current_level != level_from_history
+    )
+    if current_level is not None and current_level > 0:
+        out_of_stock_since = None
+
+    days_out = None
+    since_dt = _parse(out_of_stock_since)
+    if since_dt is not None:
+        days_out = (now - since_dt).days
+
+    movements = [r for r in rows if (r.get("quantity") or 0) != 0]
+    real_movements = [
+        r for r in movements
+        if r.get("change_source") not in _AUTOMATED_CHANGE_SOURCES
+    ]
+    last_sale = _first(lambda r: r.get("change_source") == "SALE")
+    last_recv = _first(lambda r: r.get("change_source") in ("PO_DELIVERY", "RETURN"))
+
+    return {
+        "current_level": current_level,
+        "level_from_history": level_from_history,
+        "out_of_stock_since": out_of_stock_since,
+        "days_out_of_stock": days_out,
+        "out_of_stock_since_is_lower_bound": bool(out_of_stock_since) and not zero_run_complete,
+        "last_movement_date": movements[0]["date"] if movements else None,
+        "last_real_movement_date": real_movements[0]["date"] if real_movements else None,
+        "last_sale_date": last_sale["date"] if last_sale else None,
+        "last_received_date": last_recv["date"] if last_recv else None,
+        "movement_count": len(rows),
+        "level_mismatch": level_mismatch,
+    }
+
+
+@mcp.tool()
+def get_stock_change_history(
+    skus: list[str] | str,
+    location_id: str | None = None,
+    all_locations: bool = False,
+    include_movements: bool = True,
+    max_movements: int = 50,
+    change_sources: list[str] | None = None,
+    exclude_change_sources: list[str] | None = None,
+    max_pages: int = 10,
+) -> dict:
+    """
+    Stock movement history for one or more SKUs, plus a derived dead-stock summary
+    answering "when did this item actually go out of stock?".
+
+    This is the audit trail behind a stock level — every change with its date,
+    quantity, resulting level and source (sale, PO delivery, return, stocktake,
+    manual adjustment, file import, FBA sync). Built for the catalogue-cleanup
+    screen: find items that have sat at zero for ~3 months, then hand them to
+    find_composite_parents → delist_all_channel_listings → archive_inventory_items.
+
+    KEY DERIVED FIELD — `out_of_stock_since` is the date the item TRANSITIONED to
+    zero: the oldest row in the current unbroken run of level_after == 0. It is
+    deliberately NOT "the most recent row where level == 0", because an item that
+    has been dead for a year still receives automated rows (FBA sync, nightly file
+    imports) that rewrite 0 — which would reset the dead-stock clock to today on
+    exactly the items you are hunting. `days_out_of_stock` follows from it.
+
+    ⚠️  PER LOCATION, NOT COMBINED. Linnworks requires a locationId here (the
+    spec's "if null then combined" is wrong — it 400s), so history is always
+    location-scoped. `all_locations=True` scans every location and returns a
+    per-location breakdown plus `zero_at_all_locations_since` (the LATEST of the
+    per-location zero dates, set only when every location is currently zero).
+    Quantities are NOT summed across locations: most non-Default locations in this
+    tenant are virtual dropship supplier mirrors showing the same availability, so
+    a combined figure would be meaningless.
+
+    ⚠️  change_source is DERIVED from the free-text note, not returned by Linnworks
+    — the API has no ChangeSource field even though the underlying table does. The
+    raw `note` is always included so you can reclassify anything landing in "OTHER".
+
+    Filtering (`change_sources` / `exclude_change_sources`) applies to the returned
+    `movements` list and to `last_real_movement_date`. It never applies to the
+    level series behind `out_of_stock_since`, because automated rows here are real
+    decrements (FBA sync live-observed walking an item 13 → 0) and dropping them
+    would produce a wrong date.
+
+    Cost: one call per (SKU, location) page. `all_locations=True` costs ~29 calls
+    per SKU on this tenant — keep those batches small. Rate limit 250/min.
+
+    Args:
+        skus: One SKU or a list of SKUs (exact ItemNumbers; ACTIVE items only —
+            archived SKUs cannot be resolved).
+        location_id: StockLocationId GUID to scope to. Defaults to the "Default"
+            location (owned stock). Ignored when all_locations=True.
+        all_locations: If True, scan every stock location and return a per-location
+            breakdown plus zero_at_all_locations_since. Costs ~29 calls per SKU.
+        include_movements: If True (default), return the movement rows. Set False
+            for a summary-only bulk screen.
+        max_movements: Cap on returned movement rows per SKU/location (default 50).
+            Truncates detail only — every summary figure is computed across all
+            rows read.
+        change_sources: Only include movements with these sources. One or more of:
+            SALE, RETURN, PO_DELIVERY, PO_BOOKING, PO_DELETED, PO_UPDATE,
+            STOCKTAKE, ADJUSTMENT, FBA_SYNC, FILE_IMPORT, SCRAP, OTHER.
+        exclude_change_sources: Drop movements with these sources. Applied after
+            change_sources.
+        max_pages: Max history pages (200 rows each) to read per SKU/location.
+            Default 10 (2,000 rows). If the trailing zero run reaches the end of a
+            truncated read, out_of_stock_since_is_lower_bound is set True.
+
+    Returns:
+        dict with per-SKU results carrying the summary fields (out_of_stock_since,
+        days_out_of_stock, last_sale_date, last_received_date, …), optional
+        movements, and — with all_locations — a `locations` breakdown. Unresolvable
+        SKUs land in `unresolved` and never abort the batch.
+    """
+    if isinstance(skus, str):
+        skus = [skus]
+    if not skus:
+        return {"error": "No SKUs supplied.", "count": 0, "results": []}
+
+    for name, sel in (("change_sources", change_sources),
+                      ("exclude_change_sources", exclude_change_sources)):
+        if sel:
+            bad = [s for s in sel if s.upper() not in _KNOWN_CHANGE_SOURCES]
+            if bad:
+                raise ValueError(
+                    f"Unknown {name}: {bad}. Valid sources: {', '.join(_KNOWN_CHANGE_SOURCES)}"
+                )
+
+    include_set = {s.upper() for s in change_sources} if change_sources else None
+    exclude_set = {s.upper() for s in exclude_change_sources} if exclude_change_sources else set()
+    max_pages = max(1, min(int(max_pages or 1), 100))
+
+    if all_locations:
+        loc_rows = call_linnworks_get("Inventory/GetStockLocations") or []
+        targets = [
+            (l.get("StockLocationId"), l.get("LocationName"))
+            for l in loc_rows
+            if l.get("StockLocationId")
+        ]
+    else:
+        lid = location_id or DEFAULT_LOCATION_ID
+        targets = [(lid, None)]
+
+    def _apply_filter(rows: list[dict]) -> list[dict]:
+        out = rows
+        if include_set is not None:
+            out = [r for r in out if r["change_source"] in include_set]
+        if exclude_set:
+            out = [r for r in out if r["change_source"] not in exclude_set]
+        return out
+
+    results, unresolved = [], []
+    id_cache: dict = {}
+    calls = 0
+
+    for sku in skus:
+        try:
+            stock_item_id = _resolve_sku_to_id(sku, id_cache)
+        except Exception as exc:
+            unresolved.append({
+                "sku": sku,
+                "error": str(exc),
+                "hint": "Archived items cannot be resolved by SKU — unarchive first.",
+            })
+            continue
+
+        # Current levels are authoritative — history can be empty for an item that
+        # genuinely holds stock (live-confirmed: RS-102201 has 0 history rows at
+        # Default while holding stock at Rock Solid), so never infer the level from
+        # the history alone.
+        levels_by_loc: dict[str, int] = {}
+        try:
+            batch = call_linnworks(
+                "Stock/GetStockLevel_Batch", {"request": {"StockItemIds": [stock_item_id]}}
+            )
+            calls += 1
+            item_row = next(
+                (r for r in (batch if isinstance(batch, list) else [])
+                 if r.get("pkStockItemId") == stock_item_id),
+                None,
+            )
+            for l in (item_row or {}).get("StockItemLevels") or []:
+                loc = (l.get("Location") or {}).get("StockLocationId")
+                if loc:
+                    levels_by_loc[loc] = l.get("StockLevel") or 0
+        except Exception:
+            levels_by_loc = {}
+
+        per_location = []
+        for lid, lname in targets:
+            rows_raw, total, truncated = _fetch_change_history_rows(
+                stock_item_id, lid, max_pages
+            )
+            calls += max(1, -(-len(rows_raw) // 200))
+            rows = [_format_change_row(r) for r in rows_raw]
+            summary = _summarise_change_history(
+                rows, levels_by_loc.get(lid), truncated
+            )
+            entry = {
+                "location_id": lid,
+                "location_name": lname,
+                "total_entries": total,
+                "rows_read": len(rows),
+                "history_truncated": truncated,
+                **summary,
+            }
+            if include_movements:
+                shown = _apply_filter(rows)
+                entry["movements"] = shown[:max_movements]
+                entry["movements_truncated"] = len(shown) > max_movements
+                entry["movements_matching_filter"] = len(shown)
+            per_location.append(entry)
+
+        record: dict = {"sku": sku, "stock_item_id": stock_item_id}
+
+        if all_locations:
+            active = [p for p in per_location if p["total_entries"] or p["current_level"]]
+            all_zero = all((p["current_level"] or 0) == 0 for p in per_location)
+            zero_dates = [p["out_of_stock_since"] for p in active if p["out_of_stock_since"]]
+            never_stocked = all_zero and not zero_dates
+            record.update({
+                "scope": "all_locations",
+                "zero_at_all_locations": all_zero,
+                # The LATEST per-location zero date: every location has been at
+                # zero only since the last one of them hit zero.
+                "zero_at_all_locations_since": max(zero_dates) if (all_zero and zero_dates) else None,
+                "never_stocked_anywhere": never_stocked,
+                "locations_with_history": len([p for p in per_location if p["total_entries"]]),
+                "locations": [p for p in per_location if p["total_entries"] or (p["current_level"] or 0)],
+            })
+        else:
+            record.update({"scope": "location", **per_location[0]})
+
+        results.append(record)
+
+    return {
+        "count": len(results),
+        "unresolved_count": len(unresolved),
+        "scope": "all_locations" if all_locations else "location",
+        "change_source_filter": {
+            "include": sorted(include_set) if include_set else None,
+            "exclude": sorted(exclude_set) if exclude_set else None,
+            "note": (
+                "Filters apply to `movements` and last_real_movement_date only — never "
+                "to the level series behind out_of_stock_since."
+            ),
+        },
+        "automated_sources": list(_AUTOMATED_CHANGE_SOURCES),
+        "api_calls": calls,
+        "results": results,
+        "unresolved": unresolved,
+    }
 
 
 @mcp.tool()
