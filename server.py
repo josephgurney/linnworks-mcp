@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.37.0"
+__version__ = "1.38.0"
 
 import os
 import sys
@@ -12584,40 +12584,136 @@ def unpublish_channel_listing(
             res["error"] = f"ProcessTemplates (Delete) failed: {exc}"
         results.append(res)
 
-    # ── Read-back: once per item, after all of its templates are processed ─────
+    # ── Read-back: TWO surfaces, per item AND per template (issue #36) ─────────
+    #
+    # The channel-SKU check alone is a PER-ITEM signal, and the first successful
+    # delete empties that table for the whole item — so on a multi-template item
+    # it reported taken_down:true for templates that were never deleted. Live
+    # proof (6 Aug 2026): 304035-000-825 and 304037-000-850 each had two
+    # templates; one of each survived with Linnworks returning
+    # Status "Not deleted", and the tool called all four a success.
+    #
+    # So each template is now checked individually by re-opening the item's
+    # templates and asking whether THAT template id is gone, while the
+    # channel-SKU read still answers the separate question "is the listing gone".
+    # The two can legitimately disagree: an orphaned-but-undeletable template
+    # over an already-dead listing is a real, observed state.
     taken = 0
     for sid in dict.fromkeys(row["stock_item_id"] for row in plan):
         rows_for_item = [r for r in results
                          if any(p["template_id"] == r["template_id"] and p["stock_item_id"] == sid
                                 for p in plan)]
+
+        # (a) per-template: which template ids still exist, and in what state?
+        remaining: dict = {}
+        template_readback_failed = None
+        try:
+            resp = call_linnworks(
+                "GenericListings/OpenTemplatesByInventory",
+                {"request": {
+                    "ChannelType": ch["channel_type"],
+                    "ChannelName": ch["channel_name"],
+                    "Parameters": {
+                        "SelectedRegions": [],
+                        "Token": "00000000-0000-0000-0000-000000000000",
+                        "InventoryItemIds": [sid],
+                        "ChannelId": target_channel_id,
+                    },
+                    "PaginationParameters": {"PageNumber": 1, "EntriesPerPage": 20},
+                }},
+            )
+            for t in (resp.get("TemplatesInfo") if isinstance(resp, dict) else None) or []:
+                info = t.get("Info") if isinstance(t.get("Info"), dict) else {}
+                remaining[t.get("Id")] = _glt_field(info, "Status")
+        except RuntimeError as exc:
+            template_readback_failed = str(exc)
+
+        # (b) per-item: are any channel-SKU rows left for this store?
+        still_count = None
         try:
             rows = call_linnworks_get(
                 "Inventory/GetInventoryItemChannelSKUs", {"inventoryItemId": sid},
             )
-            still = [
+            still_count = len([
                 r for r in (rows if isinstance(rows, list) else [])
                 if _norm_conf_name(r.get("Source")) == _norm_conf_name(channel_source)
                 and _norm_conf_name(r.get("SubSource")) == _norm_conf_name(sub_source)
-            ]
-            for r in rows_for_item:
-                r["still_listed"] = len(still) > 0
-                r["taken_down"] = len(still) == 0
-                if len(still) == 0 and r.get("processed"):
-                    taken += 1
+            ])
         except RuntimeError as exc:
             for r in rows_for_item:
                 r["readback_error"] = f"could not confirm take-down: {exc}"
+
+        for r in rows_for_item:
+            if still_count is not None:
+                r["still_listed"] = still_count > 0
+            if template_readback_failed:
+                r["template_readback_error"] = template_readback_failed
+                r["taken_down"] = None
+                r["outcome"] = "unconfirmed"
+                continue
+
+            tid = r["template_id"]
+            template_gone = tid not in remaining
+            r["template_deleted"] = template_gone
+            r["template_status_after"] = remaining.get(tid)
+
+            if template_gone and still_count == 0:
+                r["taken_down"] = True
+                r["outcome"] = "taken_down"
+                taken += 1
+            elif template_gone and still_count:
+                # Template removed but a channel-SKU row survives — usually
+                # channel sync lag, sometimes another template still owns it.
+                r["taken_down"] = False
+                r["outcome"] = "template_deleted_listing_row_remains"
+            elif not template_gone and still_count == 0:
+                # ⚠️ The case that used to be silently reported as success.
+                r["taken_down"] = False
+                r["outcome"] = "listing_gone_template_orphaned"
+                r["warning"] = (
+                    f"Template {tid} still exists (status "
+                    f"{r['template_status_after']!r}) even though the channel-SKU row is gone. "
+                    "The listing itself appears to be down — verify in the channel's admin. "
+                    "Repeated Delete calls on such a template return 2xx and change nothing."
+                )
+            else:
+                r["taken_down"] = False
+                r["outcome"] = "delete_failed"
+                r["warning"] = (
+                    f"Template {tid} was NOT deleted (status "
+                    f"{r['template_status_after']!r}) and the listing row is still present — "
+                    "the listing may still be live. Check the channel's admin."
+                )
+
+    orphaned = sum(1 for r in results if r.get("outcome") == "listing_gone_template_orphaned")
+    failed = sum(1 for r in results if r.get("outcome") == "delete_failed")
+    extra = ""
+    if orphaned:
+        extra += (
+            f" {orphaned} template(s) survived the Delete but their listing row is gone "
+            "(orphaned template — listing appears down; see results[].warning)."
+        )
+    if failed:
+        extra += (
+            f" ⚠️ {failed} template(s) were NOT deleted AND still have a live listing row — "
+            "these may still be selling."
+        )
 
     return {
         "dry_run": False,
         **base_out,
         "results": results,
+        "taken_down_count": taken,
+        "orphaned_template_count": orphaned,
+        "delete_failed_count": failed,
         "message": (
             f"{taken}/{len(plan)} {ch['channel_type']} template(s) on '{sub_source}' confirmed "
-            "taken down. ProcessTemplates returns no body, so success is inferred from a 2xx plus "
-            "a channel-SKU read-back; the channel may lag, so a row that is still_listed=true may "
-            "simply not have synced yet — re-check with get_channel_listings, and verify in the "
-            f"channel's own admin. Per-item errors are in results[].error.{unproven_note}"
+            "taken down. Each template is verified individually (re-opened by id) AND against the "
+            "channel-SKU table, because a per-item check alone reports success for templates that "
+            "were never deleted on multi-template items (issue #36). The channel may lag, so a "
+            "still_listed=true row may simply not have synced — re-check with get_channel_listings "
+            f"and verify in the channel's own admin. Per-item errors are in results[].error.{extra}"
+            f"{unproven_note}"
         ),
     }
 
@@ -12893,18 +12989,31 @@ def delist_all_channel_listings(
                 })
 
     taken = sum(1 for r in results if r.get("taken_down"))
+    orphaned = sum(1 for r in results if r.get("outcome") == "listing_gone_template_orphaned")
+    failed = sum(1 for r in results if r.get("outcome") == "delete_failed")
+    # Never let a per-template failure hide behind the aggregate count (issue #36).
+    extra = ""
+    if orphaned:
+        extra += (f" {orphaned} orphaned template(s): the Delete did not remove them but their "
+                  "listing row is gone — listing appears down, template needs manual tidying.")
+    if failed:
+        extra += (f" ⚠️ {failed} template(s) were NOT deleted and still have a live listing row — "
+                  "these may still be selling; check the channel's admin.")
     return {
         "dry_run": False,
         **base_out,
         "results": results,
         "still_listed_sub_sources": still_listed,
+        "taken_down_count": taken,
+        "orphaned_template_count": orphaned,
+        "delete_failed_count": failed,
         "message": (
             f"{taken}/{len(results)} template(s) confirmed taken down across all selected "
             f"channels. {len(base_out['skipped_channels'])} listing(s) left up (see "
             "skipped_channels) — those need ending in the channel's own admin. "
             "still_listed_sub_sources lists any store/region whose channel-SKU row survived; "
             "channel sync can lag, so re-check with get_channel_listings before concluding the "
-            f"take-down failed.{unproven_note}"
+            f"take-down failed.{extra}{unproven_note}"
         ),
     }
 
