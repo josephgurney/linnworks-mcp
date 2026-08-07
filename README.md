@@ -1,6 +1,6 @@
 # Linnworks MCP Server
 
-![Version](https://img.shields.io/badge/version-1.38.0-blue)
+![Version](https://img.shields.io/badge/version-1.39.0-blue)
 ![Tools](https://img.shields.io/badge/tools-83-blue)
 
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
@@ -94,7 +94,7 @@ Once installed, Claude gets access to these tools:
 |---|---|
 | `get_channel_listings` | Check whether a SKU is listed, and on which channel/store |
 | `get_channel_listings_bulk` | The same listing check across many SKUs at once. Pass `stock_item_ids` instead of SKUs for large batches — it skips per-SKU resolution entirely (5,391 items: 15.6s vs 187s). Rate-limited lookups are reported separately from genuinely-missing ones |
-| `list_to_shopify` | List existing inventory to Shopify via a saved configurator |
+| `list_to_shopify` | List existing inventory to Shopify via a saved configurator. Two dedupe layers: the same item already listed, **and** a different SKU with the same title already live (the SKU-migration case that created 177 duplicate products) — the latter is excluded unless `allow_duplicate_titles=True` |
 | `refresh_channel_listing` | Re-push edited item data to a live Shopify listing (revise) |
 | `unpublish_channel_listing` | Take down / end a live listing on one channel and store — Shopify, Amazon, TikTok, Magento or Walmart. Each template is verified individually after the delete, so a template that survived is never reported as taken down |
 | `delist_all_channel_listings` | Take down every listing for an item across all channels and stores at once. eBay, Etsy and Mirakl are reported as skipped and left up — they can only be ended in their own admin |

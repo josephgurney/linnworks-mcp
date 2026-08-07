@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.38.0"
+__version__ = "1.39.0"
 
 import os
 import sys
@@ -11418,12 +11418,28 @@ def set_inventory_item_image_order(
     }
 
 
+def _norm_title(title: str | None) -> str:
+    """
+    Normalise an ItemTitle for product-level duplicate matching (issue #38).
+
+    Lowercase + collapse whitespace only. Deliberately NOT fuzzy: exact match on
+    the normalised title caught all 177 duplicate pairs in the 6 Aug 2026
+    incident, and anything looser would start blocking legitimately distinct
+    variants (sizes, colours) whose titles differ by a word or two.
+    """
+    if not title:
+        return ""
+    return " ".join(str(title).split()).casefold()
+
+
 @mcp.tool()
 def list_to_shopify(
     skus: list[str],
     configurator: str | None = None,
     default_configurator: str | None = None,
     sub_source: str | None = None,
+    allow_duplicate_titles: bool = False,
+    known_listed_titles: list[str] | None = None,
     confirmed_count: int | None = None,
     dry_run: bool = True,
 ) -> dict:
@@ -11489,10 +11505,36 @@ def list_to_shopify(
             sub_source, decision)
           - groups: items grouped by resolved configurator — what each
             CreateTemplates call would cover
+          - already_listed: SKUs whose OWN item is already live on the target
+            store (item-level dedupe) — excluded from CreateTemplates
+          - possible_duplicates: SKUs whose TITLE matches a product already live
+            on the target store under a DIFFERENT SKU (product-level dedupe,
+            issue #38) — excluded unless allow_duplicate_titles=True
           - unresolved: per-SKU error rows (not found / no configurator decided /
             name not in catalogue / ambiguous across stores)
           - results: per-group outcome with created template ids and process
             status (live run only)
+
+    ⚠️  TWO dedupe layers, because one wasn't enough:
+      1. ITEM-level — is THIS StockItemId already listed on the target store?
+      2. PRODUCT-level — is a DIFFERENT SKU with the same title already live?
+
+    Layer 2 exists because layer 1 worked perfectly and still produced 177
+    duplicate Shopify products on 6 Aug 2026: a category carried the same fins
+    under an old word-suffix SKU scheme and a new code scheme, so the new SKUs
+    were genuinely unlisted while the products were already for sale. Titles are
+    compared normalised (lowercase, whitespace collapsed) and matched exactly.
+
+    The comparison set is the batch's own `already_listed` rows — free, and the
+    right answer when you pass a whole category. If your batch contains ONLY the
+    new SKUs, pass `known_listed_titles` (e.g. titles from `list_inventory_items`
+    for that category) or layer 2 has nothing to compare against.
+
+    Args (beyond the selection args above):
+        allow_duplicate_titles: If True, title-matched items are listed anyway
+            and merely reported. Default False (they are excluded).
+        known_listed_titles: Extra titles known to be live on the target store,
+            for when the batch doesn't itself contain the already-listed SKUs.
     """
     if not skus:
         raise ValueError("skus must contain at least one SKU.")
@@ -11657,6 +11699,64 @@ def list_to_shopify(
                 "WITHOUT dedupe — verify nothing is double-listed"
             )
 
+    # ── Product-level duplicate guard (issue #38) ─────────────────────────────
+    # The dedupe above is ITEM-level: it asks "is THIS StockItemId already listed
+    # on the target store?". It cannot see that a DIFFERENT SKU for the same
+    # physical product is already live, because the two SKUs are separate
+    # Linnworks items with separate StockItemIds.
+    #
+    # That is not hypothetical. On 6 Aug 2026 a bulk run over the Surfboard Fins
+    # category created 177 duplicate product pairs on SWH Shopify: the category
+    # carried the same fins under an old word-suffix SKU scheme and a new code
+    # scheme, and 184 of the 265 newly created listings had a BYTE-IDENTICAL
+    # ItemTitle to a listing already live on the same store. The item-level check
+    # was working correctly and still produced the wrong outcome.
+    #
+    # So: compare normalised titles against everything known to be live on the
+    # same store, and refuse the match by default. Sources of "known live":
+    #   - the already_listed rows from this very batch (free — the common case,
+    #     since callers usually pass a whole category), and
+    #   - optional `known_listed_titles` supplied by the caller, for when the
+    #     batch contains only the new SKUs and the old ones aren't in it.
+    possible_duplicates: list[dict] = []
+    if plan:
+        live_titles: dict[str, list[str]] = {}
+        for row in already_listed:
+            key = _norm_title(row.get("title"))
+            if key:
+                live_titles.setdefault(key, []).append(row.get("sku"))
+        for t in (known_listed_titles or []):
+            key = _norm_title(t)
+            if key:
+                live_titles.setdefault(key, [])
+
+        if live_titles:
+            keep: list[dict] = []
+            for row in plan:
+                key = _norm_title(row.get("title"))
+                match = live_titles.get(key) if key else None
+                if match is None:
+                    keep.append(row)
+                    continue
+                dup = {
+                    **row,
+                    "duplicate_of_skus": [s for s in match if s],
+                    "matched_on": "normalised ItemTitle",
+                    "reason": (
+                        "a product with an identical title is already live on "
+                        f"'{row['sub_source']}' under a different SKU — listing this would "
+                        "create a second Shopify product for the same physical item"
+                    ),
+                }
+                if allow_duplicate_titles:
+                    dup["listed_anyway"] = True
+                    keep.append(row)
+                else:
+                    dup["listed_anyway"] = False
+                possible_duplicates.append(dup)
+            if not allow_duplicate_titles:
+                plan = keep
+
     # ── Group resolved items by configurator (what each CreateTemplates covers) ─
     groups: dict[int, dict] = {}
     for row in plan:
@@ -11683,10 +11783,19 @@ def list_to_shopify(
             for g in group_list
         ],
         "already_listed":                already_listed,
+        "possible_duplicates":           possible_duplicates,
         "unresolved":                    unresolved,
     }
     if dedupe_warning:
         base_out["dedupe_warning"] = dedupe_warning
+    if possible_duplicates and not allow_duplicate_titles:
+        base_out["duplicate_warning"] = (
+            f"{len(possible_duplicates)} SKU(s) share a title with a product already live on "
+            "the target store under a DIFFERENT SKU and were EXCLUDED — see possible_duplicates. "
+            "This is the SKU-migration case that created 177 duplicate Shopify products on "
+            "6 Aug 2026. Pass allow_duplicate_titles=True only if you are sure they are "
+            "genuinely different products."
+        )
 
     # ── Write guard (threshold 25) ────────────────────────────────────────────
     guard = _write_guard("list_to_shopify", skus, confirmed_count, dry_run)
@@ -11702,6 +11811,10 @@ def list_to_shopify(
                 f"{len(group_list)} configurator group(s) would be listed to Shopify; "
                 f"{len(already_listed)} SKU(s) already live on their target store and "
                 f"skipped (see already_listed); "
+                f"{len(possible_duplicates)} SKU(s) share a title with a product already live "
+                f"under a different SKU "
+                f"({'listed anyway — allow_duplicate_titles=True' if allow_duplicate_titles else 'EXCLUDED'}, "
+                "see possible_duplicates); "
                 f"{len(unresolved)} SKU(s) could not be resolved (see unresolved). "
                 "Review the plan, then set dry_run=False to create and push the "
                 "listings. A live run creates real customer-facing Shopify listings."
