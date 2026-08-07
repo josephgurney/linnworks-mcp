@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.39.0"
+__version__ = "1.40.0"
 
 import os
 import sys
@@ -219,13 +219,27 @@ def call_linnworks_form(method_path: str, payload: dict) -> dict:
 _RATE_LIMIT_BACKOFF = (5, 10, 20, 30)   # seconds; ~65s total, > one quota window
 
 
-class RateLimitError(RuntimeError):
+class RateLimitError(Exception):
     """
     Raised when a Linnworks call is still rate-limited after the full backoff.
 
-    Subclasses RuntimeError so existing `except RuntimeError` handlers keep
-    working, but callers that classify failures MUST catch this separately —
-    it means "ask again later", never "no such record". See issue #34.
+    ⚠️  Deliberately does NOT subclass RuntimeError (changed in v1.40.0, issue #37).
+
+    v1.37.0 made it a RuntimeError subclass so that "existing `except RuntimeError`
+    handlers keep working". They did keep working — they kept working WRONGLY.
+    ~40 handlers across this file bucket a RuntimeError as a per-item DATA failure
+    ("SKU not found", `unresolved`), so a transient quota error was still being
+    reported as "this SKU does not exist" — the exact defect #34 was meant to kill,
+    and in the direction that points at the destructive answer. Live: 116 of 266
+    SKUs in a listing run, and 53 of 191 in an ageing run, all of which resolved
+    fine on retry.
+
+    Inheriting from Exception makes that structurally impossible: a bare
+    `except RuntimeError` cannot swallow it, so it propagates loudly instead of
+    being mislabelled. Tools that should degrade gracefully catch it EXPLICITLY
+    and report a `rate_limited` bucket with `complete: false`.
+
+    It means "ask again later". It never means "no such record".
     """
 
 
@@ -4084,13 +4098,18 @@ def get_stock_change_history(
             out = [r for r in out if r["change_source"] not in exclude_set]
         return out
 
-    results, unresolved = [], []
+    results, unresolved, rate_limited = [], [], []
     id_cache: dict = {}
     calls = 0
 
     for sku in skus:
         try:
             stock_item_id = _resolve_sku_to_id(sku, id_cache)
+        except RateLimitError as exc:
+            # A quota failure is NOT a missing item, and the archived hint below
+            # would assert a cause that didn't happen (issue #37).
+            rate_limited.append({"sku": sku, "error": str(exc)})
+            continue
         except Exception as exc:
             unresolved.append({
                 "sku": sku,
@@ -4118,6 +4137,17 @@ def get_stock_change_history(
                 loc = (l.get("Location") or {}).get("StockLocationId")
                 if loc:
                     levels_by_loc[loc] = l.get("StockLevel") or 0
+        except RateLimitError as exc:
+            # Do NOT swallow this. Current level is what suppresses or produces
+            # out_of_stock_since, and the cleanup chain archives/delists on that
+            # date — silently treating "we were throttled" as "no level data"
+            # would let a stocked item read as dead (issue #37).
+            rate_limited.append({
+                "sku": sku,
+                "error": f"stock levels unavailable: {exc}",
+                "note": "ageing skipped — a missing level would fake an out-of-stock date",
+            })
+            continue
         except Exception:
             levels_by_loc = {}
 
@@ -4171,6 +4201,8 @@ def get_stock_change_history(
     return {
         "count": len(results),
         "unresolved_count": len(unresolved),
+        "rate_limited_count": len(rate_limited),
+        "complete": not rate_limited,
         "scope": "all_locations" if all_locations else "location",
         "change_source_filter": {
             "include": sorted(include_set) if include_set else None,
@@ -4184,6 +4216,8 @@ def get_stock_change_history(
         "api_calls": calls,
         "results": results,
         "unresolved": unresolved,
+        # Transient quota failures — retry these; they are NOT missing items.
+        "rate_limited": rate_limited,
     }
 
 
@@ -4453,6 +4487,12 @@ def _fetch_supplier_for_items(stock_item_ids: list[str]) -> dict[str, dict]:
                     }
                 else:
                     result[iid] = {"supplier_name": "No Supplier", "supplier_id": ""}
+        except RateLimitError:
+            # A quota failure here silently drops suppliers from the map, which
+            # shows up downstream as revenue landing in the "No Supplier" bucket —
+            # an under-attribution that looks like real data. Fail loudly instead
+            # of quietly skewing a supplier report (issue #37).
+            raise
         except Exception:
             # Best-effort: items we can't resolve stay absent from the map.
             pass
@@ -11575,6 +11615,7 @@ def list_to_shopify(
     sku_cache: dict[str, str] = {}
     plan: list[dict] = []
     unresolved: list[dict] = []
+    rate_limited: list[dict] = []
 
     for raw_sku in skus:
         sku = (raw_sku or "").strip()
@@ -11585,6 +11626,10 @@ def list_to_shopify(
         # Resolve identity (StockItemId + title)
         try:
             item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+        except RateLimitError as exc:
+            # Quota failure — transient, and NOT a missing SKU (issue #37).
+            rate_limited.append({"sku": sku, "error": str(exc)})
+            continue
         except RuntimeError as exc:
             unresolved.append({"sku": sku, "error": f"not found: {exc}"})
             continue
@@ -11785,6 +11830,8 @@ def list_to_shopify(
         "already_listed":                already_listed,
         "possible_duplicates":           possible_duplicates,
         "unresolved":                    unresolved,
+        "rate_limited":                  rate_limited,
+        "complete":                      not rate_limited,
     }
     if dedupe_warning:
         base_out["dedupe_warning"] = dedupe_warning
@@ -12066,6 +12113,7 @@ def refresh_channel_listing(
     # costs ONE SearchVariationGroups sweep, not N.
     resolved: list[dict] = []
     unresolved: list[dict] = []
+    rate_limited: list[dict] = []
     _variation_cache: dict[str, dict | None] = {}
 
     def _parent_of_child(child_sku: str, child_sid: str) -> dict | None:
@@ -12100,6 +12148,10 @@ def refresh_channel_listing(
             continue
         try:
             item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+        except RateLimitError as exc:
+            # Quota failure — transient, and NOT a missing SKU (issue #37).
+            rate_limited.append({"sku": sku, "error": str(exc)})
+            continue
         except RuntimeError as exc:
             unresolved.append({"sku": sku, "error": f"not found: {exc}"})
             continue
@@ -12288,6 +12340,8 @@ def refresh_channel_listing(
         "available_sub_sources": available_sub_sources,
         "plan":                  plan,
         "unresolved":            unresolved,
+        "rate_limited":          rate_limited,
+        "complete":              not rate_limited,
     }
 
     # ── Write guard (threshold 25) ────────────────────────────────────────────
@@ -12497,6 +12551,7 @@ def unpublish_channel_listing(
     # ── Resolve each SKU + confirm it's listed on the target store ────────────
     resolved: list[dict] = []
     unresolved: list[dict] = []
+    rate_limited: list[dict] = []
     for raw in skus:
         sku = (raw or "").strip()
         if not sku:
@@ -12504,6 +12559,10 @@ def unpublish_channel_listing(
             continue
         try:
             item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+        except RateLimitError as exc:
+            # Quota failure — transient, and NOT a missing SKU (issue #37).
+            rate_limited.append({"sku": sku, "error": str(exc)})
+            continue
         except RuntimeError as exc:
             unresolved.append({"sku": sku, "error": f"not found: {exc}"})
             continue
@@ -12623,6 +12682,8 @@ def unpublish_channel_listing(
         "available_sub_sources": available_sub_sources,
         "plan":                  plan,
         "unresolved":            unresolved,
+        "rate_limited":          rate_limited,
+        "complete":              not rate_limited,
     }
 
     # ── Write guard (threshold 10) ─────────────────────────────────────────────

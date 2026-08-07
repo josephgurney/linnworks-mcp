@@ -67,9 +67,28 @@ def test_does_not_flag_ordinary_errors():
     assert server._is_rate_limited(_resp(200)) is False
 
 
-def test_rate_limit_error_is_a_runtime_error():
-    """Existing `except RuntimeError` handlers must keep working."""
-    assert issubclass(server.RateLimitError, RuntimeError)
+def test_rate_limit_error_is_NOT_a_runtime_error():
+    """
+    Reversed in v1.40.0 (issue #37). v1.37.0 made this a RuntimeError subclass so
+    existing handlers "kept working" — they kept working WRONGLY, bucketing a
+    quota failure as a per-item "SKU not found". Inheriting from Exception makes
+    that structurally impossible: a bare `except RuntimeError` cannot swallow it.
+    """
+    assert not issubclass(server.RateLimitError, RuntimeError)
+    assert issubclass(server.RateLimitError, Exception)
+
+
+def test_bare_except_runtimeerror_cannot_swallow_it():
+    """The property the whole fix rests on."""
+    caught = None
+    try:
+        try:
+            raise server.RateLimitError("quota exceeded")
+        except RuntimeError:            # the ~40 handlers in server.py
+            caught = "swallowed"
+    except server.RateLimitError:
+        caught = "propagated"
+    assert caught == "propagated"
 
 
 # --- retry / backoff ---------------------------------------------------------
@@ -227,3 +246,56 @@ def test_empty_inputs_are_still_reported_as_unresolved_not_rate_limited():
         out = server.get_channel_listings_bulk(skus=["", "OK"])
     assert len(out["unresolved"]) == 1
     assert out["rate_limited"] == []
+
+
+# --- issue #37: the ~40 bare handlers ----------------------------------------
+
+def test_stock_change_history_buckets_rate_limit_without_the_archived_hint():
+    """
+    The live report: a 429 came back as "SKU not found ..." with
+    hint "Archived items cannot be resolved by SKU — unarchive first."
+    That hint asserted a cause that did not happen.
+    """
+    def resolve(sku, cache=None):
+        if sku == "LIMITED":
+            raise server.RateLimitError("quota exceeded")
+        raise ValueError(f"SKU '{sku}' not found in Linnworks: HTTP 400")
+
+    with patch.object(server, "_resolve_sku_to_id", side_effect=resolve):
+        out = server.get_stock_change_history(["LIMITED", "GENUINELY-GONE"])
+
+    assert [r["sku"] for r in out["rate_limited"]] == ["LIMITED"]
+    assert [r["sku"] for r in out["unresolved"]] == ["GENUINELY-GONE"]
+    assert out["complete"] is False
+    # the misleading hint must not ride along with a quota failure
+    assert "hint" not in out["rate_limited"][0]
+    assert "hint" in out["unresolved"][0]
+
+
+def test_stock_change_history_complete_true_when_clean():
+    with patch.object(server, "_resolve_sku_to_id",
+                      side_effect=ValueError("SKU 'X' not found in Linnworks")):
+        out = server.get_stock_change_history(["X"])
+    assert out["complete"] is True
+    assert out["rate_limited"] == []
+
+
+def test_list_to_shopify_separates_rate_limited_from_unresolved():
+    """Live: 116 of 266 SKUs were reported as unresolved; all were 429s."""
+    def fake_post(path, payload):
+        if path == "Inventory/GetInventoryItem":
+            if payload["sku"] == "LIMITED":
+                raise server.RateLimitError("quota exceeded")
+            raise RuntimeError("HTTP 400 — no such item")
+        raise AssertionError(path)
+
+    with patch.object(server, "_fetch_shopify_configurators",
+                      return_value=[{"id": 1, "name": "C", "channel_id": 18,
+                                     "sub_source": "SWH Shopify", "show_in_inventory": True}]), \
+         patch.object(server, "call_linnworks", side_effect=fake_post):
+        out = server.list_to_shopify(skus=["LIMITED", "GONE"], configurator="C",
+                                     sub_source="SWH Shopify", dry_run=True)
+
+    assert [r["sku"] for r in out["rate_limited"]] == ["LIMITED"]
+    assert [r["sku"] for r in out["unresolved"]] == ["GONE"]
+    assert out["complete"] is False
