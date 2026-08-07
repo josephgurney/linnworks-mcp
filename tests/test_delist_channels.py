@@ -26,6 +26,11 @@ from unittest.mock import patch
 
 SID_A = "c4b07a59-f0cf-4a92-97e6-76184bd5da8a"   # amazon+shopify+ebay item
 SID_S = "2b03d809-35e6-421c-a92c-fcc58a2b13eb"   # shopify-only item
+# Two more items shaped like SID_A, purely so the staging tests can exceed the
+# threshold with DISTINCT items. Repeating one SKU no longer inflates the plan:
+# take-downs are deduped by template, so asking twice is still one delete.
+SID_B = "3f1e2d4c-0000-0000-0000-0000000000b0"
+SID_C = "3f1e2d4c-0000-0000-0000-0000000000c0"
 
 # Configurator catalogues per ChannelType, mirroring the live probe.
 CATALOGUES = {
@@ -70,6 +75,8 @@ CHANNEL_SKUS = {
          "ChannelReferenceId": "9425839882486:508:521", "ListedQuantity": 2},
     ],
 }
+for _sid in (SID_B, SID_C):
+    CHANNEL_SKUS[_sid] = [dict(r) for r in CHANNEL_SKUS[SID_A]]
 
 # (StockItemId, ChannelId) → templates. Amazon returns TWO for one item.
 TEMPLATES = {
@@ -101,7 +108,15 @@ TEMPLATES = {
     ],
 }
 
-SKU_TO_SID = {"vnm_bearings_gold": SID_A, "RS-102201": SID_S}
+for _n, _sid in ((1, SID_B), (2, SID_C)):
+    for _cid in (2, 18, 30):
+        TEMPLATES[(_sid, _cid)] = [
+            {**t, "Id": t["Id"] + 100000 * _n, "StockItemId": _sid}
+            for t in TEMPLATES[(SID_A, _cid)]
+        ]
+
+SKU_TO_SID = {"vnm_bearings_gold": SID_A, "RS-102201": SID_S,
+              "vnm_bearings_silver": SID_B, "vnm_bearings_black": SID_C}
 
 
 def _mock(delete_clears=True, lock_template=None):
@@ -163,6 +178,16 @@ def _mock(delete_clears=True, lock_template=None):
     def call_linnworks_get(path, params=None):
         if path.endswith("GetInventoryItemChannelSKUs"):
             return live.get(params["inventoryItemId"], [])
+        # None of these fixtures are variation members. The take-down now probes
+        # the variation table whenever an item is un-mapped or template-less, so
+        # it can tell a variation child apart from a template-less standalone
+        # (issue #35); these are the "no group" answers.
+        if path.endswith("GetVariationGroupByParentId"):
+            return None
+        if path.endswith("SearchVariationGroups"):
+            return {"PageNumber": 1, "TotalPages": 1, "TotalEntries": 0, "Data": []}
+        if path.endswith("GetVariationItems"):
+            return []
         raise AssertionError(f"Unexpected GET: {path}")
 
     patches = [
@@ -481,9 +506,10 @@ def test_fanout_stages_above_threshold_and_writes_nothing():
     patches, captured = _mock()
     for p in patches: p.start()
     try:
-        # 4 templates per item × 3 items = 12 planned take-downs > 10.
+        # 4 templates per item × 3 DISTINCT items = 12 planned take-downs > 10.
         r = server.delist_all_channel_listings(
-            ["vnm_bearings_gold"] * 3, dry_run=False)
+            ["vnm_bearings_gold", "vnm_bearings_silver", "vnm_bearings_black"],
+            dry_run=False)
     finally:
         for p in patches: p.stop()
 
@@ -498,7 +524,8 @@ def test_fanout_wrong_confirmed_count_blocks():
     for p in patches: p.start()
     try:
         r = server.delist_all_channel_listings(
-            ["vnm_bearings_gold"] * 3, confirmed_count=99, dry_run=False)
+            ["vnm_bearings_gold", "vnm_bearings_silver", "vnm_bearings_black"],
+            confirmed_count=99, dry_run=False)
     finally:
         for p in patches: p.stop()
 

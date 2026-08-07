@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.40.0"
+__version__ = "1.41.0"
 
 import os
 import sys
@@ -12452,6 +12452,8 @@ def unpublish_channel_listing(
     skus: list[str],
     sub_source: str = "SWH Shopify",
     channel: str = "Shopify",
+    allow_variation_parent_takedown: bool = True,
+    also_retiring_skus: list[str] | None = None,
     confirmed_count: int | None = None,
     dry_run: bool = True,
 ) -> dict:
@@ -12484,22 +12486,39 @@ def unpublish_channel_listing(
     templates and no public listing-management API, so they can only be ended in
     that channel's own admin. Passing them raises a ValueError.
 
+    VARIATION GROUPS (issue #35). A variation CHILD holds the channel-SKU rows
+    but no template of its own — the template lives on the variation PARENT and
+    serves EVERY variant of the listing. So a dead size/colour can only be
+    retired by deleting the parent's template, which also ends its siblings.
+    That is done here ONLY when it costs nothing: when every other member of the
+    group is either already un-listed on this store, or is itself being retired
+    in the same operation (`skus` + `also_retiring_skus`). Otherwise the SKU is
+    blocked with `blocked_reason="variation_child_live_siblings"`, naming the
+    parent and the live siblings, so the reason is actionable instead of opaque.
+    "Live" means "still has a channel-SKU row on this store" — NOT "has stock":
+    a sibling listed at zero stock is still a customer-facing listing nobody
+    asked to remove. Passing a PARENT SKU directly is an explicit instruction to
+    retire the whole group and IS allowed, with the affected children named in
+    the plan row.
+
     Flow per SKU (read-before-write):
       1. Resolve SKU → StockItemId + title.
       2. Confirm the item has a channel-SKU mapping for this channel's Source on
          `sub_source` (see get_channel_listings), and capture its current
-         channel_reference_id + listed_quantity for the manifest. Not listed on
-         that store/account → unresolved.
+         channel_reference_id + listed_quantity for the manifest. A variation
+         PARENT counts as listed when any of its children is mapped. Not listed
+         on that store/account → unresolved.
       3. GenericListings/OpenTemplatesByInventory → open the item's EXISTING GLT
          template(s) (OPENS existing templates — it does NOT create any). An item
          can have SEVERAL templates on one channel (live-observed on Amazon: a
          merchant and an ".FBA" template on one item) — ALL of them are planned,
          because deleting one would leave the other live. Locked → unresolved.
+         No template of its own → the variation-parent fallback above.
       4. (live run) GenericListings/ProcessTemplates with Action="Delete" per
          template → ends the live listing.
-      5. (live run) Re-read the channel-SKU table ONCE PER ITEM (after all its
-         templates are processed) to confirm the rows on `sub_source` are gone
-         (`taken_down`).
+      5. (live run) Verify on TWO surfaces: re-open each template by id to prove
+         it is gone, AND re-read the channel-SKU rows of every item whose listing
+         this template served (the children, for a parent take-down).
 
     Staging: the threshold is 10 (the tightest tier, shared with
     delete_inventory_item). For batches > 10 SKUs this returns the plan + manifest
@@ -12515,6 +12534,17 @@ def unpublish_channel_listing(
             ChannelId. TikTok: "SKATEWAREHOUSE_UK".
         channel: GLT channel — "Shopify" (default), "Amazon", "TikTok",
             "Magento", "Walmart".
+        allow_variation_parent_takedown: If True (default), a variation child may
+            be retired via its parent's template when — and only when — no other
+            group member would lose a listing (see above). Set False to refuse
+            every parent-level take-down; children are then blocked with
+            `variation_child_parent_takedown_disabled` rather than silently
+            mislabelled.
+        also_retiring_skus: Extra SKUs known to be going away in this same
+            operation. They are treated as already-retired when judging whether a
+            variation parent is safe to take down — needed when a group is split
+            across chunks, or when a caller delegates one SKU at a time (as
+            delist_all_channel_listings does). They are NOT themselves delisted.
         confirmed_count: For batches > 10 SKUs, pass len(skus) after reviewing the
             plan to confirm the write.
         dry_run: If True (default), returns the plan without taking anything down.
@@ -12525,13 +12555,20 @@ def unpublish_channel_listing(
           - dry_run, item_count, target_channel, target_source, target_sub_source,
             target_channel_id, sub_source_resolution, delete_proven,
             available_sub_sources
-          - plan: one row PER TEMPLATE to be deleted (sku, stock_item_id, title,
+          - plan: one row PER TEMPLATE to be deleted (sku, covers_skus,
+            stock_item_id, template_stock_item_id, listing_sids, title,
             template_id, configurator_id, active_listing_id, status,
-            channel_reference_id, listed_quantity, next_suggested_action, action)
-          - unresolved: per-SKU error rows (not found / not listed on the
-            store / no template / locked)
+            channel_reference_id, listed_quantity, next_suggested_action, action,
+            plus via_variation_parent / variation_parent_sku /
+            variation_group_name / group_member_skus on a parent take-down)
+          - unresolved: per-SKU rows, each with a `blocked_reason` code —
+            not_found · channel_read_failed · not_listed · no_glt_template ·
+            variation_child_live_siblings · variation_parent_has_no_template ·
+            variation_child_parent_takedown_disabled · template_locked
+          - blocked_summary / blocked_count / retirable_sku_count — so a small
+            plan against a large request cannot read as success
           - results: per-template outcome (live run only — processed, taken_down,
-            still_listed, error)
+            still_listed, outcome, error)
     """
     if not skus:
         raise ValueError("skus must contain at least one SKU.")
@@ -12548,6 +12585,58 @@ def unpublish_channel_listing(
     target_channel_id = target["channel_id"]
     channel_source = ch["source"]
 
+    # SKUs whose listings are going away in this same operation. Their liveness
+    # must NOT block a variation-parent take-down — the caller is retiring them
+    # too. `skus` itself is included, so handing a whole group in one batch just
+    # works; `also_retiring_skus` covers a chunked run and the one-SKU-at-a-time
+    # delegation in delist_all_channel_listings.
+    retiring: set[str] = {(s or "").strip().lower() for s in skus if (s or "").strip()}
+    for s in (also_retiring_skus or []):
+        _check_injection("also_retiring_skus", s or "")
+        if (s or "").strip():
+            retiring.add(s.strip().lower())
+
+    def _rows_on_store(rows) -> list:
+        return [
+            r for r in (rows if isinstance(rows, list) else [])
+            if _norm_conf_name(r.get("Source")) == _norm_conf_name(channel_source)
+            and _norm_conf_name(r.get("SubSource")) == _norm_conf_name(sub_source)
+        ]
+
+    # Memoised child -> group lookup. A confirmed group seeds every one of its
+    # members, so N children of one group cost ONE SearchVariationGroups sweep.
+    _variation_cache: dict[str, dict | None] = {}
+
+    def _group_of_child(child_sku: str, child_sid: str) -> dict | None:
+        """Child SKU -> {'parent_sku','parent_sid','group_name','members'} or None."""
+        key = child_sku.strip().lower()
+        if key in _variation_cache:
+            return _variation_cache[key]
+        try:
+            rel = _resolve_variation(child_sku, child_sid)
+        except RuntimeError:
+            _variation_cache[key] = None
+            return None
+        entry = None
+        if rel.get("role") == "child" and rel.get("parent_stock_item_id"):
+            # The group's full membership, from this child's point of view: it
+            # plus its siblings. Identical from any member's point of view, which
+            # is what makes the seeding below correct.
+            members = [{"sku": child_sku, "stock_item_id": child_sid}] + [
+                {"sku": s.get("sku"), "stock_item_id": s.get("stock_item_id")}
+                for s in rel.get("siblings", []) if s.get("sku")
+            ]
+            entry = {
+                "parent_sku": rel.get("parent_sku"),
+                "parent_sid": rel.get("parent_stock_item_id"),
+                "group_name": rel.get("group_name"),
+                "members":    members,
+            }
+            for m in members:
+                _variation_cache[(m["sku"] or "").strip().lower()] = entry
+        _variation_cache[key] = entry
+        return entry
+
     # ── Resolve each SKU + confirm it's listed on the target store ────────────
     resolved: list[dict] = []
     unresolved: list[dict] = []
@@ -12555,7 +12644,7 @@ def unpublish_channel_listing(
     for raw in skus:
         sku = (raw or "").strip()
         if not sku:
-            unresolved.append({"sku": raw, "error": "empty SKU"})
+            unresolved.append({"sku": raw, "blocked_reason": "empty_sku", "error": "empty SKU"})
             continue
         try:
             item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
@@ -12564,11 +12653,13 @@ def unpublish_channel_listing(
             rate_limited.append({"sku": sku, "error": str(exc)})
             continue
         except RuntimeError as exc:
-            unresolved.append({"sku": sku, "error": f"not found: {exc}"})
+            unresolved.append({"sku": sku, "blocked_reason": "not_found",
+                               "error": f"not found: {exc}"})
             continue
         sid = item.get("StockItemId")
         if not sid:
-            unresolved.append({"sku": sku, "error": "found but returned no StockItemId"})
+            unresolved.append({"sku": sku, "blocked_reason": "not_found",
+                               "error": "found but returned no StockItemId"})
             continue
         title = item.get("ItemTitle")
         try:
@@ -12578,29 +12669,62 @@ def unpublish_channel_listing(
         except RuntimeError as exc:
             unresolved.append({
                 "sku": sku, "stock_item_id": sid, "title": title,
+                "blocked_reason": "channel_read_failed",
                 "error": f"could not read channel listings: {exc}",
             })
             continue
-        on_store = [
-            r for r in (rows if isinstance(rows, list) else [])
-            if _norm_conf_name(r.get("Source")) == _norm_conf_name(channel_source)
-            and _norm_conf_name(r.get("SubSource")) == _norm_conf_name(sub_source)
-        ]
-        if not on_store:
-            unresolved.append({
+        on_store = _rows_on_store(rows)
+        if on_store:
+            # Capture the current listing identity for the manifest / confirmation.
+            row0 = on_store[0]
+            resolved.append({
                 "sku": sku, "stock_item_id": sid, "title": title,
-                "error": (
-                    f"not listed on {ch['channel_type']} '{sub_source}' — nothing to take down"
-                ),
+                "channel_reference_id": row0.get("ChannelReferenceId"),
+                "listed_quantity":      row0.get("ListedQuantity"),
+                "channel_row_count":    len(on_store),
+                # Whose channel-SKU rows must disappear for this to count as
+                # taken down. For a parent take-down these are the CHILDREN —
+                # the parent has no rows of its own, so checking the parent
+                # would report "gone" without anything having happened.
+                "listing_sids":         [sid],
             })
             continue
-        # Capture the current listing identity for the manifest / confirmation.
-        row0 = on_store[0]
-        resolved.append({
+
+        # Not mapped itself — but a variation PARENT owns the whole group's
+        # listing while carrying no channel-SKU row. Passing the parent IS an
+        # explicit instruction to retire every variant, so it is allowed; the
+        # blast radius is named on the plan row.
+        try:
+            rel = _resolve_variation(sku, sid)
+        except RuntimeError:
+            rel = {"role": "none"}
+        if rel.get("role") == "parent" and rel.get("children"):
+            child_map = _fetch_channel_skus_for_ids(
+                [c["stock_item_id"] for c in rel["children"] if c.get("stock_item_id")]
+            )
+            listed_children = [
+                c for c in rel["children"]
+                if _rows_on_store(child_map.get((c.get("stock_item_id") or "").lower(), []))
+            ]
+            if listed_children:
+                resolved.append({
+                    "sku": sku, "stock_item_id": sid, "title": title,
+                    "channel_reference_id": None,
+                    "listed_quantity":      None,
+                    "channel_row_count":    0,
+                    "listing_sids":         [c["stock_item_id"] for c in listed_children],
+                    "is_variation_parent":  True,
+                    "variation_group_name": rel.get("group_name"),
+                    "listed_via_children":  [c["sku"] for c in listed_children],
+                })
+                continue
+
+        unresolved.append({
             "sku": sku, "stock_item_id": sid, "title": title,
-            "channel_reference_id": row0.get("ChannelReferenceId"),
-            "listed_quantity":      row0.get("ListedQuantity"),
-            "channel_row_count":    len(on_store),
+            "blocked_reason": "not_listed",
+            "error": (
+                f"not listed on {ch['channel_type']} '{sub_source}' — nothing to take down"
+            ),
         })
 
     # ── Open the existing GLT templates for the resolved items (read) ──────────
@@ -12633,32 +12757,198 @@ def unpublish_channel_listing(
             if tsid:
                 templates_by_sid.setdefault(tsid.lower(), []).append(t)
 
-    # ── Build the take-down plan (one row per TEMPLATE) ────────────────────────
-    plan: list[dict] = []
+    # ── Variation-child classification + parent fallback (issue #35) ───────────
+    #
+    # A dead variation CHILD has channel-SKU rows but NO template of its own —
+    # the template hangs off the parent and serves every variant (issue #26).
+    # The take-down deliberately refused to follow it, because deleting that
+    # template ends the siblings too. In the first live cleanup run that made 28
+    # of 37 blocked SKUs unretirable, while the obvious workaround (delist the
+    # parent) would have killed live listings in 19 of 21 groups.
+    #
+    # Following the parent is safe exactly when nothing else is lost: every OTHER
+    # group member is already un-listed on this store, or is itself being retired
+    # in this operation. Then the parent's template serves ONLY listings the
+    # caller asked to end. Liveness is judged on the channel-SKU row, not on
+    # stock — a sibling listed at zero stock is still a live listing.
+    #
+    # Classification runs even when allow_variation_parent_takedown is False, so
+    # a blocked child says WHY instead of collapsing into "no template".
+    child_fallback: dict[str, dict] = {}     # input sku (lower) -> group entry
+    variation_block: dict[str, dict] = {}    # input sku (lower) -> block detail
+    _group_live_cache: dict[str, list[str]] = {}
+    parent_sids_to_open: list[str] = []
     for r in resolved:
-        templates = templates_by_sid.get(r["stock_item_id"].lower()) or []
-        if not templates:
-            unresolved.append({
-                **r,
-                "error": "listed on the channel but no GLT template could be opened for it",
-            })
+        if templates_by_sid.get(r["stock_item_id"].lower()) or r.get("is_variation_parent"):
             continue
+        grp = _group_of_child(r["sku"], r["stock_item_id"])
+        if not grp or not grp.get("parent_sid"):
+            continue                          # not a variation child at all
+        psid = grp["parent_sid"].lower()
+        if psid in _group_live_cache:
+            live_outside = _group_live_cache[psid]
+        else:
+            # Every member not being retired here. The child itself is always in
+            # `retiring` (it came from `skus`), so excluding it is automatic —
+            # which is also why this is cacheable per group rather than per child.
+            outside = [m for m in grp["members"]
+                       if (m["sku"] or "").strip().lower() not in retiring]
+            sib_map = _fetch_channel_skus_for_ids(
+                [m["stock_item_id"] for m in outside if m.get("stock_item_id")]
+            ) if outside else {}
+            live_outside = [
+                m["sku"] for m in outside
+                if _rows_on_store(sib_map.get((m.get("stock_item_id") or "").lower(), []))
+            ]
+            _group_live_cache[psid] = live_outside
+
+        key = r["sku"].strip().lower()
+        if live_outside:
+            variation_block[key] = {
+                "blocked_reason":     "variation_child_live_siblings",
+                "parent_sku":         grp["parent_sku"],
+                "group_name":         grp["group_name"],
+                "live_siblings":      live_outside,
+            }
+        elif not allow_variation_parent_takedown:
+            variation_block[key] = {
+                "blocked_reason":     "variation_child_parent_takedown_disabled",
+                "parent_sku":         grp["parent_sku"],
+                "group_name":         grp["group_name"],
+                "live_siblings":      [],
+            }
+        else:
+            child_fallback[key] = grp
+            if psid not in templates_by_sid:
+                parent_sids_to_open.append(grp["parent_sid"])
+
+    parent_sids_to_open = list(dict.fromkeys(parent_sids_to_open))
+    for i in range(0, len(parent_sids_to_open), 200):
+        chunk = parent_sids_to_open[i:i + 200]
+        resp = call_linnworks(
+            "GenericListings/OpenTemplatesByInventory",
+            {"request": {
+                "ChannelType": ch["channel_type"],
+                "ChannelName": ch["channel_name"],
+                "Parameters": {
+                    "SelectedRegions":  [],
+                    "Token":            _ZERO_GUID,
+                    "InventoryItemIds": chunk,
+                    "ChannelId":        target_channel_id,
+                },
+                "PaginationParameters": {"PageNumber": 1, "EntriesPerPage": max(len(chunk) * 4, 10)},
+            }},
+        )
+        for t in (resp.get("TemplatesInfo") if isinstance(resp, dict) else None) or []:
+            tsid = t.get("StockItemId")
+            if tsid:
+                templates_by_sid.setdefault(tsid.lower(), []).append(t)
+
+    # ── Build the take-down plan (one row per TEMPLATE) ────────────────────────
+    # Deduped by template id: several children of one variation group resolve to
+    # the SAME parent template, and that is ONE delete, not N. covers_skus names
+    # every input SKU whose listing the delete ends.
+    plan: list[dict] = []
+    plan_by_template: dict = {}
+    for r in resolved:
+        key = r["sku"].strip().lower()
+        templates = templates_by_sid.get(r["stock_item_id"].lower()) or []
+        via = None
+        if not templates:
+            via = child_fallback.get(key)
+            if via:
+                templates = templates_by_sid.get(via["parent_sid"].lower()) or []
+                if not templates:
+                    unresolved.append({
+                        **r,
+                        "blocked_reason":       "variation_parent_has_no_template",
+                        "variation_parent_sku": via["parent_sku"],
+                        "variation_group_name": via["group_name"],
+                        "error": (
+                            f"variation child — its parent '{via['parent_sku']}' has no GLT "
+                            "template either, so nothing here can reach this listing. End it in "
+                            f"the {ch['channel_type']} admin."
+                        ),
+                    })
+                    continue
+
+        if not templates:
+            blocked = variation_block.get(key)
+            if blocked and blocked["blocked_reason"] == "variation_child_live_siblings":
+                sibs = blocked["live_siblings"]
+                unresolved.append({
+                    **r,
+                    "blocked_reason":       blocked["blocked_reason"],
+                    "variation_parent_sku": blocked["parent_sku"],
+                    "variation_group_name": blocked["group_name"],
+                    "live_sibling_count":   len(sibs),
+                    "live_siblings":        sibs[:25],
+                    "error": (
+                        f"variation child — its listing is owned by parent "
+                        f"'{blocked['parent_sku']}', whose template still serves {len(sibs)} live "
+                        "sibling listing(s). Deleting it would take those down too. Remove this "
+                        f"variant in the {ch['channel_type']} admin, or retire the whole group "
+                        "(pass every member, or list them in also_retiring_skus)."
+                    ),
+                })
+            elif blocked:
+                unresolved.append({
+                    **r,
+                    "blocked_reason":       blocked["blocked_reason"],
+                    "variation_parent_sku": blocked["parent_sku"],
+                    "variation_group_name": blocked["group_name"],
+                    "error": (
+                        f"variation child — the whole group is retirable via parent "
+                        f"'{blocked['parent_sku']}', but allow_variation_parent_takedown=False. "
+                        "Set it True to take the parent template down."
+                    ),
+                })
+            else:
+                unresolved.append({
+                    **r,
+                    "blocked_reason": "no_glt_template",
+                    "error": (
+                        "listed on the channel but NO GLT template exists for it (checked the "
+                        "item and its variation parent) — it was most likely listed outside the "
+                        f"GLT, so nothing here can reach it. End it in the {ch['channel_type']} "
+                        "admin."
+                    ),
+                })
+            continue
+
         for t in templates:
+            tid = t.get("Id")
+            existing = plan_by_template.get(tid)
+            if existing is not None:
+                if r["sku"] not in existing["covers_skus"]:
+                    existing["covers_skus"].append(r["sku"])
+                for s in (r.get("listing_sids") or []):
+                    if s not in existing["listing_sids"]:
+                        existing["listing_sids"].append(s)
+                continue
+
             if t.get("IsLocked"):
                 unresolved.append({
-                    **r, "template_id": t.get("Id"),
+                    **r, "template_id": tid,
+                    "blocked_reason": "template_locked",
                     "error": "GLT template is locked — cannot take it down right now",
                 })
                 continue
 
             info = t.get("Info") if isinstance(t.get("Info"), dict) else {}
-            plan.append({
+            row = {
                 "sku":                   r["sku"],
+                "covers_skus":           [r["sku"]],
                 "stock_item_id":         r["stock_item_id"],
+                # Whose template this is — the parent's on a fallback. The
+                # per-template read-back re-opens THIS item.
+                "template_stock_item_id": via["parent_sid"] if via else r["stock_item_id"],
+                # Whose channel-SKU rows must vanish for this to count as gone.
+                "listing_sids":          list(r.get("listing_sids") or []),
                 "title":                 r["title"],
                 "channel":               ch["channel_type"],
                 "sub_source":            sub_source,
-                "template_id":           t.get("Id"),
+                "template_id":           tid,
                 "configurator_id":       t.get("ConfiguratorId"),
                 # On Amazon this is the channel SKU ("…​.FBA"), not a product id.
                 "active_listing_id":     _glt_field(info, "ActiveListingId"),
@@ -12669,7 +12959,41 @@ def unpublish_channel_listing(
                 "templates_on_item":     len(templates),
                 "delete_proven":         ch["delete_proven"],
                 "action":                "Delete",
-            })
+            }
+            if via:
+                row.update({
+                    "via_variation_parent": True,
+                    "variation_parent_sku": via["parent_sku"],
+                    "variation_group_name": via["group_name"],
+                    "group_member_skus":    [m["sku"] for m in via["members"]],
+                    "warning": (
+                        f"Whole-group take-down: this deletes the template on variation parent "
+                        f"'{via['parent_sku']}', which ends the listing for ALL "
+                        f"{len(via['members'])} member(s) of '{via['group_name']}'. Allowed "
+                        "because no member outside this operation still has a listing on "
+                        f"'{sub_source}'."
+                    ),
+                })
+            elif r.get("is_variation_parent"):
+                kids = r.get("listed_via_children") or []
+                row.update({
+                    "is_variation_parent":  True,
+                    "variation_group_name": r.get("variation_group_name"),
+                    "listed_via_children":  kids,
+                    "warning": (
+                        f"Variation PARENT: deleting this template ends the listing for all "
+                        f"{len(kids)} currently-listed child variant(s) — {', '.join(kids[:10])}"
+                        f"{' …' if len(kids) > 10 else ''}. Nothing checks whether you meant to "
+                        "keep any of them; pass the individual children instead if you did."
+                    ),
+                })
+            plan.append(row)
+            plan_by_template[tid] = row
+
+    blocked_summary: dict[str, int] = {}
+    for u in unresolved:
+        code = u.get("blocked_reason") or "unknown"
+        blocked_summary[code] = blocked_summary.get(code, 0) + 1
 
     base_out = {
         "item_count":            len(skus),
@@ -12682,6 +13006,9 @@ def unpublish_channel_listing(
         "available_sub_sources": available_sub_sources,
         "plan":                  plan,
         "unresolved":            unresolved,
+        "blocked_summary":       blocked_summary,
+        "blocked_count":         len(unresolved),
+        "retirable_sku_count":   len({s for row in plan for s in row["covers_skus"]}),
         "rate_limited":          rate_limited,
         "complete":              not rate_limited,
     }
@@ -12700,17 +13027,41 @@ def unpublish_channel_listing(
         )
     )
 
+    # A small plan against a large request must never read as success (issue #35):
+    # spell out how many SKUs are unretirable and WHY, in the message itself.
+    blocked_note = (
+        ""
+        if not unresolved
+        else (
+            f" ⚠️  {len(unresolved)} of {len(skus)} requested SKU(s) CANNOT be taken down: "
+            + ", ".join(f"{n}× {code}" for code, n in
+                        sorted(blocked_summary.items(), key=lambda kv: -kv[1]))
+            + ". See unresolved[] — each row carries blocked_reason and what to do instead "
+              "(variation_child_live_siblings and no_glt_template need the channel's own admin)."
+        )
+    )
+    group_note = (
+        ""
+        if not any(p.get("via_variation_parent") for p in plan)
+        else (
+            f" {sum(1 for p in plan if p.get('via_variation_parent'))} of these are WHOLE-GROUP "
+            "take-downs via a variation parent — allowed only because no member outside this "
+            "operation is still listed; check plan[].group_member_skus."
+        )
+    )
+
     if dry_run:
         return {
             "dry_run": True,
             **base_out,
             "message": (
                 f"Dry run — nothing taken down. {len(plan)} {ch['channel_type']} template(s) on "
-                f"'{sub_source}' would be DELETED (listing ended); {len(unresolved)} SKU(s) could "
-                "not be taken down (see unresolved). Review the plan — confirm each "
-                "channel_reference_id / listed_quantity is the orphan you mean to retire, NOT a "
-                "listing you want to keep — then set dry_run=False. A live run removes real "
-                f"customer-facing listings.{unproven_note}"
+                f"'{sub_source}' would be DELETED (listing ended), covering "
+                f"{base_out['retirable_sku_count']} of {len(skus)} requested SKU(s). Review the "
+                "plan — confirm each channel_reference_id / listed_quantity is the orphan you "
+                "mean to retire, NOT a listing you want to keep — then set dry_run=False. A live "
+                f"run removes real customer-facing listings.{group_note}{blocked_note}"
+                f"{unproven_note}"
             ),
         }
 
@@ -12720,8 +13071,8 @@ def unpublish_channel_listing(
             **base_out,
             "results": [],
             "message": (
-                f"Nothing to take down — no SKU resolved to an existing {ch['channel_type']} "
-                "template."
+                f"Nothing to take down — none of the {len(skus)} requested SKU(s) resolved to a "
+                f"deletable {ch['channel_type']} template.{blocked_note}"
             ),
         }
 
@@ -12734,9 +13085,11 @@ def unpublish_channel_listing(
     for row in plan:
         res = {
             "sku":         row["sku"],
+            "covers_skus": list(row.get("covers_skus") or [row["sku"]]),
             "channel":     ch["channel_type"],
             "sub_source":  sub_source,
             "template_id": row["template_id"],
+            "via_variation_parent": bool(row.get("via_variation_parent")),
             "action":      "Delete",
             "processed":   False,
             "taken_down":  None,
@@ -12772,15 +13125,17 @@ def unpublish_channel_listing(
     # channel-SKU read still answers the separate question "is the listing gone".
     # The two can legitimately disagree: an orphaned-but-undeletable template
     # over an already-dead listing is a real, observed state.
-    taken = 0
-    for sid in dict.fromkeys(row["stock_item_id"] for row in plan):
-        rows_for_item = [r for r in results
-                         if any(p["template_id"] == r["template_id"] and p["stock_item_id"] == sid
-                                for p in plan)]
-
-        # (a) per-template: which template ids still exist, and in what state?
-        remaining: dict = {}
-        template_readback_failed = None
+    #
+    # Which item to read is now TWO different questions, because a variation
+    # parent take-down splits them (issue #35): the TEMPLATE belongs to the
+    # parent, but the channel-SKU rows belong to the CHILDREN — the parent has
+    # none. Reading the parent's rows would return zero and score a clean
+    # take_down without anything having happened, which is the #36 defect wearing
+    # a different hat. So templates are re-opened on template_stock_item_id and
+    # listings are re-read on every id in listing_sids.
+    remaining: dict = {}
+    template_readback_error: dict[str, str] = {}
+    for tsid in dict.fromkeys(row["template_stock_item_id"] for row in plan):
         try:
             resp = call_linnworks(
                 "GenericListings/OpenTemplatesByInventory",
@@ -12789,8 +13144,8 @@ def unpublish_channel_listing(
                     "ChannelName": ch["channel_name"],
                     "Parameters": {
                         "SelectedRegions": [],
-                        "Token": "00000000-0000-0000-0000-000000000000",
-                        "InventoryItemIds": [sid],
+                        "Token": _ZERO_GUID,
+                        "InventoryItemIds": [tsid],
                         "ChannelId": target_channel_id,
                     },
                     "PaginationParameters": {"PageNumber": 1, "EntriesPerPage": 20},
@@ -12800,64 +13155,78 @@ def unpublish_channel_listing(
                 info = t.get("Info") if isinstance(t.get("Info"), dict) else {}
                 remaining[t.get("Id")] = _glt_field(info, "Status")
         except RuntimeError as exc:
-            template_readback_failed = str(exc)
+            template_readback_error[tsid] = str(exc)
 
-        # (b) per-item: are any channel-SKU rows left for this store?
-        still_count = None
+    listing_counts: dict[str, int] = {}
+    listing_errors: dict[str, str] = {}
+    for lsid in dict.fromkeys(s for row in plan for s in (row.get("listing_sids") or [])):
         try:
             rows = call_linnworks_get(
-                "Inventory/GetInventoryItemChannelSKUs", {"inventoryItemId": sid},
+                "Inventory/GetInventoryItemChannelSKUs", {"inventoryItemId": lsid},
             )
-            still_count = len([
-                r for r in (rows if isinstance(rows, list) else [])
-                if _norm_conf_name(r.get("Source")) == _norm_conf_name(channel_source)
-                and _norm_conf_name(r.get("SubSource")) == _norm_conf_name(sub_source)
-            ])
+            listing_counts[lsid] = len(_rows_on_store(rows))
         except RuntimeError as exc:
-            for r in rows_for_item:
-                r["readback_error"] = f"could not confirm take-down: {exc}"
+            listing_errors[lsid] = str(exc)
 
-        for r in rows_for_item:
-            if still_count is not None:
-                r["still_listed"] = still_count > 0
-            if template_readback_failed:
-                r["template_readback_error"] = template_readback_failed
-                r["taken_down"] = None
-                r["outcome"] = "unconfirmed"
-                continue
+    taken = 0
+    for row, r in zip(plan, results):
+        lsids = row.get("listing_sids") or []
+        errs = [listing_errors[s] for s in lsids if s in listing_errors]
+        if errs:
+            r["readback_error"] = f"could not confirm take-down: {errs[0]}"
+        # Only trust a count that covers EVERY item this template served.
+        still_count = (
+            sum(listing_counts[s] for s in lsids)
+            if lsids and all(s in listing_counts for s in lsids)
+            else None
+        )
+        if still_count is not None:
+            r["still_listed"] = still_count > 0
 
-            tid = r["template_id"]
-            template_gone = tid not in remaining
-            r["template_deleted"] = template_gone
-            r["template_status_after"] = remaining.get(tid)
+        terr = template_readback_error.get(row["template_stock_item_id"])
+        if terr:
+            r["template_readback_error"] = terr
+            r["taken_down"] = None
+            r["outcome"] = "unconfirmed"
+            continue
 
-            if template_gone and still_count == 0:
-                r["taken_down"] = True
-                r["outcome"] = "taken_down"
-                taken += 1
-            elif template_gone and still_count:
-                # Template removed but a channel-SKU row survives — usually
-                # channel sync lag, sometimes another template still owns it.
-                r["taken_down"] = False
-                r["outcome"] = "template_deleted_listing_row_remains"
-            elif not template_gone and still_count == 0:
-                # ⚠️ The case that used to be silently reported as success.
-                r["taken_down"] = False
-                r["outcome"] = "listing_gone_template_orphaned"
-                r["warning"] = (
-                    f"Template {tid} still exists (status "
-                    f"{r['template_status_after']!r}) even though the channel-SKU row is gone. "
-                    "The listing itself appears to be down — verify in the channel's admin. "
-                    "Repeated Delete calls on such a template return 2xx and change nothing."
-                )
-            else:
-                r["taken_down"] = False
-                r["outcome"] = "delete_failed"
-                r["warning"] = (
-                    f"Template {tid} was NOT deleted (status "
-                    f"{r['template_status_after']!r}) and the listing row is still present — "
-                    "the listing may still be live. Check the channel's admin."
-                )
+        tid = r["template_id"]
+        template_gone = tid not in remaining
+        r["template_deleted"] = template_gone
+        r["template_status_after"] = remaining.get(tid)
+
+        if still_count is None:
+            # The listing side could not be read — never score a take-down on
+            # half the evidence.
+            r["taken_down"] = None
+            r["outcome"] = "unconfirmed"
+        elif template_gone and still_count == 0:
+            r["taken_down"] = True
+            r["outcome"] = "taken_down"
+            taken += 1
+        elif template_gone and still_count:
+            # Template removed but a channel-SKU row survives — usually
+            # channel sync lag, sometimes another template still owns it.
+            r["taken_down"] = False
+            r["outcome"] = "template_deleted_listing_row_remains"
+        elif not template_gone and still_count == 0:
+            # ⚠️ The case that used to be silently reported as success.
+            r["taken_down"] = False
+            r["outcome"] = "listing_gone_template_orphaned"
+            r["warning"] = (
+                f"Template {tid} still exists (status "
+                f"{r['template_status_after']!r}) even though the channel-SKU row is gone. "
+                "The listing itself appears to be down — verify in the channel's admin. "
+                "Repeated Delete calls on such a template return 2xx and change nothing."
+            )
+        else:
+            r["taken_down"] = False
+            r["outcome"] = "delete_failed"
+            r["warning"] = (
+                f"Template {tid} was NOT deleted (status "
+                f"{r['template_status_after']!r}) and the listing row is still present — "
+                "the listing may still be live. Check the channel's admin."
+            )
 
     orphaned = sum(1 for r in results if r.get("outcome") == "listing_gone_template_orphaned")
     failed = sum(1 for r in results if r.get("outcome") == "delete_failed")
@@ -12884,9 +13253,11 @@ def unpublish_channel_listing(
             f"{taken}/{len(plan)} {ch['channel_type']} template(s) on '{sub_source}' confirmed "
             "taken down. Each template is verified individually (re-opened by id) AND against the "
             "channel-SKU table, because a per-item check alone reports success for templates that "
-            "were never deleted on multi-template items (issue #36). The channel may lag, so a "
-            "still_listed=true row may simply not have synced — re-check with get_channel_listings "
-            f"and verify in the channel's own admin. Per-item errors are in results[].error.{extra}"
+            "were never deleted on multi-template items (issue #36). On a variation-parent "
+            "take-down the listing side is read on the CHILDREN, since the parent has no "
+            "channel-SKU rows of its own (issue #35). The channel may lag, so a still_listed=true "
+            "row may simply not have synced — re-check with get_channel_listings and verify in the "
+            f"channel's own admin. Per-item errors are in results[].error.{extra}{blocked_note}"
             f"{unproven_note}"
         ),
     }
@@ -12896,6 +13267,7 @@ def unpublish_channel_listing(
 def delist_all_channel_listings(
     skus: list[str],
     channels: list[str] | None = None,
+    allow_variation_parent_takedown: bool = True,
     confirmed_count: int | None = None,
     dry_run: bool = True,
 ) -> dict:
@@ -12932,15 +13304,32 @@ def delist_all_channel_listings(
     live run the tool re-reads each item's rows for that channel and reports any
     sub-source still present under `still_listed_sub_sources`.
 
+    ⚠️  DEAD VARIANTS INSIDE LIVE PRODUCTS ARE THE COMMON CASE, and most of them
+    are NOT retirable here. A variation child's listing is owned by its parent's
+    template, so it can only be taken down by ending the whole group — done
+    automatically when every other member is dead or also in this batch, and
+    refused (with `blocked_reason="variation_child_live_siblings"`) when a
+    sibling is still listed. Sizes and colours are exactly what goes dead in a
+    catalogue, so expect a large `blocked_summary`; those variants need removing
+    on the channel side. See `unresolved[].blocked_reason` for the per-SKU reason
+    rather than reading the take-down count as a completion rate.
+
     ⚠️  DESTRUCTIVE and customer-facing — removes real listings (reviews, ranking,
     URL not recoverable). dry_run=True by default; staging threshold 10 on the
     number of planned template deletions.
 
     Args:
         skus: Exact SKUs / ItemNumbers (must be ACTIVE / resolvable) to delist.
+            The whole list is treated as one operation, so a variation group
+            handed in fully here is retirable even though each SKU is processed
+            separately.
         channels: GLT channels to act on, e.g. ["Shopify", "Amazon"]. Default
             (None) = every GLT channel that has configurators in this tenant.
             Pass ["Shopify"] to keep to the live-proven path.
+        allow_variation_parent_takedown: Passed through to
+            unpublish_channel_listing. True (default) allows a whole-group
+            take-down via the variation parent when no member outside this batch
+            would lose a listing; False refuses every parent-level take-down.
         confirmed_count: For > 10 planned take-downs, pass the take_down_count from
             the dry-run manifest to confirm.
         dry_run: If True (default), preview only. Set False to execute.
@@ -12948,8 +13337,9 @@ def delist_all_channel_listings(
     Returns:
         dict with `glt_channels` (what is actionable in this tenant), per-SKU
         `discovery` (targets + skipped_channels), a combined `plan` of template
-        take-downs, `unresolved`, and — on a live run — per-template `results`
-        plus `still_listed_sub_sources`.
+        take-downs, `unresolved` (each row carrying `blocked_reason`),
+        `blocked_summary`, and — on a live run — per-template `results` plus
+        `still_listed_sub_sources`.
     """
     if not skus:
         raise ValueError("skus must contain at least one SKU.")
@@ -13072,10 +13462,34 @@ def delist_all_channel_listings(
         })
 
     # ── Build the combined plan by dry-running the single-channel tool ────────
-    plan: list[dict] = []
+    # Delegation is batched PER TARGET (channel × account), not per SKU. A whole
+    # variation group shares ONE parent template, so N children delegated
+    # separately would queue N deletes of the same template — the first would
+    # succeed and the rest would come back as "no template" (issue #35). Handing
+    # the delegate every SKU for a target lets it dedupe by template and report
+    # one take-down covering all of them.
+    #
+    # `also_retiring_skus` carries the REST of the batch on top, so a group whose
+    # members land in different targets still counts them all as going away.
+    batch_skus = [(s or "").strip() for s in skus if (s or "").strip()]
+    by_target: dict[tuple, dict] = {}
     for w in work:
+        k = (w["channel_type"], _norm_conf_name(w["sub_source"]))
+        t = by_target.setdefault(k, {"channel_type": w["channel_type"],
+                                     "sub_source": w["sub_source"], "skus": []})
+        if w["sku"] not in t["skus"]:
+            t["skus"].append(w["sku"])
+    targets_work = list(by_target.values())
+
+    plan: list[dict] = []
+    for w in targets_work:
         sub = unpublish_channel_listing(
-            skus=[w["sku"]], sub_source=w["sub_source"], channel=w["channel_type"], dry_run=True
+            skus=w["skus"], sub_source=w["sub_source"], channel=w["channel_type"],
+            allow_variation_parent_takedown=allow_variation_parent_takedown,
+            also_retiring_skus=batch_skus,
+            # The fan-out's own _write_guard below is the real staging gate; the
+            # delegate must not stage a batch the caller has already confirmed.
+            confirmed_count=len(w["skus"]), dry_run=True,
         )
         if sub.get("error"):
             unresolved.append({**w, "error": sub["error"]})
@@ -13089,12 +13503,20 @@ def delist_all_channel_listings(
          "actionable": bool(s["accounts"]), "delete_proven": s["delete_proven"]}
         for s in channel_state.values()
     ]
+    blocked_summary: dict[str, int] = {}
+    for u in unresolved:
+        code = u.get("blocked_reason") or "unknown"
+        blocked_summary[code] = blocked_summary.get(code, 0) + 1
+
     base_out = {
         "item_count":       len(skus),
         "glt_channels":     glt_channels,
         "discovery":        discovery,
         "plan":             plan,
         "unresolved":       unresolved,
+        "blocked_summary":  blocked_summary,
+        "blocked_count":    len(unresolved),
+        "retirable_sku_count": len({s for p in plan for s in (p.get("covers_skus") or [p["sku"]])}),
         "skipped_channels": [
             {"sku": d["sku"], **s} for d in discovery for s in d["skipped_channels"]
         ],
@@ -13112,26 +13534,52 @@ def delist_all_channel_listings(
         if unproven else ""
     )
 
+    # Never let the take-down count read as a completion rate (issue #35): on real
+    # dead stock most SKUs are dead VARIANTS of live products and are not
+    # retirable through Linnworks at all.
+    blocked_note = (
+        ""
+        if not unresolved
+        else (
+            f" ⚠️  {base_out['blocked_count']} SKU-listing(s) CANNOT be taken down: "
+            + ", ".join(f"{n}× {code}" for code, n in
+                        sorted(blocked_summary.items(), key=lambda kv: -kv[1]))
+            + ". See unresolved[].blocked_reason — variation_child_live_siblings and "
+              "no_glt_template both need removing on the channel side, not here."
+        )
+    )
+    group_note = (
+        ""
+        if not any(p.get("via_variation_parent") for p in plan)
+        else (
+            f" {sum(1 for p in plan if p.get('via_variation_parent'))} row(s) are WHOLE-GROUP "
+            "take-downs via a variation parent — every member is dead or in this batch; check "
+            "plan[].group_member_skus."
+        )
+    )
+
     if dry_run:
         return {
             "dry_run": True,
             **base_out,
             "take_down_count": len(plan),
             "message": (
-                f"Dry run — nothing taken down. {len(plan)} template(s) across "
-                f"{len({(p['sku'], p['channel'], p['sub_source']) for p in plan})} "
-                f"(item×channel×account) would be DELETED; "
-                f"{len(base_out['skipped_channels'])} listing(s) can't be taken down (see "
-                f"skipped_channels) and will stay up. Review the plan, then set "
-                f"dry_run=False.{unproven_note}"
+                f"Dry run — nothing taken down. {len(plan)} template(s) would be DELETED, "
+                f"covering {base_out['retirable_sku_count']} of {len(skus)} requested SKU(s); "
+                f"{len(base_out['skipped_channels'])} listing(s) on non-GLT channels stay up "
+                "(see skipped_channels). Review the plan, then set "
+                f"dry_run=False.{group_note}{blocked_note}{unproven_note}"
             ),
         }
 
-    # ── Live execution: delegate each (sku, channel, account) ─────────────────
+    # ── Live execution: delegate each (channel, account) target ───────────────
     results: list[dict] = []
-    for w in work:
+    for w in targets_work:
         sub = unpublish_channel_listing(
-            skus=[w["sku"]], sub_source=w["sub_source"], channel=w["channel_type"], dry_run=False
+            skus=w["skus"], sub_source=w["sub_source"], channel=w["channel_type"],
+            allow_variation_parent_takedown=allow_variation_parent_takedown,
+            also_retiring_skus=batch_skus,
+            confirmed_count=len(w["skus"]), dry_run=False,
         )
         results.extend(sub.get("results", []))
 
@@ -13183,11 +13631,11 @@ def delist_all_channel_listings(
         "delete_failed_count": failed,
         "message": (
             f"{taken}/{len(results)} template(s) confirmed taken down across all selected "
-            f"channels. {len(base_out['skipped_channels'])} listing(s) left up (see "
-            "skipped_channels) — those need ending in the channel's own admin. "
+            f"channels. {len(base_out['skipped_channels'])} listing(s) on non-GLT channels were "
+            "left up (see skipped_channels) — those need ending in the channel's own admin. "
             "still_listed_sub_sources lists any store/region whose channel-SKU row survived; "
             "channel sync can lag, so re-check with get_channel_listings before concluding the "
-            f"take-down failed.{extra}{unproven_note}"
+            f"take-down failed.{extra}{group_note}{blocked_note}{unproven_note}"
         ),
     }
 
@@ -13195,6 +13643,7 @@ def delist_all_channel_listings(
 @mcp.tool()
 def delist_all_shopify_listings(
     skus: list[str],
+    allow_variation_parent_takedown: bool = True,
     confirmed_count: int | None = None,
     dry_run: bool = True,
 ) -> dict:
@@ -13214,12 +13663,18 @@ def delist_all_shopify_listings(
 
     Args:
         skus: Exact SKUs / ItemNumbers (must be ACTIVE / resolvable).
+        allow_variation_parent_takedown: True (default) allows a whole-group
+            take-down via the variation parent when no member outside this batch
+            is still listed; False refuses every parent-level take-down. See
+            delist_all_channel_listings.
         confirmed_count: For > 10 planned take-downs, pass the take_down_count
             from the dry-run manifest to confirm.
         dry_run: If True (default), preview only. Set False to execute.
     """
     return delist_all_channel_listings(
-        skus=skus, channels=["Shopify"], confirmed_count=confirmed_count, dry_run=dry_run
+        skus=skus, channels=["Shopify"],
+        allow_variation_parent_takedown=allow_variation_parent_takedown,
+        confirmed_count=confirmed_count, dry_run=dry_run,
     )
 
 
