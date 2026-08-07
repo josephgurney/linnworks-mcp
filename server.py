@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.41.0"
+__version__ = "1.42.0"
 
 import os
 import sys
@@ -10428,8 +10428,20 @@ GLT_CHANNELS: dict[str, dict] = {
     # that flag describes the SUGGESTED action, it does not gate a forced Delete.
     "amazon":  {"channel_type": "Amazon",  "channel_name": "AMAZON",  "source": "AMAZON",
                 "delete_proven": True},
+    # TikTok Delete LIVE-PROVEN 7 Aug 2026 on ven-20-black-raw-core-complete-7.5
+    # (template 30006, configurator 112, listing 1729486505080953421): the TIKTOK
+    # channel-SKU row vanished, OpenTemplatesByInventory on ChannelId 30 went 1 → 0,
+    # and the Amazon/eBay/2× Shopify rows plus stock were untouched. Two notes:
+    #  • The template read Status "Errors while updating" and NextSuggestedAction
+    #    "Update"; a forced Delete worked anyway — same lesson as Amazon's
+    #    "NotAllowed", these fields do not gate a Delete.
+    #  • The item is a variation CHILD that held its OWN template. On TikTok the
+    #    template hangs off the child, NOT off the variation parent as on Shopify
+    #    (#26) — so a TikTok child usually needs no whole-group gate at all. The
+    #    gate still fires correctly for the children that genuinely have no
+    #    template (live-confirmed on vnm-triplepads-yellowblack-jnr).
     "tiktok":  {"channel_type": "TikTok",  "channel_name": "TIKTOK",  "source": "TIKTOK",
-                "delete_proven": False},
+                "delete_proven": True},
     "magento": {"channel_type": "Magento", "channel_name": "MAGENTO", "source": "MAGENTO",
                 "delete_proven": False},
     "walmart": {"channel_type": "Walmart", "channel_name": "WALMART", "source": "WALMART",
@@ -10441,6 +10453,17 @@ GLT_CHANNELS: dict[str, dict] = {
 # They can only be ended in that channel's own admin, so "delisted everywhere" is
 # never true for them and they are always reported under `skipped_channels`.
 NON_GLT_SOURCES = ("EBAY", "MIRAKL MP", "ETSY", "CDISCOUNT")
+
+
+def _proven_delete_channels() -> str:
+    """Comma-joined list of channels whose Delete is live-proven, for warnings.
+
+    Derived from GLT_CHANNELS so a warning can never go stale the way the
+    hard-coded "only Shopify is" did — it survived both the Amazon (v1.32.0) and
+    TikTok (v1.42.0) proofs while claiming neither had happened.
+    """
+    proven = sorted(c["channel_type"] for c in GLT_CHANNELS.values() if c["delete_proven"])
+    return ", ".join(proven) if proven else "none"
 
 
 def _resolve_glt_channel(channel: str) -> dict:
@@ -13018,12 +13041,16 @@ def unpublish_channel_listing(
     if guard is not None:
         return {**guard, **base_out}
 
+    # Name the channels actually proven rather than hard-coding one — this string
+    # said "only Shopify is" for the whole of the Amazon and TikTok proofs, which
+    # is exactly the kind of stale in-code claim assumption #10 warns about.
     unproven_note = (
         ""
         if ch["delete_proven"]
         else (
             f" ⚠️  ProcessTemplates Delete is NOT yet live-proven on {ch['channel_type']} "
-            "(only Shopify is) — prove it on ONE throwaway listing before any bulk run."
+            f"(proven: {_proven_delete_channels()}) — prove it on ONE throwaway listing "
+            "before any bulk run."
         )
     )
 

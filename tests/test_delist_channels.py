@@ -416,15 +416,24 @@ def test_fanout_channels_filter_scopes_the_plan():
 
 
 def test_unproven_channel_is_flagged_and_warned_about():
-    """Shopify and Amazon Deletes are live-proven; TikTok is not, so its rows
-    must carry delete_proven=false and the message must say so."""
+    """An unproven channel's rows must carry delete_proven=false and the message
+    must say so.
+
+    This tests the MECHANISM, not whichever channel is currently unproven —
+    TikTok used to be the fixture here and stopped being one the moment its
+    Delete was proven (v1.42.0). Forcing the flag keeps the test honest as
+    channels get proven off one by one.
+    """
     import server
     patches, _ = _mock()
     for p in patches: p.start()
+    real = server.GLT_CHANNELS["tiktok"]["delete_proven"]
+    server.GLT_CHANNELS["tiktok"]["delete_proven"] = False
     try:
         r = server.delist_all_channel_listings(
             ["vnm_bearings_gold"], channels=["TikTok"], dry_run=True)
     finally:
+        server.GLT_CHANNELS["tiktok"]["delete_proven"] = real
         for p in patches: p.stop()
 
     assert [p["template_id"] for p in r["plan"]] == [30181]
@@ -433,16 +442,49 @@ def test_unproven_channel_is_flagged_and_warned_about():
 
 
 def test_proven_channels_carry_no_warning():
+    """Shopify, Amazon AND TikTok Deletes are all live-proven as of v1.42.0."""
     import server
     patches, _ = _mock()
     for p in patches: p.start()
     try:
         r = server.delist_all_channel_listings(
-            ["vnm_bearings_gold"], channels=["Shopify", "Amazon"], dry_run=True)
+            ["vnm_bearings_gold"], channels=["Shopify", "Amazon", "TikTok"], dry_run=True)
     finally:
         for p in patches: p.stop()
 
     assert all(p["delete_proven"] is True for p in r["plan"])
+    assert "not live-proven" not in r["message"].lower()
+
+
+def test_tiktok_delete_is_proven():
+    """Live-proven 7 Aug 2026 on ven-20-black-raw-core-complete-7.5 (tpl 30006):
+    the TIKTOK channel-SKU row and the template both vanished, other channels
+    and stock untouched. Guards against the flag being reverted by accident."""
+    import server
+    assert server.GLT_CHANNELS["tiktok"]["delete_proven"] is True
+
+
+def test_unproven_warning_names_the_proven_channels_not_just_shopify():
+    """The single-channel warning hard-coded "(only Shopify is)" and stayed
+    wrong through two proofs. It must now be derived from the registry."""
+    import server
+    proven = server._proven_delete_channels()
+    assert "Shopify" in proven and "Amazon" in proven and "TikTok" in proven
+
+    patches, _ = _mock()
+    for p in patches: p.start()
+    real = server.GLT_CHANNELS["tiktok"]["delete_proven"]
+    server.GLT_CHANNELS["tiktok"]["delete_proven"] = False
+    try:
+        r = server.unpublish_channel_listing(
+            ["vnm_bearings_gold"], channel="TikTok",
+            sub_source="SKATEWAREHOUSE_UK", dry_run=True)
+    finally:
+        server.GLT_CHANNELS["tiktok"]["delete_proven"] = real
+        for p in patches: p.stop()
+
+    assert "only Shopify is" not in r["message"]
+    assert "Amazon" in r["message"]
     assert "not live-proven" not in r["message"].lower()
 
 
