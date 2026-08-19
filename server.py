@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.42.1"
+__version__ = "1.43.0"
 
 import os
 import sys
@@ -11996,11 +11996,236 @@ _GLT_PROCESS_ACTIONS = {
 _GLT_REFRESH_ACTIONS = {"Update", "Revise", "Relist", "ChannelSpecific"}
 
 
+# ── Pre-flight staleness check for a GLT template (issue #40) ─────────────────
+#
+# ProcessTemplates pushes the template's STORED snapshot, not the item's current
+# data (#27). A push carrying a stale snapshot returns the same empty 2xx as a
+# real revise, so `processed: true` has meant "accepted", never "changed
+# anything" — live-proven 18 Aug 2026, when two BLT templates pushed cleanly and
+# left Shopify byte-for-byte unchanged because the stored image URL had since
+# been deleted.
+#
+# WHAT OpenTemplatesByInventory ACTUALLY EXPOSES (live-probed 19 Aug 2026 on
+# tpl 52731 / 39076). Info carries real VALUES for Title, Price and
+# LastModificationTime, but Images / Attributes / MetaFields / Description come
+# back as Type:"Action" SUMMARIES — a count ("1", "21", "42") or the literal
+# "Filled". So the snapshot can only be compared on:
+#
+#     title  ·  price (non-variation only)  ·  image COUNT
+#
+# and never on image content/URL, description body, attribute or metafield
+# values. Three traps, each of which yields a WRONG verdict if ignored:
+#
+#   1. TITLE MUST BE COMPARED AGAINST THE EFFECTIVE CHANNEL TITLE, not the base
+#      ItemTitle. The #40 items carry a channel-title override ("Zero Megadeath
+#      …") that differs from the base title ("Zero Megadeth …"), and the template
+#      correctly holds the override — comparing against the base would flag every
+#      override-carrying item as stale.
+#   2. A VARIATION TEMPLATE REPORTS Price 0.0 (prices live per-variant in
+#      Variations). Live: tpl 39076 -> 0.0 against a real 79.95 channel price.
+#      Comparing it marks every variation group stale, so price is skipped there.
+#   3. MATCHING FIELDS DO NOT MEAN THE PUSH WILL CHANGE ANYTHING. The proven #40
+#      no-op had title, price AND image count all matching while the image URL
+#      had changed underneath. This is why nothing here returns `will_change`:
+#      the honest output is `comparable_fields_match` plus an explicit
+#      `undetectable_fields` list. Assuming a match means "fresh" would repeat
+#      the v1.42.1 mistake of trusting a stored field that merely looks live.
+#
+# NextSuggestedAction is NOT a freshness signal either: it read "Update" with
+# IsNextSuggestedActionAllowed true on 24/24 sampled listed Shopify templates,
+# including the ones whose snapshots were seven weeks old. It is effectively a
+# constant for a listed template.
+#
+# The load-bearing signal is therefore LastModificationTime — the snapshot build
+# time. It is free (already on the opened template) and it is what would have
+# caught #40: the images were corrected on 18 Aug, the snapshot was built 12 Aug.
+# It also correctly dates the known-stale catnip template to 2026-02-16, matching
+# the v1.27.1 incident.
+
+_GLT_UNDETECTABLE_FIELDS = [
+    "image content/URL (the template exposes only a COUNT)",
+    "description body (exposed only as \"Filled\")",
+    "attributes (exposed only as a count)",
+    "metafields (exposed only as a count)",
+]
+
+
+def _glt_snapshot_age_days(last_modified: str | None) -> int | None:
+    """Whole days between the template snapshot's build time and now (UTC)."""
+    if not last_modified:
+        return None
+    raw = str(last_modified).strip().replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return max(0, (datetime.now(timezone.utc) - dt).days)
+
+
+def _effective_channel_value(rows, sub_source: str, key: str, fallback=None):
+    """
+    The value the channel actually uses: the SHOPIFY/<sub_source> override row
+    if one exists, else `fallback` (the item-level base value).
+
+    Returns (value, source) where source is "channel_override" or "base".
+    """
+    for r in rows if isinstance(rows, list) else []:
+        if (_norm_conf_name(r.get("Source")) == _norm_conf_name(GLT_SHOPIFY_CHANNEL_NAME)
+                and _norm_conf_name(r.get("SubSource")) == _norm_conf_name(sub_source)):
+            val = r.get(key)
+            if val is not None:
+                return val, "channel_override"
+    return fallback, "base"
+
+
+def _refresh_staleness_message(check_staleness: bool, stale_rows: list, no_diff_rows: list,
+                               unchecked_rows: list, live: bool = False) -> str:
+    """One sentence summarising the pre-flight staleness verdict (issue #40)."""
+    if not check_staleness:
+        return ("Staleness NOT checked (check_staleness=False) — the snapshot may disagree "
+                "with the item. ")
+    bits = []
+    if stale_rows:
+        verb = "pushed a STALE snapshot" if live else "would push a STALE snapshot"
+        names = ", ".join(
+            f"{r['sku']} ({'/'.join(r['staleness']['stale_fields'])})" for r in stale_rows[:5])
+        more = f" +{len(stale_rows) - 5} more" if len(stale_rows) > 5 else ""
+        bits.append(f"⚠️ {len(stale_rows)} template(s) {verb}: {names}{more} — the stored value "
+                    "overwrites the current one; rebuild the template in the Linnworks GLT UI.")
+    if no_diff_rows:
+        bits.append(f"{len(no_diff_rows)} template(s) show NO DETECTABLE difference — which may "
+                    "mean a silent no-op, NOT that the push worked: image URLs, description, "
+                    "attributes and metafields are invisible to this check (issue #40).")
+    if unchecked_rows:
+        bits.append(f"{len(unchecked_rows)} template(s) could NOT be checked (read failed) — "
+                    "treat their freshness as unknown.")
+    return (" ".join(bits) + " ") if bits else ""
+
+
+def _glt_template_staleness(template: dict, stock_item_id: str, base_title: str | None,
+                            base_price, sub_source: str) -> dict:
+    """
+    Compare a GLT template's STORED snapshot against the item's CURRENT values.
+
+    Costs three GETs per template (titles / prices / images). Never raises: a
+    failed read yields checked=False with comparable_fields_match=None, because
+    "we could not tell" must never collapse into "it matches" (issue #37 —
+    a quota error laundered into a factual verdict).
+    """
+    info = template.get("Info") if isinstance(template.get("Info"), dict) else {}
+    last_mod = _glt_field(info, "LastModificationTime")
+    out: dict = {
+        "checked": True,
+        "template_last_modified": last_mod,
+        "snapshot_age_days": _glt_snapshot_age_days(last_mod),
+        "compared": {},
+        "stale_fields": [],
+        "skipped_comparisons": [],
+        "comparable_fields_match": None,
+        "undetectable_fields": list(_GLT_UNDETECTABLE_FIELDS),
+    }
+
+    try:
+        title_rows = call_linnworks_get(
+            "Inventory/GetInventoryItemTitles", {"inventoryItemId": stock_item_id})
+        price_rows = call_linnworks_get(
+            "Inventory/GetInventoryItemPrices", {"inventoryItemId": stock_item_id})
+        images = call_linnworks_get(
+            "Inventory/GetInventoryItemImages", {"inventoryItemId": stock_item_id})
+    except (RateLimitError, RuntimeError) as exc:
+        out["checked"] = False
+        out["error"] = f"could not read current item values: {exc}"
+        out["warning"] = (
+            "Staleness UNKNOWN — the current-value read failed, so this is not a "
+            "statement that the snapshot is fresh."
+        )
+        return out
+
+    # ── title: compare against the EFFECTIVE channel title (trap 1) ──────────
+    tpl_title = _glt_field(info, "Title")
+    cur_title, title_src = _effective_channel_value(
+        title_rows, sub_source, "Title", fallback=base_title)
+    if tpl_title is not None and cur_title is not None:
+        match = str(tpl_title).strip() == str(cur_title).strip()
+        out["compared"]["title"] = {
+            "template": tpl_title, "item": cur_title,
+            "item_value_from": title_src, "match": match,
+        }
+        if not match:
+            out["stale_fields"].append("title")
+
+    # ── price: NOT comparable on a variation template (trap 2) ───────────────
+    if template.get("IsVariation"):
+        out["skipped_comparisons"].append(
+            "price (variation template — the snapshot reports 0.0 because prices "
+            "live per-variant, so a comparison would be a false positive)"
+        )
+        out["undetectable_fields"].append("per-variant prices on a variation template")
+    else:
+        tpl_price = _glt_field(info, "Price")
+        cur_price, price_src = _effective_channel_value(
+            price_rows, sub_source, "Price", fallback=base_price)
+        if tpl_price is not None and cur_price is not None:
+            try:
+                match = abs(float(tpl_price) - float(cur_price)) < 0.005
+            except (TypeError, ValueError):
+                match = str(tpl_price) == str(cur_price)
+            out["compared"]["price"] = {
+                "template": tpl_price, "item": cur_price,
+                "item_value_from": price_src, "match": match,
+            }
+            if not match:
+                out["stale_fields"].append("price")
+
+    # ── images: COUNT only — matching counts prove nothing (trap 3) ──────────
+    tpl_images = _glt_field(info, "Images")
+    cur_count = len(images) if isinstance(images, list) else None
+    if tpl_images is not None and cur_count is not None:
+        try:
+            tpl_count = int(str(tpl_images).strip())
+        except (TypeError, ValueError):
+            tpl_count = None
+        if tpl_count is not None:
+            match = tpl_count == cur_count
+            out["compared"]["image_count"] = {
+                "template": tpl_count, "item": cur_count, "match": match,
+                "note": ("COUNT ONLY — the template does not expose image URLs, so an "
+                         "equal count does NOT mean the same images (this is exactly "
+                         "how issue #40 went undetected)"),
+            }
+            if not match:
+                out["stale_fields"].append("image_count")
+
+    out["comparable_fields_match"] = not out["stale_fields"]
+
+    age = out["snapshot_age_days"]
+    age_txt = f"built {age} day(s) ago" if age is not None else "build time unknown"
+    if out["stale_fields"]:
+        out["warning"] = (
+            f"STALE — the snapshot ({age_txt}) disagrees with the item on "
+            f"{', '.join(out['stale_fields'])}. Pushing it will send the STORED value "
+            "and overwrite the current one on the live listing. Rebuild the template "
+            "by opening the listing in the Linnworks GLT UI first."
+        )
+    else:
+        out["warning"] = (
+            f"No DETECTABLE difference on the comparable fields, but the snapshot was "
+            f"{age_txt} and this is NOT a guarantee the push will change anything: "
+            "image URLs, description body, attributes and metafields are invisible "
+            "here. Issue #40 was a silent no-op with every comparable field matching. "
+            "Read the live listing back after pushing."
+        )
+    return out
+
+
 @mcp.tool()
 def refresh_channel_listing(
     skus: list[str],
     sub_source: str = "SWH Shopify",
     action: str | None = None,
+    check_staleness: bool = True,
     confirmed_count: int | None = None,
     dry_run: bool = True,
 ) -> dict:
@@ -12043,14 +12268,36 @@ def refresh_channel_listing(
 
     Action selection (per template, data-driven):
       - action=None (default, "auto"): use the template's own
-        `NextSuggestedAction` when GLT marks it allowed — this is the action the
-        GLT engine itself computed for pushing the pending change (typically
-        "Update" for Shopify) — otherwise fall back to "Revise".
+        `NextSuggestedAction` when GLT marks it allowed, otherwise fall back to
+        "Revise".
       - action="Revise"/"Update"/"Relist"/…: force that GLT action for every item.
     Templates GLT marks as locked, or where neither the suggested action nor
     Revise is allowed, are reported in `unresolved` rather than force-pushed.
+    ⚠️ `NextSuggestedAction` is NOT evidence that a change is pending: it read
+    "Update", allowed, on 24/24 sampled listed Shopify templates (19 Aug 2026),
+    including ones whose snapshots were seven weeks old. For a listed Shopify
+    template it is effectively a constant — use `staleness` below, not this.
 
     ⚠️  A live run (dry_run=False) changes REAL customer-facing Shopify listings.
+
+    ⚠️⚠️  A PUSH CAN BE A SILENT NO-OP (issue #40, live-proven 18 Aug 2026).
+    ProcessTemplates returns an empty 2xx whether it changed the listing or not,
+    so `processed: true` means the push was ACCEPTED — never that anything moved.
+    Two BLT templates pushed "successfully" and left Shopify byte-for-byte
+    unchanged, because the template's stored image URL pointed at a Linnworks
+    image that had since been deleted. The no-op read as "fixed" and the wrong
+    image stayed live.
+    → `check_staleness=True` (default) now compares the template's STORED
+      snapshot against the item's CURRENT values before pushing and reports
+      `staleness` per plan row. ⚠️ It is a PARTIAL check by necessity: the
+      template exposes real values only for Title, Price and
+      LastModificationTime — Images/Attributes/MetaFields/Description come back
+      as counts or the literal "Filled". So `comparable_fields_match: true` means
+      "no difference I can SEE", NOT "this push will change something". The #40
+      no-op had title, price AND image count all matching. There is deliberately
+      no `will_change` field, and no post-push read-back: `LastUpdateTime`
+      advances on every push (it advanced on the proven no-op), so nothing the
+      API returns can confirm the channel actually changed. Read the storefront.
 
     ⚠️⚠️  STALE-SNAPSHOT HAZARD (live-proven 14 Jul 2026): ProcessTemplates
     Update pushes the template's STORED field snapshot, NOT the item's current
@@ -12075,6 +12322,11 @@ def refresh_channel_listing(
             "is it listed?" check and which store's template is opened/revised.
         action: Optional GLT action override (e.g. "Revise", "Update"). Default
             None = auto (use the template's NextSuggestedAction, else "Revise").
+        check_staleness: If True (default), compare each template's stored
+            snapshot against the item's current title / price / image count
+            before pushing (3 extra GETs per template) and report `staleness`
+            on every plan row. Set False to skip the extra reads — the plan then
+            says nothing about whether the snapshot is fresh.
         confirmed_count: For batches > 25 SKUs, pass len(skus) after reviewing
             the plan to confirm the write.
         dry_run: If True (default), returns the plan without pushing anything.
@@ -12089,6 +12341,12 @@ def refresh_channel_listing(
             action, next_suggested_action, is_allowed_to_revise, covers_skus;
             plus via_variation_parent / listed_via_children where a variation
             group was resolved). Deduped: inputs sharing one template = one row.
+            Each row also carries `staleness` (when check_staleness):
+            template_last_modified, snapshot_age_days, compared{title,price,
+            image_count}, stale_fields[], comparable_fields_match,
+            skipped_comparisons[], undetectable_fields[], warning.
+          - stale_plan_count / no_detectable_change_count /
+            staleness_unchecked_count / staleness_note
           - unresolved: per-SKU error rows (not found / not listed on the store /
             no template / locked / no allowed revise action)
           - results: per-SKU push outcome (live run only)
@@ -12194,7 +12452,10 @@ def refresh_channel_listing(
             })
             continue
         if _rows_on_store(rows):
-            resolved.append({"sku": sku, "stock_item_id": sid, "title": title})
+            resolved.append({
+                "sku": sku, "stock_item_id": sid, "title": title,
+                "base_price": item.get("RetailPrice"),
+            })
             continue
 
         # Not mapped itself — a variation PARENT is still revisable when its
@@ -12211,6 +12472,7 @@ def refresh_channel_listing(
             if listed_children:
                 resolved.append({
                     "sku": sku, "stock_item_id": sid, "title": title,
+                    "base_price": item.get("RetailPrice"),
                     "listed_via_children": listed_children,
                 })
                 continue
@@ -12289,6 +12551,10 @@ def refresh_channel_listing(
     # covered inputs listed in covers_skus.
     plan: list[dict] = []
     plan_by_template: dict = {}
+    base_info_by_sid: dict[str, dict] = {
+        r["stock_item_id"].lower(): {"title": r.get("title"), "base_price": r.get("base_price")}
+        for r in resolved
+    }
     for r in resolved:
         t = templates_by_sid.get(r["stock_item_id"].lower())
         via_parent = None
@@ -12353,8 +12619,36 @@ def refresh_channel_listing(
             row["via_variation_parent"] = True
         if "listed_via_children" in r:
             row["listed_via_children"] = r["listed_via_children"]
+
+        # Pre-flight staleness (issue #40): does the template's STORED snapshot
+        # still agree with the item's current values? Costs 3 GETs per template.
+        # A via-parent row is judged on the PARENT's values — the template holds
+        # the parent's title, not the child's.
+        if check_staleness:
+            base_title, base_price = r.get("title"), r.get("base_price")
+            if via_parent:
+                cached = base_info_by_sid.get(row["stock_item_id"].lower())
+                if cached is None:
+                    try:
+                        pitem = call_linnworks(
+                            "Inventory/GetInventoryItem", {"sku": row["sku"]})
+                        cached = {"title": pitem.get("ItemTitle"),
+                                  "base_price": pitem.get("RetailPrice")}
+                    except (RateLimitError, RuntimeError):
+                        cached = {}
+                    base_info_by_sid[row["stock_item_id"].lower()] = cached
+                base_title = cached.get("title")
+                base_price = cached.get("base_price")
+            row["staleness"] = _glt_template_staleness(
+                t, row["stock_item_id"], base_title, base_price, sub_source)
+
         plan.append(row)
         plan_by_template[t.get("Id")] = row
+
+    stale_rows       = [r for r in plan if r.get("staleness", {}).get("stale_fields")]
+    unchecked_rows   = [r for r in plan if "staleness" in r and not r["staleness"].get("checked")]
+    no_diff_rows     = [r for r in plan
+                        if r.get("staleness", {}).get("comparable_fields_match") is True]
 
     base_out = {
         "item_count":            len(skus),
@@ -12366,6 +12660,21 @@ def refresh_channel_listing(
         "rate_limited":          rate_limited,
         "complete":              not rate_limited,
     }
+    if check_staleness:
+        base_out["staleness_checked"] = True
+        base_out["stale_plan_count"] = len(stale_rows)
+        base_out["no_detectable_change_count"] = len(no_diff_rows)
+        base_out["staleness_unchecked_count"] = len(unchecked_rows)
+        base_out["staleness_note"] = (
+            "Staleness compares the template's STORED snapshot against the item's "
+            "current values. Only title, price (non-variation) and image COUNT are "
+            "comparable — image URLs, description body, attributes and metafields are "
+            "not exposed, so 'no detectable change' is NOT a promise that the push "
+            "will alter the listing (issue #40 was a silent no-op with every "
+            "comparable field matching)."
+        )
+    else:
+        base_out["staleness_checked"] = False
 
     # ── Write guard (threshold 25) ────────────────────────────────────────────
     guard = _write_guard("refresh_channel_listing", skus, confirmed_count, dry_run)
@@ -12379,6 +12688,8 @@ def refresh_channel_listing(
             "message": (
                 f"Dry run — nothing pushed. {len(plan)} listing(s) on '{sub_source}' would be "
                 f"revised; {len(unresolved)} SKU(s) could not be revised (see unresolved). "
+                + _refresh_staleness_message(check_staleness, stale_rows, no_diff_rows,
+                                             unchecked_rows) +
                 "Review the plan, then set dry_run=False to push the revisions. A live run "
                 "changes real customer-facing Shopify listings."
             ),
@@ -12402,6 +12713,11 @@ def refresh_channel_listing(
             "action":      row["action"],
             "processed":   False,
         }
+        st = row.get("staleness")
+        if st is not None:
+            res["stale_fields"] = st.get("stale_fields")
+            res["comparable_fields_match"] = st.get("comparable_fields_match")
+            res["snapshot_age_days"] = st.get("snapshot_age_days")
         try:
             call_linnworks(
                 "GenericListings/ProcessTemplates",
@@ -12426,10 +12742,13 @@ def refresh_channel_listing(
         "results": results,
         "message": (
             f"{pushed}/{len(plan)} Shopify listing(s) on '{sub_source}' revised and pushed. "
-            "ProcessTemplates returns no body, so success is inferred from a 2xx — READ THE LIVE "
-            "LISTING BACK NOW: the push sends the template's STORED field snapshot, which can be "
-            "stale and overwrite current prices/content (live-proven 14 Jul 2026). Per-item "
-            "errors are in results[].error."
+            + _refresh_staleness_message(check_staleness, stale_rows, no_diff_rows,
+                                         unchecked_rows, live=True) +
+            "ProcessTemplates returns no body, so `processed: true` means the push was ACCEPTED, "
+            "never that the listing changed — READ THE LIVE LISTING BACK NOW: the push sends the "
+            "template's STORED field snapshot, which can be stale and overwrite current "
+            "prices/content (live-proven 14 Jul 2026) or change nothing at all (issue #40). "
+            "Per-item errors are in results[].error."
         ),
     }
 

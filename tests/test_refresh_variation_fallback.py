@@ -98,6 +98,13 @@ class _Harness:
 
     def call_linnworks_get(self, path, params=None):
         params = params or {}
+        # Pre-flight staleness reads (issue #40) — this suite is about the
+        # variation fallback, not staleness, so they return empty and the
+        # staleness verdict simply has nothing comparable to report.
+        if ("GetInventoryItemTitles" in path
+                or "GetInventoryItemPrices" in path
+                or "GetInventoryItemImages" in path):
+            return []
         if "GetInventoryItemChannelSKUs" in path:
             sid = params.get("inventoryItemId")
             # Children + plain item carry the store mapping; the parent does NOT.
