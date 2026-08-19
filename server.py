@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.45.0"
+__version__ = "1.46.0"
 
 import json
 import os
@@ -14241,6 +14241,34 @@ SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2026-01")
 # A Linnworks image id embedded in a Shopify CDN filename.
 _GUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
+# ⚠️  Shopify UNIQUIFIES a filename when one of that name already exists in Files,
+# appending "_<uuid>":  7385b433-….jpg  ->  7385b433-…_debe98f1-….jpg
+# (live-proven 19 Aug 2026 on a throwaway product). A bare-GUID match therefore
+# MISSES the image, which is worse than it sounds: the media reads as `unmanaged`
+# (so it is never detached — the safe direction) but the Linnworks image reads as
+# MISSING, so the tool re-attaches it, and does so again on every subsequent run.
+# Unbounded duplicate growth.
+#
+# It is not a rare edge either — the collision happens whenever that Linnworks
+# image already exists in the store's Files, and **a detached file stays in Files**,
+# so this tool's own detach-then-reattach cycle is precisely what triggers it.
+_GUID_PREFIX_RE = re.compile(
+    r"^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_|$)", re.I
+)
+
+
+def _linnworks_image_id(stem: str | None) -> str | None:
+    """The Linnworks image id a Shopify filename stem carries, or None.
+
+    Accepts both the plain form and Shopify's uniquified "<guid>_<uuid>" form.
+    None means the file was not put there by Linnworks (a hand-uploaded photo,
+    size chart or lifestyle shot) — those are reported `unmanaged` and never removed.
+    """
+    if not stem:
+        return None
+    m = _GUID_PREFIX_RE.match(stem.strip())
+    return m.group(1).lower() if m else None
+
 
 def _shopify_store_for(sub_source: str) -> dict | None:
     """Resolve a Linnworks SubSource ("SWH Shopify") -> Shopify Admin credentials.
@@ -14450,12 +14478,14 @@ def _shopify_read_media(store: dict, product_gid: str) -> dict:
     for n in nodes:
         img = n.get("image") or {}
         url = img.get("url")
+        stem = _media_filename_stem(url)
         media.append({
             "media_id":     n.get("id"),
             "status":       n.get("status"),
             "content_type": n.get("mediaContentType"),
             "url":          url,
-            "stem":         _media_filename_stem(url),
+            "stem":         stem,
+            "lw_image_id":  _linnworks_image_id(stem),
             "alt":          img.get("altText"),
             "errors":       n.get("mediaErrors") or [],
         })
@@ -14743,11 +14773,11 @@ def repair_channel_listing_images(
             continue
 
         # ── Diff ──────────────────────────────────────────────────────────────
-        by_stem = {(m["stem"] or "").lower(): m for m in live["media"] if m.get("stem")}
+        by_stem = {m["lw_image_id"]: m for m in live["media"] if m.get("lw_image_id")}
         matched, superseded, unmanaged = [], [], []
         for m in live["media"]:
-            stem = (m.get("stem") or "").lower()
-            if not (stem and _GUID_RE.match(stem)):
+            stem = m.get("lw_image_id")
+            if not stem:
                 # Filename is not a Linnworks GUID, so Linnworks never put it there —
                 # a hand-uploaded photo, size chart or lifestyle shot. Not ours to remove.
                 unmanaged.append(m)
@@ -14930,7 +14960,8 @@ def repair_channel_listing_images(
                     m = polled["media"].get(mid, {})
                     status = (m.get("status") or "UNKNOWN").upper()
                     rec = {"media_id": mid, "status": status, "url": m.get("url"),
-                           "linnworks_image_id": m.get("stem"), "errors": m.get("errors") or []}
+                           "linnworks_image_id": m.get("lw_image_id"),
+                           "errors": m.get("errors") or []}
                     (out["added"] if status == "READY" else out["add_failed"]).append(rec)
                 if polled["timed_out"]:
                     out["errors"].append({
@@ -14941,7 +14972,7 @@ def repair_channel_listing_images(
 
             # Re-read once: everything below keys off the product's real state.
             live = _shopify_read_media(store, pgid)
-            by_stem = {(m["stem"] or "").lower(): m for m in live["media"] if m.get("stem")}
+            by_stem = {m["lw_image_id"]: m for m in live["media"] if m.get("lw_image_id")}
 
             # 3. Featured image — Linnworks' is_main does not drive Shopify.
             if set_featured and p["main_image_id"]:
@@ -14982,7 +15013,7 @@ def repair_channel_listing_images(
             # 5. Read back against the REAL surface — the storefront's own data,
             #    never this tool's assumption that the writes landed.
             final = _shopify_read_media(store, pgid)
-            final_stems = {(m["stem"] or "").lower() for m in final["media"] if m.get("stem")}
+            final_stems = {m["lw_image_id"] for m in final["media"] if m.get("lw_image_id")}
             lw_ids = {(im["image_id"] or "").lower()
                       for im in p["missing"]} | {
                       (m.get("linnworks_image_id") or "") for m in p["matched"]}
@@ -14995,8 +15026,8 @@ def repair_channel_listing_images(
 
             still_missing = sorted(i for i in lw_ids if i not in final_stems)
             # Recompute from the FINAL read — by_stem predates the detach step.
-            final_by_stem = {(m["stem"] or "").lower(): m
-                             for m in final["media"] if m.get("stem")}
+            final_by_stem = {m["lw_image_id"]: m
+                             for m in final["media"] if m.get("lw_image_id")}
             main_media_final = final_by_stem.get(p["main_image_id"]) if p["main_image_id"] else None
             featured_now = final["featured_media_id"]
             featured_ok = bool(

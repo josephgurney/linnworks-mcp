@@ -563,3 +563,73 @@ def test_net_gain_still_allows_removal(shopify_env, lw, monkeypatch):
     assert [m["linnworks_image_id"] for m in p["to_detach"]] == [OLD]
     assert len(p["missing"]) == 2
     assert p["removal_blocked_reason"] is None
+
+
+# --------------------------------------------------------------------------
+# Shopify's uniquified filenames
+# --------------------------------------------------------------------------
+#
+# Live-proven on a throwaway product 19 Aug 2026: Shopify appends "_<uuid>" when a
+# file of that name already exists in the store's Files. A bare-GUID match misses
+# it, and the failure is asymmetric — the media reads as `unmanaged` (never
+# detached, safe) but the Linnworks image reads as MISSING, so it is attached
+# again, and again on every later run. Unbounded duplicate growth.
+#
+# And this tool CREATES the trigger: fileUpdate detaches without deleting, so the
+# file stays in Files and the next attach of that same image collides.
+
+SUFFIXED = f"{IMG_A}_debe98f1-c8d5-4820-9178-bf41a2690ee3"
+
+
+@pytest.mark.parametrize("stem,expected", [
+    (IMG_A, IMG_A),                                    # plain
+    (SUFFIXED, IMG_A),                                 # Shopify-uniquified
+    (f"{IMG_A}_x_y", IMG_A),                           # more than one suffix
+    (IMG_A.upper(), IMG_A),                            # case-insensitive, normalised
+    ("lifestyle-shot", None),                          # hand-uploaded
+    ("size_chart_v2", None),
+    (f"prefix_{IMG_A}", None),                         # GUID must lead
+    (None, None),
+])
+def test_linnworks_image_id_extraction(stem, expected):
+    assert server._linnworks_image_id(stem) == expected
+
+
+def test_uniquified_filename_is_recognised_not_re_attached(shopify_env, lw, monkeypatch):
+    """The bug: a suffixed name read as `missing`, so the image was attached again."""
+    fake = FakeShopify(media=[_sh_media(1, SUFFIXED)])
+    monkeypatch.setattr(server, "_shopify_graphql", fake)
+
+    out = server.repair_channel_listing_images(["sku-1"], dry_run=False)
+    p = out["plan"][0]
+
+    assert p["missing"] == [], "the image is already on the product — must not re-attach"
+    assert [m["linnworks_image_id"] for m in p["matched"]] == [IMG_A]
+    assert p["unmanaged"] == []
+    assert out["repairable_count"] == 0
+    assert "add" not in fake.stages()
+
+
+def test_uniquified_filename_still_counts_as_the_main_image(shopify_env, lw, monkeypatch):
+    """Featured-image detection must resolve through the suffix too."""
+    fake = FakeShopify(media=[_sh_media(1, SUFFIXED), _sh_media(2, OLD)],
+                       featured="gid://shopify/MediaImage/2")
+    monkeypatch.setattr(server, "_shopify_graphql", fake)
+
+    p = server.repair_channel_listing_images(["sku-1"], dry_run=True)["plan"][0]
+
+    assert p["main_image_id"] == IMG_A
+    assert p["featured_is_correct"] is False, "featured is the stale one, not the main"
+    assert any("featured" in a for a in p["actions"])
+
+
+def test_uniquified_superseded_media_is_still_detachable(shopify_env, lw, monkeypatch):
+    """A stale image that was itself uniquified must remain removable."""
+    lw["images"]["sku-1"] = [_lw_img(IMG_A, is_main=True, sort=0), _lw_img(IMG_B, sort=1)]
+    stale_suffixed = f"{OLD}_aaaabbbb-cccc-dddd-eeee-ffff00001111"
+    fake = FakeShopify(media=[_sh_media(1, IMG_A), _sh_media(9, stale_suffixed)])
+    monkeypatch.setattr(server, "_shopify_graphql", fake)
+
+    p = server.repair_channel_listing_images(["sku-1"], dry_run=True)["plan"][0]
+
+    assert [m["linnworks_image_id"] for m in p["to_detach"]] == [OLD]
