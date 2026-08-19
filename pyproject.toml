@@ -1,12 +1,12 @@
 [project]
 name = "linnworks-mcp"
-version = "1.43.0"
+version = "1.43.1"
 description = "A local MCP server that connects Claude Desktop to your Linnworks account"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
-    "mcp>=1.27.0",
+    "mcp>=1.29.0,<2",  # 2.0.0 removed mcp.server.fastmcp (imported by server.py)
     "requests>=2.33.0",
     "python-dotenv>=1.0.0",
 ]

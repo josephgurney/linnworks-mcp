@@ -1,3 +1,4 @@
-mcp>=1.27.0
+# mcp 2.0.0 REMOVED mcp.server.fastmcp, which server.py imports — cap below 2.x.
+mcp>=1.29.0,<2
 requests>=2.33.0
 python-dotenv>=1.0.0
