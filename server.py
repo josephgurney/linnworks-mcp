@@ -10,8 +10,9 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.43.1"
+__version__ = "1.44.0"
 
+import json
 import os
 import sys
 import time
@@ -497,6 +498,7 @@ WRITE_THRESHOLDS: dict[str, int] = {
     "list_to_shopify":                25,   # creates live customer-facing channel listings
     "refresh_channel_listing":        25,   # re-pushes live customer-facing channel listings
     "unpublish_channel_listing":      10,   # TAKES DOWN live customer-facing listings — destructive
+    "repair_channel_listing_images":  10,   # WRITES to live customer-facing product pages (Shopify Admin)
     "delist_all_shopify_listings":    10,   # TAKES DOWN every Shopify listing for an item — destructive
     "delist_all_channel_listings":    10,   # TAKES DOWN every GLT listing (all channels) — destructive
     "delete_categories":              10,   # IRREVERSIBLE — deletes categories (non-empty → items reassigned)
@@ -14192,6 +14194,811 @@ def _set_archive_state(
             f"{verb.capitalize()} {len(ids)} item(s); {confirmed} confirmed by read-back. "
             + ("Archived SKUs no longer resolve." if archive
                else "Unarchived items now resolve as active.")
+        ),
+    }
+
+
+# ---------- Repair a channel listing's images (Shopify Admin API, write) ----------
+#
+# Issue #41. The one image job the GLT cannot do.
+#
+# When an item's images are corrected in Linnworks there is NO supported route
+# to get the new picture onto an EXISTING Shopify listing:
+#   - refresh_channel_listing pushes the template's STORED snapshot (#27/#40), so
+#     it re-sends the old — sometimes deleted — URL and silently no-ops. Worse,
+#     ProcessTemplates returns an empty 2xx either way, so the no-op reads as a fix.
+#   - re-listing is not an option on a live product (loses reviews/ranking/handle).
+# Every occurrence so far was fixed by hand through the Shopify Admin API.
+#
+# So this tool deliberately BYPASSES the GLT and talks to Shopify directly. That
+# also means it stays useful whether or not #27 is ever unblocked.
+#
+# ── The matching key (live discovery, 19 Aug 2026) ────────────────────────────
+# Shopify's CDN filename PRESERVES the Linnworks image GUID:
+#   Linnworks image_id 88b7b1da-a06b-4439-b93e-9f4a7ec310f2
+#   Shopify  image.url .../files/88b7b1da-a06b-4439-b93e-9f4a7ec310f2.jpg?v=...
+# Confirmed across 3 products / 4 media on SWH Shopify. That gives a per-image
+# identity, which is exactly what #40's staleness check could NOT have (the GLT
+# template exposes only an image COUNT, so "1 == 1" hid a wrong picture).
+#
+# Media whose stem is NOT a GUID was not put there by Linnworks — a hand-uploaded
+# photo, a lifestyle shot, a size chart. Those are reported as `unmanaged` and are
+# NEVER auto-removed.
+#
+# ── Mutations (all validated against the live Admin schema, none deprecated) ──
+#   add      productUpdate(product:{id}, media:[CreateMediaInput!])
+#   featured productReorderMedia(id, moves:[MoveInput!])   (zero-based newPosition)
+#   remove   fileUpdate(files:[{id, referencesToRemove:[productId]}])
+# NB the manual procedure used productCreateMedia + productDeleteMedia; both are
+# now DEPRECATED (-> productUpdate / fileUpdate). fileUpdate DETACHES the media
+# from the product and leaves the file in Shopify Files, which is strictly safer
+# and recoverable — productDeleteMedia destroyed it.
+#
+# Required Admin scopes: read_products, write_products, read_files, write_files.
+
+SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2026-01")
+
+# A Linnworks image id embedded in a Shopify CDN filename.
+_GUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def _shopify_store_for(sub_source: str) -> dict | None:
+    """Resolve a Linnworks SubSource ("SWH Shopify") -> Shopify Admin credentials.
+
+    Two config shapes, because this tenant runs FIVE Shopify stores (SWH 18,
+    Venom 21, Icarus 26, Lobster 29, TWG B2B 34) but most repairs only ever touch
+    one of them:
+
+      SHOPIFY_STORES  — JSON map, the multi-store form:
+          {"SWH Shopify": {"shop_domain": "x.myshopify.com",
+                           "access_token": "shpat_..."}}
+      SHOPIFY_SHOP_DOMAIN + SHOPIFY_ADMIN_ACCESS_TOKEN — the single-store form,
+          applied to SHOPIFY_DEFAULT_SUB_SOURCE (default "SWH Shopify").
+
+    Returns None when nothing is configured for this store — the caller turns
+    that into an actionable setup message rather than a stack trace.
+    """
+    want = (sub_source or "").strip().lower()
+
+    raw = os.environ.get("SHOPIFY_STORES")
+    if raw:
+        try:
+            stores = json.loads(raw)
+        except ValueError as e:
+            raise ValueError(f"SHOPIFY_STORES is not valid JSON: {e}") from e
+        for name, cfg in (stores or {}).items():
+            if (name or "").strip().lower() == want:
+                dom, tok = cfg.get("shop_domain"), cfg.get("access_token")
+                if dom and tok:
+                    return {"sub_source": name, "shop_domain": dom, "access_token": tok}
+
+    default_ss = os.environ.get("SHOPIFY_DEFAULT_SUB_SOURCE", "SWH Shopify")
+    dom = os.environ.get("SHOPIFY_SHOP_DOMAIN")
+    tok = os.environ.get("SHOPIFY_ADMIN_ACCESS_TOKEN")
+    if dom and tok and (default_ss or "").strip().lower() == want:
+        return {"sub_source": default_ss, "shop_domain": dom, "access_token": tok}
+
+    return None
+
+
+def _shopify_setup_error(sub_source: str) -> dict:
+    """The one place that explains how to configure Shopify Admin access."""
+    return {
+        "error": (
+            f"No Shopify Admin credentials configured for store '{sub_source}'. This tool "
+            "writes to Shopify directly (the GLT cannot fix listing images — see #40), so it "
+            "needs an Admin API access token that Linnworks does not provide."
+        ),
+        "how_to_fix": [
+            "In Shopify admin: Settings > Apps and sales channels > Develop apps > Create an app.",
+            "Grant Admin API scopes: read_products, write_products, read_files, write_files.",
+            "Install the app and copy the Admin API access token (shpat_...).",
+            "Add it to the linnworks MCP env — either single-store:",
+            "    SHOPIFY_SHOP_DOMAIN=your-store.myshopify.com",
+            "    SHOPIFY_ADMIN_ACCESS_TOKEN=shpat_...",
+            f"    SHOPIFY_DEFAULT_SUB_SOURCE={sub_source}",
+            "  or multi-store (JSON, one entry per Linnworks SubSource):",
+            '    SHOPIFY_STORES={"SWH Shopify": {"shop_domain": "...", "access_token": "shpat_..."}}',
+            "Restart Claude Desktop so the server picks the new env up.",
+        ],
+        "shopify_configured": False,
+    }
+
+
+def _shopify_graphql(store: dict, query: str, variables: dict) -> dict:
+    """POST one GraphQL document to the Shopify Admin API and return `data`.
+
+    Raises RuntimeError with the response body on transport or GraphQL errors —
+    same house rule as call_linnworks: surface the real reason verbatim.
+
+    Shopify throttles on a leaky-bucket query COST (not a request count), and
+    signals it with HTTP 429 or a THROTTLED error extension. Both are retried on
+    the same 5/10/20/30s ladder the Linnworks helpers use (#34/#37), so a quota
+    pause is never mistaken for a data failure.
+    """
+    url = f"https://{store['shop_domain']}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+    headers = {
+        "X-Shopify-Access-Token": store["access_token"],
+        "Content-Type": "application/json",
+    }
+
+    for attempt, pause in enumerate([5, 10, 20, 30, None]):
+        resp = requests.post(
+            url, headers=headers, json={"query": query, "variables": variables}, timeout=60
+        )
+
+        throttled = resp.status_code == 429
+        body: dict = {}
+        if not throttled:
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"Shopify Admin API HTTP {resp.status_code} on {store['shop_domain']}: "
+                    f"{resp.text[:600]}"
+                )
+            try:
+                body = resp.json()
+            except ValueError as e:
+                raise RuntimeError(f"Shopify returned non-JSON: {resp.text[:400]}") from e
+
+            errors = body.get("errors") or []
+            throttled = any(
+                (e.get("extensions") or {}).get("code") == "THROTTLED" for e in errors
+            )
+            if errors and not throttled:
+                raise RuntimeError(f"Shopify GraphQL errors: {json.dumps(errors)[:600]}")
+
+        if not throttled:
+            return body.get("data") or {}
+
+        if pause is None:
+            raise RuntimeError(
+                f"Shopify API still throttled after backoff ({store['shop_domain']}). "
+                "Retry shortly — this is a quota pause, not a data problem."
+            )
+        time.sleep(pause)
+
+    return {}
+
+
+def _shopify_product_gid(channel_reference_id: str | None) -> str | None:
+    """Linnworks' Shopify ChannelReferenceId -> the product GID.
+
+    The reference is a `product:variant:inventory` id triple — live-confirmed on
+    this tenant, e.g. "9495050125558:51459308912886:52770497429750". The FIRST
+    segment is the product, which is what carries the media. A variant-scoped id
+    would be the wrong object entirely, so parse rather than assume.
+    """
+    ref = (channel_reference_id or "").strip()
+    if not ref:
+        return None
+    head = ref.split(":")[0].strip()
+    return f"gid://shopify/Product/{head}" if head.isdigit() else None
+
+
+def _media_filename_stem(url: str | None) -> str | None:
+    """Filename stem of a Shopify CDN image URL, minus query string and extension.
+
+    ".../files/88b7b1da-a06b-4439-b93e-9f4a7ec310f2.jpg?v=1787068333"
+        -> "88b7b1da-a06b-4439-b93e-9f4a7ec310f2"
+    """
+    if not url:
+        return None
+    name = url.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
+    return name.rsplit(".", 1)[0] if "." in name else name
+
+
+_SHOPIFY_READ_PRODUCT = """
+query LwRepairReadProduct($id: ID!) {
+  product(id: $id) {
+    id
+    title
+    featuredMedia { id }
+    media(first: 250) {
+      nodes {
+        id
+        mediaContentType
+        status
+        mediaErrors { code details message }
+        ... on MediaImage { image { url altText } }
+      }
+    }
+  }
+}
+"""
+
+_SHOPIFY_ADD_MEDIA = """
+mutation LwRepairAddMedia($productId: ID!, $media: [CreateMediaInput!]!) {
+  productUpdate(product: {id: $productId}, media: $media) {
+    product { id }
+    userErrors { field message }
+  }
+}
+"""
+
+_SHOPIFY_REORDER_MEDIA = """
+mutation LwRepairSetFeatured($id: ID!, $moves: [MoveInput!]!) {
+  productReorderMedia(id: $id, moves: $moves) {
+    job { id done }
+    mediaUserErrors { field code message }
+  }
+}
+"""
+
+_SHOPIFY_DETACH_MEDIA = """
+mutation LwRepairDetachMedia($files: [FileUpdateInput!]!) {
+  fileUpdate(files: $files) {
+    files { id fileStatus }
+    userErrors { field code message }
+  }
+}
+"""
+
+
+def _shopify_read_media(store: dict, product_gid: str) -> dict:
+    """Read a Shopify product's media, normalised for diffing.
+
+    `image` is null while a media is still PROCESSING, so `url`/`stem` may be
+    None on a fresh upload — callers must not treat a missing stem as "not ours".
+    """
+    data = _shopify_graphql(store, _SHOPIFY_READ_PRODUCT, {"id": product_gid})
+    product = data.get("product")
+    if not product:
+        return {"found": False, "product_gid": product_gid}
+
+    nodes = ((product.get("media") or {}).get("nodes")) or []
+    media = []
+    for n in nodes:
+        img = n.get("image") or {}
+        url = img.get("url")
+        media.append({
+            "media_id":     n.get("id"),
+            "status":       n.get("status"),
+            "content_type": n.get("mediaContentType"),
+            "url":          url,
+            "stem":         _media_filename_stem(url),
+            "alt":          img.get("altText"),
+            "errors":       n.get("mediaErrors") or [],
+        })
+
+    featured = product.get("featuredMedia") or {}
+    return {
+        "found":             True,
+        "product_gid":       product.get("id"),
+        "product_title":     product.get("title"),
+        "featured_media_id": featured.get("id"),
+        "media":             media,
+    }
+
+
+def _shopify_poll_media(
+    store: dict, product_gid: str, media_ids: list[str],
+    timeout_s: int = 90, interval_s: int = 3,
+) -> dict:
+    """Poll newly-attached media until every id leaves PROCESSING.
+
+    Shopify processes uploads asynchronously — the add mutation returns before
+    the image exists, exactly like GLT creates (#38). A read-back taken straight
+    after the write proves nothing, so this waits for READY/FAILED and reports
+    which it got. Returns {media_id: {status, errors, url, stem}} plus `timed_out`.
+    """
+    wanted = {m for m in media_ids if m}
+    deadline = time.time() + timeout_s
+    seen: dict[str, dict] = {}
+
+    while wanted and time.time() < deadline:
+        time.sleep(interval_s)
+        snapshot = _shopify_read_media(store, product_gid)
+        for m in snapshot.get("media", []):
+            mid = m["media_id"]
+            if mid in wanted:
+                seen[mid] = m
+                if (m.get("status") or "").upper() != "PROCESSING":
+                    wanted.discard(mid)
+
+    return {"media": seen, "timed_out": sorted(wanted)}
+
+
+def _owning_stock_item_ids(sku: str, stock_item_id: str) -> dict:
+    """Every Linnworks item whose images legitimately live on this Shopify product.
+
+    ⚠️  THE HAZARD THIS EXISTS FOR. On Shopify a variation group is ONE product
+    shared by every variant (#26), but each variant is a SEPARATE Linnworks item
+    with its OWN images. So a sibling's photo sits on the same product and — being
+    a Linnworks GUID absent from THIS item's image list — would look exactly like
+    a superseded image. Removing it would delete a live sibling's picture while
+    the tool reported a clean repair.
+
+    So the owning set is the whole group (parent + children), and a media file is
+    only ever "superseded" when it belongs to NONE of them. Costs one variation
+    lookup plus one batched image read.
+
+    Returns {role, group_name, member_skus, stock_item_ids, shared_product}.
+    A lookup failure degrades to "assume shared" (removal disabled), never to
+    "assume standalone" — the safe direction.
+    """
+    try:
+        rel = _resolve_variation(sku, stock_item_id)
+    except RateLimitError:
+        raise
+    except Exception as e:
+        return {
+            "role": None, "group_name": None,
+            "member_skus": [sku], "stock_item_ids": [stock_item_id],
+            "shared_product": True,
+            "lookup_error": f"Variation lookup failed ({e}) — treating the product as shared.",
+        }
+
+    role = rel.get("role")
+    members = list(rel.get("children") or []) + list(rel.get("siblings") or [])
+    ids = {(stock_item_id or "").lower()}
+    skus = {sku}
+    for m in members:
+        if m.get("stock_item_id"):
+            ids.add(m["stock_item_id"].lower())
+        if m.get("sku"):
+            skus.add(m["sku"])
+    if rel.get("parent_stock_item_id"):
+        ids.add(rel["parent_stock_item_id"].lower())
+    if rel.get("parent_sku"):
+        skus.add(rel["parent_sku"])
+
+    return {
+        "role":            role,
+        "group_name":      rel.get("group_name"),
+        "member_skus":     sorted(skus),
+        "stock_item_ids":  sorted(ids),
+        "shared_product":  role in ("parent", "child"),
+    }
+
+
+@mcp.tool()
+def repair_channel_listing_images(
+    skus: list[str],
+    sub_source: str = "SWH Shopify",
+    remove_superseded: bool = True,
+    set_featured: bool = True,
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Push an item's CURRENT Linnworks images onto its EXISTING Shopify listing —
+    the one image job the Generic Listing Tool cannot do.
+
+    Use this when images were corrected in Linnworks but the live product page
+    still shows the old picture, is missing photos, or has the wrong shot as its
+    hero. `refresh_channel_listing` CANNOT fix that: it re-pushes the template's
+    stored snapshot, so it re-sends the old (sometimes deleted) URL and returns a
+    success that changed nothing (#40). This talks to the Shopify Admin API
+    directly and verifies against the storefront's own data.
+
+    What it does per SKU:
+      1. reads the item's current Linnworks images (ids, main flag, sort order),
+      2. finds the live Shopify product via the channel-SKU reference,
+      3. diffs Linnworks images against the product's media,
+      4. ATTACHES anything missing, waits for Shopify to finish processing it,
+      5. makes the Linnworks main image the product's featured image,
+      6. DETACHES media that came from Linnworks but is no longer on the item.
+
+    Images are matched by GUID: Shopify's CDN filename preserves the Linnworks
+    image id, so this compares actual pictures rather than counts — the blind
+    spot that made #40 a silent no-op.
+
+    SAFETY — what it will NOT touch:
+      - Media whose filename is not a Linnworks GUID is reported as `unmanaged`
+        and never removed. That is a hand-uploaded photo, size chart or lifestyle
+        shot, and Linnworks has no opinion about it.
+      - On a VARIATION group every variant shares ONE Shopify product but keeps
+        its own Linnworks images, so a sibling's photo would otherwise look
+        superseded. The whole group's images are read first, and removal is
+        disabled for shared products unless every member was passed in `skus`.
+      - Nothing is removed unless the replacement media reached READY. A failed
+        upload leaves the old picture in place rather than emptying the listing.
+
+    Requires Shopify Admin credentials (scopes: read_products, write_products,
+    read_files, write_files) — Linnworks cannot supply these. If none are
+    configured the tool returns setup instructions and writes nothing.
+
+    Batches of more than 10 SKUs require confirmed_count=len(skus); these are
+    live customer-facing product pages.
+
+    Args:
+        skus: Exact SKUs / ItemNumbers to repair.
+        sub_source: The Shopify store, as named in Linnworks (default
+            "SWH Shopify"). Must match a configured store.
+        remove_superseded: Detach Linnworks-origin media that is no longer on the
+            item (default True). Detach leaves the file in Shopify Files, so it
+            is recoverable. Automatically disabled for shared variation products.
+        set_featured: Make the Linnworks main image the product's featured image
+            (default True). Linnworks' own is_main does not drive Shopify.
+        confirmed_count: For batches > 10, pass len(skus) here.
+        dry_run: If True (default), returns the manifest without writing.
+
+    Returns:
+        A dict with:
+          - sub_source, shop_domain, dry_run, item_count
+          - plan:       per-SKU diff — missing / superseded / unmanaged / matched
+                        media, featured status, and the actions that would run
+          - unresolved: SKUs not repairable here, each with a `blocked_reason`
+          - results:    per-SKU outcome (live run) — added / detached / featured,
+                        plus `in_sync` from a fresh read of the product afterwards
+    """
+    if not skus:
+        raise ValueError("skus is empty — nothing to repair.")
+    _check_injection("sub_source", sub_source)
+
+    store = _shopify_store_for(sub_source)
+    if store is None:
+        return {**_shopify_setup_error(sub_source), "sub_source": sub_source, "skus": skus}
+
+    lw_source = GLT_CHANNELS["shopify"]["source"]  # "SHOPIFY"
+    want_ss = (sub_source or "").strip().lower()
+
+    plan: list[dict] = []
+    unresolved: list[dict] = []
+    rate_limited: list[dict] = []
+    id_cache: dict = {}
+
+    for sku in skus:
+        # ── Resolve the item ──────────────────────────────────────────────────
+        try:
+            sid = _resolve_sku_to_id(sku, id_cache)
+        except RateLimitError as e:
+            rate_limited.append({"sku": sku, "error": str(e)})
+            continue
+        except (ValueError, RuntimeError) as e:
+            unresolved.append({"sku": sku, "blocked_reason": "not_found", "error": str(e)})
+            continue
+
+        # ── Is it listed on this store? ───────────────────────────────────────
+        try:
+            rows = _fetch_channel_skus_for_ids([sid]).get(sid.lower(), [])
+        except RateLimitError as e:
+            rate_limited.append({"sku": sku, "error": str(e)})
+            continue
+
+        row = next(
+            (r for r in rows
+             if (r.get("Source") or "").upper() == lw_source
+             and (r.get("SubSource") or "").strip().lower() == want_ss),
+            None,
+        )
+        if row is None:
+            unresolved.append({
+                "sku": sku, "blocked_reason": "not_listed",
+                "error": f"'{sku}' has no {lw_source} listing on '{sub_source}' — nothing to repair.",
+            })
+            continue
+
+        product_gid = _shopify_product_gid(row.get("ChannelReferenceId"))
+        if not product_gid:
+            unresolved.append({
+                "sku": sku, "blocked_reason": "no_product_reference",
+                "channel_reference_id": row.get("ChannelReferenceId"),
+                "error": (
+                    "The channel-SKU row carries no usable Shopify product id "
+                    f"(ChannelReferenceId={row.get('ChannelReferenceId')!r}). Expected a "
+                    "'product:variant:inventory' triple."
+                ),
+            })
+            continue
+
+        # ── Linnworks images for this item, and for its whole variation group ──
+        try:
+            own_raw = _fetch_raw_images(sid)
+            owner = _owning_stock_item_ids(sku, sid)
+            group_ids = owner["stock_item_ids"]
+            group_imgs = _fetch_images_for_ids(group_ids) if len(group_ids) > 1 else {sid.lower(): own_raw}
+        except RateLimitError as e:
+            rate_limited.append({"sku": sku, "error": str(e)})
+            continue
+
+        own = [_format_image_row(r) for r in own_raw]
+        own.sort(key=lambda im: (im["sort_order"] if im["sort_order"] is not None else 0))
+        own_ids = {(im["image_id"] or "").lower() for im in own if im.get("image_id")}
+        group_owned_ids = {
+            (img.get("pkRowId") or "").lower()
+            for rows_ in group_imgs.values() for img in rows_ if img.get("pkRowId")
+        } or own_ids
+
+        if not own:
+            unresolved.append({
+                "sku": sku, "blocked_reason": "no_linnworks_images",
+                "product_gid": product_gid,
+                "error": (
+                    f"'{sku}' has no images in Linnworks — there is nothing to push. Add one "
+                    "with add_inventory_item_images first."
+                ),
+            })
+            continue
+
+        # ── Read the live product ─────────────────────────────────────────────
+        try:
+            live = _shopify_read_media(store, product_gid)
+        except RuntimeError as e:
+            unresolved.append({
+                "sku": sku, "blocked_reason": "shopify_read_failed",
+                "product_gid": product_gid, "error": str(e),
+            })
+            continue
+
+        if not live.get("found"):
+            unresolved.append({
+                "sku": sku, "blocked_reason": "shopify_product_missing",
+                "product_gid": product_gid,
+                "error": (
+                    f"Shopify has no product {product_gid} — the Linnworks channel-SKU row is "
+                    "stale. Nothing was changed."
+                ),
+            })
+            continue
+
+        # ── Diff ──────────────────────────────────────────────────────────────
+        by_stem = {(m["stem"] or "").lower(): m for m in live["media"] if m.get("stem")}
+        matched, superseded, unmanaged = [], [], []
+        for m in live["media"]:
+            stem = (m.get("stem") or "").lower()
+            if not (stem and _GUID_RE.match(stem)):
+                # Filename is not a Linnworks GUID, so Linnworks never put it there —
+                # a hand-uploaded photo, size chart or lifestyle shot. Not ours to remove.
+                unmanaged.append(m)
+                continue
+            entry = {
+                **m,
+                "linnworks_image_id":  stem,
+                "belongs_to_sibling":  stem not in own_ids and stem in group_owned_ids,
+            }
+            # "Superseded" = came from Linnworks, but NO item sharing this Shopify
+            # product still carries it. A sibling variant's image is matched, not
+            # superseded (own_ids is a subset of group_owned_ids).
+            (matched if stem in group_owned_ids else superseded).append(entry)
+
+        missing = [im for im in own if (im["image_id"] or "").lower() not in by_stem]
+
+        main_img = next((im for im in own if im["is_main"]), own[0] if own else None)
+        main_stem = (main_img["image_id"] or "").lower() if main_img else None
+        main_media = by_stem.get(main_stem) if main_stem else None
+        featured_ok = bool(main_media and main_media["media_id"] == live["featured_media_id"])
+
+        # Removal is unsafe on a shared variation product unless the caller named
+        # every member — a sibling's picture is not ours to take down.
+        requested = {s.strip().lower() for s in skus}
+        all_members_requested = all(
+            (s or "").strip().lower() in requested for s in owner.get("member_skus", [sku])
+        )
+        # A failed variation lookup means we do not KNOW whether this product is
+        # shared, so removal is disabled — "unknown" must never read as "standalone".
+        lookup_failed = bool(owner.get("lookup_error"))
+        removal_allowed = remove_superseded and not lookup_failed and (
+            not owner.get("shared_product") or all_members_requested
+        )
+        removal_blocked_reason = None
+        if remove_superseded and not removal_allowed:
+            removal_blocked_reason = owner.get("lookup_error") or (
+                f"'{sku}' is a variation {owner.get('role') or 'member'} of "
+                f"'{owner.get('group_name')}', whose Shopify product is shared with "
+                f"{len(owner.get('member_skus', [])) - 1} other variant(s). Superseded media is "
+                "NOT removed unless every member is passed in `skus`, because a sibling's photo "
+                "lives on the same product."
+            )
+
+        to_detach = superseded if removal_allowed else []
+
+        actions = []
+        if missing:
+            actions.append(f"attach {len(missing)} image(s)")
+        if set_featured and main_media and not featured_ok:
+            actions.append("set featured image")
+        elif set_featured and not main_media and main_img:
+            actions.append("set featured image (after attach)")
+        if to_detach:
+            actions.append(f"detach {len(to_detach)} superseded media")
+
+        row_plan = {
+            "sku":                  sku,
+            "stock_item_id":        sid,
+            "product_gid":          product_gid,
+            "product_title":        live.get("product_title"),
+            "channel_reference_id": row.get("ChannelReferenceId"),
+            "linnworks_image_count": len(own),
+            "shopify_media_count":  len(live["media"]),
+            "missing":              missing,
+            "matched":              matched,
+            "superseded":           superseded,
+            "unmanaged":            unmanaged,
+            "to_detach":            to_detach,
+            "main_image_id":        main_stem,
+            "featured_media_id":    live["featured_media_id"],
+            "featured_is_correct":  featured_ok,
+            "variation":            {
+                "role":           owner.get("role"),
+                "group_name":     owner.get("group_name"),
+                "shared_product": owner.get("shared_product"),
+                "member_skus":    owner.get("member_skus"),
+            },
+            "removal_blocked_reason": removal_blocked_reason,
+            "actions":            actions,
+            "needs_repair":       bool(actions),
+        }
+        plan.append(row_plan)
+
+    actionable = [p for p in plan if p["needs_repair"]]
+
+    base = {
+        "sub_source":          sub_source,
+        "shop_domain":         store["shop_domain"],
+        "shopify_configured":  True,
+        "api_version":         SHOPIFY_API_VERSION,
+        "item_count":          len(skus),
+        "plan":                plan,
+        "unresolved":          unresolved,
+        "rate_limited":        rate_limited,
+        "complete":            not rate_limited,
+        "repairable_count":    len(actionable),
+        "in_sync_count":       len(plan) - len(actionable),
+        "blocked_count":       len(unresolved),
+    }
+
+    # ── Write guard ───────────────────────────────────────────────────────────
+    guard = _write_guard("repair_channel_listing_images", actionable, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, **base}
+
+    if not actionable:
+        return {
+            **base, "dry_run": dry_run, "results": [],
+            "message": (
+                f"Nothing to repair — {len(plan)} listing(s) already match their Linnworks images"
+                + (f"; {len(unresolved)} SKU(s) blocked, see `unresolved`." if unresolved else ".")
+            ),
+        }
+
+    if dry_run:
+        return {
+            **base, "dry_run": True, "results": [],
+            "message": (
+                f"Dry run — nothing written. {len(actionable)} of {len(plan)} listing(s) would be "
+                f"repaired on '{sub_source}'. Set dry_run=False to execute."
+            ),
+        }
+
+    # ── Live execution ────────────────────────────────────────────────────────
+    results = []
+    for p in actionable:
+        pgid = p["product_gid"]
+        out = {
+            "sku": p["sku"], "product_gid": pgid, "product_title": p["product_title"],
+            "added": [], "add_failed": [], "detached": [], "detach_failed": [],
+            "featured_set": None, "errors": [],
+        }
+
+        try:
+            # 1. Attach missing images. Shopify fetches the public linnlive URL itself.
+            new_ids: list[str] = []
+            if p["missing"]:
+                before = {m["media_id"] for m in _shopify_read_media(store, pgid)["media"]}
+                media_input = [{
+                    "originalSource":   im["full_url"],
+                    "mediaContentType": "IMAGE",
+                    "alt":              p["product_title"] or p["sku"],
+                } for im in p["missing"] if im.get("full_url")]
+
+                data = _shopify_graphql(
+                    store, _SHOPIFY_ADD_MEDIA, {"productId": pgid, "media": media_input}
+                )
+                errs = ((data.get("productUpdate") or {}).get("userErrors")) or []
+                if errs:
+                    out["errors"].append({"stage": "add", "user_errors": errs})
+
+                after = _shopify_read_media(store, pgid)["media"]
+                new_ids = [m["media_id"] for m in after if m["media_id"] not in before]
+
+                # 2. Wait for processing — an add mutation returns before the image
+                #    exists, so a read-back taken now would prove nothing (cf. #38).
+                polled = _shopify_poll_media(store, pgid, new_ids)
+                for mid in new_ids:
+                    m = polled["media"].get(mid, {})
+                    status = (m.get("status") or "UNKNOWN").upper()
+                    rec = {"media_id": mid, "status": status, "url": m.get("url"),
+                           "linnworks_image_id": m.get("stem"), "errors": m.get("errors") or []}
+                    (out["added"] if status == "READY" else out["add_failed"]).append(rec)
+                if polled["timed_out"]:
+                    out["errors"].append({
+                        "stage": "add",
+                        "still_processing": polled["timed_out"],
+                        "note": "Shopify was still processing these when the poll timed out.",
+                    })
+
+            # Re-read once: everything below keys off the product's real state.
+            live = _shopify_read_media(store, pgid)
+            by_stem = {(m["stem"] or "").lower(): m for m in live["media"] if m.get("stem")}
+
+            # 3. Featured image — Linnworks' is_main does not drive Shopify.
+            if set_featured and p["main_image_id"]:
+                main_media = by_stem.get(p["main_image_id"])
+                if main_media and main_media["media_id"] != live["featured_media_id"]:
+                    d = _shopify_graphql(store, _SHOPIFY_REORDER_MEDIA, {
+                        "id": pgid,
+                        "moves": [{"id": main_media["media_id"], "newPosition": "0"}],
+                    })
+                    merrs = ((d.get("productReorderMedia") or {}).get("mediaUserErrors")) or []
+                    if merrs:
+                        out["errors"].append({"stage": "featured", "user_errors": merrs})
+                    else:
+                        out["featured_set"] = main_media["media_id"]
+                elif main_media:
+                    out["featured_set"] = "already_correct"
+
+            # 4. Detach superseded media — ONLY once its replacement is READY.
+            #    Detaching first is how a product ends up with no image at all.
+            if p["to_detach"]:
+                if p["missing"] and not out["added"]:
+                    out["errors"].append({
+                        "stage": "detach",
+                        "skipped": True,
+                        "note": (
+                            "No replacement image reached READY, so superseded media was left in "
+                            "place rather than emptying the listing."
+                        ),
+                    })
+                else:
+                    files = [{"id": m["media_id"], "referencesToRemove": [pgid]}
+                             for m in p["to_detach"]]
+                    d = _shopify_graphql(store, _SHOPIFY_DETACH_MEDIA, {"files": files})
+                    uerrs = ((d.get("fileUpdate") or {}).get("userErrors")) or []
+                    if uerrs:
+                        out["errors"].append({"stage": "detach", "user_errors": uerrs})
+
+            # 5. Read back against the REAL surface — the storefront's own data,
+            #    never this tool's assumption that the writes landed.
+            final = _shopify_read_media(store, pgid)
+            final_stems = {(m["stem"] or "").lower() for m in final["media"] if m.get("stem")}
+            lw_ids = {(im["image_id"] or "").lower()
+                      for im in p["missing"]} | {
+                      (m.get("linnworks_image_id") or "") for m in p["matched"]}
+            lw_ids.discard("")
+
+            detached_ids = {m["media_id"] for m in p["to_detach"]}
+            remaining_ids = {m["media_id"] for m in final["media"]}
+            out["detached"] = sorted(detached_ids - remaining_ids)
+            out["detach_failed"] = sorted(detached_ids & remaining_ids)
+
+            still_missing = sorted(i for i in lw_ids if i not in final_stems)
+            # Recompute from the FINAL read — by_stem predates the detach step.
+            final_by_stem = {(m["stem"] or "").lower(): m
+                             for m in final["media"] if m.get("stem")}
+            main_media_final = final_by_stem.get(p["main_image_id"]) if p["main_image_id"] else None
+            featured_now = final["featured_media_id"]
+            featured_ok = bool(
+                main_media_final and featured_now == main_media_final["media_id"]
+            ) if (set_featured and p["main_image_id"]) else None
+
+            out["still_missing"] = still_missing
+            out["featured_media_id"] = featured_now
+            out["featured_is_correct"] = featured_ok
+            out["shopify_media_count"] = len(final["media"])
+            out["in_sync"] = (
+                not still_missing
+                and not out["detach_failed"]
+                and not out["add_failed"]
+                and (featured_ok is not False)
+            )
+        except RuntimeError as e:
+            out["errors"].append({"stage": "unhandled", "error": str(e)})
+            out["in_sync"] = None
+
+        results.append(out)
+
+    repaired = sum(1 for r in results if r.get("in_sync") is True)
+    failed = [r["sku"] for r in results if r.get("in_sync") is not True]
+
+    return {
+        **base, "dry_run": False, "results": results,
+        "repaired_count": repaired,
+        "failed_skus": failed,
+        "message": (
+            f"Repaired {repaired} of {len(results)} listing(s) on '{sub_source}'; verified by "
+            "re-reading each product from Shopify."
+            + (f" ⚠️ Not confirmed in sync: {failed} — read `results[].errors`." if failed else "")
         ),
     }
 

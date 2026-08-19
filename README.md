@@ -1,7 +1,7 @@
 # Linnworks MCP Server
 
-![Version](https://img.shields.io/badge/version-1.43.1-blue)
-![Tools](https://img.shields.io/badge/tools-83-blue)
+![Version](https://img.shields.io/badge/version-1.44.0-blue)
+![Tools](https://img.shields.io/badge/tools-84-blue)
 
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
 
@@ -97,6 +97,7 @@ Once installed, Claude gets access to these tools:
 | `list_to_shopify` | List existing inventory to Shopify via a saved configurator. Two dedupe layers: the same item already listed, **and** a different SKU with the same title already live (the SKU-migration case that created 177 duplicate products) — the latter is excluded unless `allow_duplicate_titles=True` |
 | `refresh_channel_listing` | Re-push edited item data to a live Shopify listing (revise); pre-flight staleness check on the template's stored snapshot |
 | `unpublish_channel_listing` | Take down / end a live listing on one channel and store — Shopify, Amazon, TikTok, Magento or Walmart. Each template is verified individually after the delete, so a template that survived is never reported as taken down. A variation child is retired via its parent's template only when no other member of the group would lose a listing; otherwise it is blocked with the parent and its live siblings named |
+| `repair_channel_listing_images` | Push an item's CURRENT Linnworks images onto its EXISTING Shopify listing — attach what's missing, make the Linnworks main image the featured image, and detach media the item no longer has. Talks to the Shopify Admin API directly, because the GLT cannot do this (it re-pushes the template's stored, sometimes deleted, image URL and silently no-ops). Images are matched by the Linnworks GUID that Shopify preserves in the CDN filename, so it compares pictures rather than counts. Hand-uploaded media is never removed, and on a variation group (one Shopify product, per-variant Linnworks images) a sibling's photo is never mistaken for a stale one. Needs Shopify Admin credentials |
 | `delist_all_channel_listings` | Take down every listing for an item across all channels and stores at once. eBay, Etsy and Mirakl are reported as skipped and left up — they can only be ended in their own admin. Every SKU that can't be retired carries a `blocked_reason`, so a small take-down count never reads as a completed cleanup |
 | `delist_all_shopify_listings` | The Shopify-only slice of the above, for when you deliberately want just Shopify |
 
@@ -250,6 +251,8 @@ Add a `linnworks` entry under `mcpServers`. Use **absolute paths** — `~/` shor
 
 > **Windows paths**: use double backslashes (`C:\\Users\\...`) or forward slashes in the JSON.
 
+> **Optional — Shopify Admin credentials.** One tool, `repair_channel_listing_images`, writes corrected images onto live Shopify listings; the Linnworks GLT cannot do that (it re-pushes the template's stored, sometimes deleted, image URL and silently no-ops). It needs an Admin API access token that Linnworks does not provide — add `SHOPIFY_SHOP_DOMAIN`, `SHOPIFY_ADMIN_ACCESS_TOKEN` and `SHOPIFY_DEFAULT_SUB_SOURCE` to the same `env` block (or `SHOPIFY_STORES` as JSON for several stores), with Admin scopes `read_products`, `write_products`, `read_files`, `write_files`. See `.env.example`. Leave them unset and that one tool returns setup instructions rather than writing; every other tool is unaffected.
+
 Restart Claude Desktop. Open a new chat — you should see `linnworks` listed in the tools panel.
 
 ### 6. Try it
@@ -296,6 +299,7 @@ All write tools default to `dry_run=True` — they will describe what they would
 | `list_to_shopify` | 25 listings |
 | `refresh_channel_listing` | 25 listings |
 | `unpublish_channel_listing` | 10 listings |
+| `repair_channel_listing_images` | 10 listings |
 | `delist_all_channel_listings` | 10 listings |
 | `delist_all_shopify_listings` | 10 listings |
 | `delete_inventory_item_images` | 10 images |
