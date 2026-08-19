@@ -315,8 +315,10 @@ def test_shared_product_allows_removal_when_all_members_requested(shopify_env, l
     fake = FakeShopify(media=[_sh_media(1, IMG_A), _sh_media(3, IMG_SIB), _sh_media(9, OLD)])
     monkeypatch.setattr(server, "_shopify_graphql", fake)
 
+    # allow_net_media_loss isolates this to the VARIATION gate — the scenario
+    # removes 1 and adds 0, which the separate net-loss guard would otherwise block.
     out = server.repair_channel_listing_images(
-        ["sku-1", "sku-2", "parent"], dry_run=True)
+        ["sku-1", "sku-2", "parent"], allow_net_media_loss=True, dry_run=True)
 
     p = next(r for r in out["plan"] if r["sku"] == "sku-1")
     assert [m["linnworks_image_id"] for m in p["to_detach"]] == [OLD]
@@ -494,3 +496,70 @@ def test_graphql_surfaces_errors_verbatim(monkeypatch):
     monkeypatch.setattr(server.requests, "post", lambda *a, **k: R())
     with pytest.raises(RuntimeError, match="Invalid API key"):
         server._shopify_graphql({"shop_domain": "x", "access_token": "t"}, "q", {})
+
+
+# --------------------------------------------------------------------------
+# Net-loss guard — the luma-huxham-blue case
+# --------------------------------------------------------------------------
+#
+# Found on the first genuinely stale product in the catalogue. "Superseded" only
+# means Linnworks pushed it once and no longer has it; it cannot tell a REPLACED
+# image from one that was deleted out of Linnworks while still earning its place
+# on the product page. On luma-huxham-blue the 6 superseded media were lifestyle
+# shots (models wearing the product) and the 4 incoming Linnworks images were
+# studio packshots — a content downgrade produced by a tool working exactly to
+# spec. Removing more than you add is the tell.
+
+OLD2 = "22223333-4444-5555-6666-777788889999"
+OLD3 = "33334444-5555-6666-7777-888899990000"
+
+
+def test_net_loss_blocks_removal_by_default(shopify_env, lw, monkeypatch):
+    # Linnworks has 1 image; Shopify has 3 Linnworks-origin media, 2 of them stale.
+    lw["images"]["sku-1"] = [_lw_img(IMG_A, is_main=True)]
+    fake = FakeShopify(media=[_sh_media(1, IMG_A), _sh_media(8, OLD2), _sh_media(9, OLD3)])
+    monkeypatch.setattr(server, "_shopify_graphql", fake)
+
+    p = server.repair_channel_listing_images(["sku-1"], dry_run=False)["plan"][0]
+
+    assert len(p["superseded"]) == 2, "both stale media are still reported"
+    assert p["to_detach"] == [], "but nothing is removed"
+    assert "net loss" in p["removal_blocked_reason"]
+    assert "detach" not in fake.stages()
+
+
+def test_net_loss_override_permits_removal(shopify_env, lw, monkeypatch):
+    lw["images"]["sku-1"] = [_lw_img(IMG_A, is_main=True)]
+    fake = FakeShopify(media=[_sh_media(1, IMG_A), _sh_media(8, OLD2), _sh_media(9, OLD3)])
+    monkeypatch.setattr(server, "_shopify_graphql", fake)
+
+    p = server.repair_channel_listing_images(
+        ["sku-1"], allow_net_media_loss=True, dry_run=True)["plan"][0]
+
+    assert sorted(m["linnworks_image_id"] for m in p["to_detach"]) == sorted([OLD2, OLD3])
+    assert p["removal_blocked_reason"] is None
+
+
+def test_even_swap_is_not_a_net_loss(shopify_env, lw, monkeypatch):
+    """One image replaced by one image — the ordinary repair — stays allowed."""
+    lw["images"]["sku-1"] = [_lw_img(IMG_A, is_main=True)]
+    fake = FakeShopify(media=[_sh_media(9, OLD)])          # 1 stale, 1 incoming
+    monkeypatch.setattr(server, "_shopify_graphql", fake)
+
+    p = server.repair_channel_listing_images(["sku-1"], dry_run=True)["plan"][0]
+
+    assert [m["linnworks_image_id"] for m in p["to_detach"]] == [OLD]
+    assert p["removal_blocked_reason"] is None
+
+
+def test_net_gain_still_allows_removal(shopify_env, lw, monkeypatch):
+    """Adding 2 while removing 1 is a clear improvement — not blocked."""
+    lw["images"]["sku-1"] = [_lw_img(IMG_A, is_main=True, sort=0), _lw_img(IMG_B, sort=1)]
+    fake = FakeShopify(media=[_sh_media(9, OLD)])
+    monkeypatch.setattr(server, "_shopify_graphql", fake)
+
+    p = server.repair_channel_listing_images(["sku-1"], dry_run=True)["plan"][0]
+
+    assert [m["linnworks_image_id"] for m in p["to_detach"]] == [OLD]
+    assert len(p["missing"]) == 2
+    assert p["removal_blocked_reason"] is None

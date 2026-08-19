@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.44.1"
+__version__ = "1.45.0"
 
 import json
 import os
@@ -14557,6 +14557,7 @@ def repair_channel_listing_images(
     sub_source: str = "SWH Shopify",
     remove_superseded: bool = True,
     set_featured: bool = True,
+    allow_net_media_loss: bool = False,
     confirmed_count: int | None = None,
     dry_run: bool = True,
 ) -> dict:
@@ -14593,6 +14594,11 @@ def repair_channel_listing_images(
         disabled for shared products unless every member was passed in `skus`.
       - Nothing is removed unless the replacement media reached READY. A failed
         upload leaves the old picture in place rather than emptying the listing.
+      - Removal is blocked when it would take away MORE media than it adds. That
+        is the signature of a storefront holding richer content than the catalogue
+        — live-observed on a Luma product whose "superseded" media turned out to be
+        lifestyle photography, against incoming studio packshots. Override with
+        allow_net_media_loss=True once you have looked at the images.
 
     Requires Shopify Admin credentials (scopes: read_products, write_products,
     read_files, write_files) — Linnworks cannot supply these. If none are
@@ -14610,6 +14616,10 @@ def repair_channel_listing_images(
             is recoverable. Automatically disabled for shared variation products.
         set_featured: Make the Linnworks main image the product's featured image
             (default True). Linnworks' own is_main does not drive Shopify.
+        allow_net_media_loss: Permit a repair that removes more media than it adds
+            (default False). Off by default because "superseded" cannot tell a
+            replaced image from one deleted out of Linnworks while still earning
+            its place on the product page.
         confirmed_count: For batches > 10, pass len(skus) here.
         dry_run: If True (default), returns the manifest without writing.
 
@@ -14779,6 +14789,27 @@ def repair_channel_listing_images(
                 f"{len(owner.get('member_skus', [])) - 1} other variant(s). Superseded media is "
                 "NOT removed unless every member is passed in `skus`, because a sibling's photo "
                 "lives on the same product."
+            )
+
+        # ⚠️  NET-LOSS GUARD — the case that nearly shipped a content downgrade.
+        # "Superseded" only means "Linnworks pushed this once and no longer has it".
+        # It CANNOT distinguish "replaced by a better version" (detach is right) from
+        # "removed from Linnworks but still valuable on the storefront" (detach is
+        # wrong). Live example, luma-huxham-blue: 6 superseded media were genuine
+        # LIFESTYLE shots (models wearing the product) while the 4 incoming Linnworks
+        # images were studio packshots — a strict content downgrade, from a tool that
+        # was behaving exactly to spec. Removing MORE media than you add is the tell
+        # that Shopify holds richer content than Linnworks, so it blocks by default.
+        net_loss = len(superseded) - len(missing)
+        if removal_allowed and net_loss > 0 and not allow_net_media_loss:
+            removal_allowed = False
+            removal_blocked_reason = (
+                f"Detaching would remove {len(superseded)} media while adding only "
+                f"{len(missing)} — a net loss of {net_loss}. Linnworks is not always the "
+                "richer image source (a storefront often carries lifestyle shots the "
+                "catalogue never held), and a superseded image is indistinguishable from "
+                "one that was simply removed from Linnworks. Review the images, then pass "
+                "allow_net_media_loss=True if the removals really are stale versions."
             )
 
         to_detach = superseded if removal_allowed else []
