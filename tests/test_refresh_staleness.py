@@ -176,7 +176,11 @@ class _Harness:
 def _run(skus, harness=None, **kwargs):
     import server
     h = harness or _Harness()
-    with patch("server._fetch_shopify_configurators", return_value=CONFIGURATORS), \
+    # refresh_channel_listing resolves its target via _resolve_glt_target, which
+    # fetches the catalogue through _fetch_glt_configurators(channel_type) rather
+    # than the Shopify-scoped alias (issue #42) — patch the shared fetcher so the
+    # fixture catalogue is used regardless of which one the code calls.
+    with patch("server._fetch_glt_configurators", return_value=CONFIGURATORS), \
          patch("server.call_linnworks", side_effect=h.call_linnworks), \
          patch("server.call_linnworks_get", side_effect=h.call_linnworks_get):
         out = server.refresh_channel_listing(skus, sub_source="SWH Shopify", **kwargs)

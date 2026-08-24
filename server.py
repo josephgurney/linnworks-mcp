@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.46.0"
+__version__ = "1.47.0"
 
 import json
 import os
@@ -10422,14 +10422,22 @@ _ZERO_GUID = "00000000-0000-0000-0000-000000000000"
 # _resolve_glt_target()'s account-prefix fallback.
 GLT_CHANNELS: dict[str, dict] = {
     "shopify": {"channel_type": "Shopify", "channel_name": "SHOPIFY", "source": "SHOPIFY",
-                "delete_proven": True},
+                "delete_proven": True, "revise_proven": True},
     # Amazon Delete LIVE-PROVEN 5 Aug 2026 on MOB-GRP-3080 (template 31703, ASIN
     # B0B311TFG3): ProcessTemplates Delete → 2xx, the AMAZON channel-SKU row and
     # the template both disappeared, eBay/Shopify rows and stock untouched. NB it
     # succeeded even though the template read NextSuggestedAction:"NotAllowed" —
     # that flag describes the SUGGESTED action, it does not gate a forced Delete.
+    # Revise/Update (refresh_channel_listing) is NOT proven on Amazon (issue #42)
+    # — only the Delete action has been fired live here. Amazon carries hundreds
+    # of templates of unknown age and no API route rebuilds a stale one (#27), so
+    # a well-intentioned bulk refresh could silently revert live content the same
+    # way the Shopify catnip push did (v1.27.1). Prove it on ONE low-risk listing
+    # (template freshness checked first, read-back on listing data, not the
+    # detail page — Amazon's can lag the catalogue by up to a day) before flipping
+    # this flag.
     "amazon":  {"channel_type": "Amazon",  "channel_name": "AMAZON",  "source": "AMAZON",
-                "delete_proven": True},
+                "delete_proven": True, "revise_proven": False},
     # TikTok Delete LIVE-PROVEN 7 Aug 2026 on ven-20-black-raw-core-complete-7.5
     # (template 30006, configurator 112, listing 1729486505080953421): the TIKTOK
     # channel-SKU row vanished, OpenTemplatesByInventory on ChannelId 30 went 1 → 0,
@@ -10442,12 +10450,14 @@ GLT_CHANNELS: dict[str, dict] = {
     #    (#26) — so a TikTok child usually needs no whole-group gate at all. The
     #    gate still fires correctly for the children that genuinely have no
     #    template (live-confirmed on vnm-triplepads-yellowblack-jnr).
+    # Revise/Update is NOT proven on TikTok either (issue #42) — same caution as
+    # Amazon applies.
     "tiktok":  {"channel_type": "TikTok",  "channel_name": "TIKTOK",  "source": "TIKTOK",
-                "delete_proven": True},
+                "delete_proven": True, "revise_proven": False},
     "magento": {"channel_type": "Magento", "channel_name": "MAGENTO", "source": "MAGENTO",
-                "delete_proven": False},
+                "delete_proven": False, "revise_proven": False},
     "walmart": {"channel_type": "Walmart", "channel_name": "WALMART", "source": "WALMART",
-                "delete_proven": False},
+                "delete_proven": False, "revise_proven": False},
 }
 
 # Channels seen in this tenant's channel-SKU table that the GLT cannot touch at
@@ -10465,6 +10475,18 @@ def _proven_delete_channels() -> str:
     TikTok (v1.42.0) proofs while claiming neither had happened.
     """
     proven = sorted(c["channel_type"] for c in GLT_CHANNELS.values() if c["delete_proven"])
+    return ", ".join(proven) if proven else "none"
+
+
+def _proven_revise_channels() -> str:
+    """Comma-joined list of channels whose Revise/Update is live-proven, for warnings.
+
+    Derived from GLT_CHANNELS (issue #42) for the same reason as
+    `_proven_delete_channels()`: a hard-coded "only Shopify is" string cannot be
+    trusted to stay true once someone proves another channel — that mistake has
+    already happened once in this codebase (see that function's docstring).
+    """
+    proven = sorted(c["channel_type"] for c in GLT_CHANNELS.values() if c["revise_proven"])
     return ", ".join(proven) if proven else "none"
 
 
@@ -12066,15 +12088,21 @@ def _glt_snapshot_age_days(last_modified: str | None) -> int | None:
     return max(0, (datetime.now(timezone.utc) - dt).days)
 
 
-def _effective_channel_value(rows, sub_source: str, key: str, fallback=None):
+def _effective_channel_value(rows, sub_source: str, key: str,
+                             channel_source: str = GLT_SHOPIFY_CHANNEL_NAME, fallback=None):
     """
-    The value the channel actually uses: the SHOPIFY/<sub_source> override row
-    if one exists, else `fallback` (the item-level base value).
+    The value the channel actually uses: the <channel_source>/<sub_source>
+    override row if one exists, else `fallback` (the item-level base value).
+
+    `channel_source` is the channel-SKU Source string (e.g. "SHOPIFY", "AMAZON")
+    — hard-coding SHOPIFY here (issue #42) meant an Amazon title/price override
+    was invisible, so the staleness check compared a template against the base
+    item value instead of what the Amazon listing actually shows.
 
     Returns (value, source) where source is "channel_override" or "base".
     """
     for r in rows if isinstance(rows, list) else []:
-        if (_norm_conf_name(r.get("Source")) == _norm_conf_name(GLT_SHOPIFY_CHANNEL_NAME)
+        if (_norm_conf_name(r.get("Source")) == _norm_conf_name(channel_source)
                 and _norm_conf_name(r.get("SubSource")) == _norm_conf_name(sub_source)):
             val = r.get(key)
             if val is not None:
@@ -12107,7 +12135,8 @@ def _refresh_staleness_message(check_staleness: bool, stale_rows: list, no_diff_
 
 
 def _glt_template_staleness(template: dict, stock_item_id: str, base_title: str | None,
-                            base_price, sub_source: str) -> dict:
+                            base_price, sub_source: str,
+                            channel_source: str = GLT_SHOPIFY_CHANNEL_NAME) -> dict:
     """
     Compare a GLT template's STORED snapshot against the item's CURRENT values.
 
@@ -12115,6 +12144,18 @@ def _glt_template_staleness(template: dict, stock_item_id: str, base_title: str 
     failed read yields checked=False with comparable_fields_match=None, because
     "we could not tell" must never collapse into "it matches" (issue #37 —
     a quota error laundered into a factual verdict).
+
+    `channel_source` (issue #42) is the channel-SKU Source string the title/price
+    override lookup is scoped to — pass the channel actually being refreshed
+    (e.g. "AMAZON"), not the Shopify default, or an Amazon channel-title override
+    is invisible and the check compares against the base item value instead.
+
+    The per-variant-price skip below (a variation template reports Price 0.0) is
+    confirmed on SHOPIFY only. Whether an Amazon variation family's template
+    hangs off the parent or each child — and so whether "IsVariation" even means
+    the same thing there — is unestablished (see refresh_channel_listing's
+    channel docstring); the same skip-rather-than-compare behaviour is applied
+    regardless of channel, which is the conservative choice either way.
     """
     info = template.get("Info") if isinstance(template.get("Info"), dict) else {}
     last_mod = _glt_field(info, "LastModificationTime")
@@ -12148,7 +12189,7 @@ def _glt_template_staleness(template: dict, stock_item_id: str, base_title: str 
     # ── title: compare against the EFFECTIVE channel title (trap 1) ──────────
     tpl_title = _glt_field(info, "Title")
     cur_title, title_src = _effective_channel_value(
-        title_rows, sub_source, "Title", fallback=base_title)
+        title_rows, sub_source, "Title", channel_source, fallback=base_title)
     if tpl_title is not None and cur_title is not None:
         match = str(tpl_title).strip() == str(cur_title).strip()
         out["compared"]["title"] = {
@@ -12168,7 +12209,7 @@ def _glt_template_staleness(template: dict, stock_item_id: str, base_title: str 
     else:
         tpl_price = _glt_field(info, "Price")
         cur_price, price_src = _effective_channel_value(
-            price_rows, sub_source, "Price", fallback=base_price)
+            price_rows, sub_source, "Price", channel_source, fallback=base_price)
         if tpl_price is not None and cur_price is not None:
             try:
                 match = abs(float(tpl_price) - float(cur_price)) < 0.005
@@ -12226,15 +12267,32 @@ def _glt_template_staleness(template: dict, stock_item_id: str, base_title: str 
 def refresh_channel_listing(
     skus: list[str],
     sub_source: str = "SWH Shopify",
+    channel: str = "Shopify",
     action: str | None = None,
     check_staleness: bool = True,
     confirmed_count: int | None = None,
     dry_run: bool = True,
 ) -> dict:
     """
-    Re-push / revise EXISTING Shopify listings so updated item data — extended
-    properties, title, price, description, etc. — propagates to the live channel.
-    Shopify only (v1).
+    Re-push / revise EXISTING listings on any GLT-managed channel so updated
+    item data — extended properties, title, price, description, etc. —
+    propagates to the live channel. Shopify (default), Amazon, TikTok (also
+    Magento/Walmart where a tenant lists through the GLT).
+
+    Generalised beyond Shopify (issue #42) by reusing the channel registry and
+    target resolver already live-proven for `unpublish_channel_listing`
+    (issue #30): channel identity comes from `GLT_CHANNELS` / `_resolve_glt_target`,
+    never from a hard-coded string, so a non-GLT channel (eBay, Etsy, Mirakl,
+    CDiscount) raises a clear ValueError naming the channels that ARE supported
+    instead of silently doing nothing.
+
+    ⚠️  REVISE IS NOT LIVE-PROVEN ON AMAZON OR TIKTOK. `ProcessTemplates`
+    Revise/Update is live-proven on SHOPIFY only (v1.27.1, 14 Jul 2026) — only
+    the Delete action has been fired live on Amazon/TikTok
+    (`unpublish_channel_listing`). Each plan row and the response carry
+    `revise_proven` from the registry, and an unproven channel is warned about
+    in every message — see `channel` below for what the eventual single-listing
+    live proof needs to check.
 
     This is the revise counterpart to `list_to_shopify`: that tool CREATES new
     listings; this one REVISES listings that already exist. It never creates a
@@ -12243,14 +12301,18 @@ def refresh_channel_listing(
 
     Flow per SKU (read-before-write):
       1. Resolve SKU → StockItemId + title.
-      2. Confirm the item has a SHOPIFY channel-SKU mapping on `sub_source` (the
-         channel-SKU link table — see get_channel_listings). Not listed →
-         unresolved.
+      2. Confirm the item has a channel-SKU mapping for this channel's Source on
+         `sub_source` (the channel-SKU link table — see get_channel_listings).
+         Not listed → unresolved.
       3. GenericListings/OpenTemplatesByInventory → open the item's EXISTING GLT
-         template for that store (this OPENS the existing template, it does NOT
-         create a new one — so it can't duplicate the listing).
-      4. (live run) GenericListings/ProcessTemplates with the revise action →
-         pushes the current item data to the live Shopify listing.
+         template(s) for that store/account (this OPENS existing templates, it
+         does NOT create any — so it can't duplicate the listing). An item can
+         have SEVERAL templates on one channel (live-observed on Amazon: a
+         merchant and an ".FBA" template on one StockItemId) — ALL of them are
+         planned and pushed, one plan row each, because reviving only one would
+         leave the other stale.
+      4. (live run) GenericListings/ProcessTemplates with the revise action, per
+         template → pushes the current item data to the live listing.
 
     Variation groups (issue #26): GLT variation listings hang off the variation
     PARENT — the parent holds the template (and usually no channel-SKU row),
@@ -12280,7 +12342,11 @@ def refresh_channel_listing(
     including ones whose snapshots were seven weeks old. For a listed Shopify
     template it is effectively a constant — use `staleness` below, not this.
 
-    ⚠️  A live run (dry_run=False) changes REAL customer-facing Shopify listings.
+    ⚠️  A live run (dry_run=False) changes REAL customer-facing listings.
+    Acceptance of the push is NOT proof of a change (see below) — read the
+    listing data back (e.g. get_channel_listings), not the channel's own detail
+    page: Amazon detail pages in particular can lag the catalogue by up to a day,
+    so a green result plus an unchanged detail page proves nothing either way.
 
     ⚠️⚠️  A PUSH CAN BE A SILENT NO-OP (issue #40, live-proven 18 Aug 2026).
     ProcessTemplates returns an empty 2xx whether it changed the listing or not,
@@ -12319,31 +12385,55 @@ def refresh_channel_listing(
     you to confirm with confirmed_count=<N> before executing.
 
     Args:
-        skus: Exact SKUs / ItemNumbers whose Shopify listings to refresh.
-        sub_source: Shopify store name (default "SWH Shopify"). Scopes both the
-            "is it listed?" check and which store's template is opened/revised.
+        skus: Exact SKUs / ItemNumbers whose listings to refresh.
+        sub_source: Store / account / region name, scoping both the "is it
+            listed?" check and which template(s) are opened/revised. Shopify:
+            the store ("SWH Shopify" default, "Venom Skateboards", …). Amazon:
+            the account ("The Warehouse Group") or a regional sub-source
+            ("The Warehouse Group - Germany"), which resolves to the account's
+            ChannelId (`sub_source_resolution: "account-prefix"` in the
+            response). TikTok: "SKATEWAREHOUSE_UK".
+        channel: GLT channel — "Shopify" (default), "Amazon", "TikTok",
+            "Magento", "Walmart". A non-GLT channel (eBay, Etsy, Mirakl,
+            CDiscount) raises a ValueError naming the supported channels.
+            ⚠️ Whether an Amazon variation family's template hangs off the
+            parent (Shopify's shape) or off each child (TikTok's shape) is
+            unestablished — nothing in this repo has observed it either way.
+            The child→parent fallback described above (issue #26) runs
+            unchanged regardless of channel, so on an Amazon variation SKU it
+            could open the correct parent template, the wrong one, or none at
+            all. Treat any Amazon variation result as unverified until the
+            single-listing live proof settles this.
         action: Optional GLT action override (e.g. "Revise", "Update"). Default
             None = auto (use the template's NextSuggestedAction, else "Revise").
         check_staleness: If True (default), compare each template's stored
             snapshot against the item's current title / price / image count
             before pushing (3 extra GETs per template) and report `staleness`
-            on every plan row. Set False to skip the extra reads — the plan then
-            says nothing about whether the snapshot is fresh.
+            on every plan row. The title/price comparison uses the override row
+            for THIS channel (e.g. an Amazon title override), not Shopify's, so
+            it doesn't misfire on exactly the channel-specific content this
+            covers. Set False to skip the extra reads — the plan then says
+            nothing about whether the snapshot is fresh.
         confirmed_count: For batches > 25 SKUs, pass len(skus) after reviewing
             the plan to confirm the write.
         dry_run: If True (default), returns the plan without pushing anything.
-            Set to False to push the revisions to Shopify.
+            Set to False to push the revisions to the channel. A dry run makes
+            no ProcessTemplates call for any channel.
 
     Returns:
         A dict with:
-          - dry_run, item_count, target_sub_source, target_channel_id,
-            available_sub_sources
-          - plan: per-TEMPLATE rows that would be revised (sku, stock_item_id,
-            title, template_id, configurator_id, active_listing_id, status,
-            action, next_suggested_action, is_allowed_to_revise, covers_skus;
-            plus via_variation_parent / listed_via_children where a variation
-            group was resolved). Deduped: inputs sharing one template = one row.
-            Each row also carries `staleness` (when check_staleness):
+          - dry_run, item_count, target_channel, target_source,
+            target_sub_source, target_channel_id, sub_source_resolution,
+            revise_proven, available_sub_sources
+          - plan: one row PER TEMPLATE that would be revised (sku, covers_skus,
+            stock_item_id, title, channel, sub_source, template_id,
+            configurator_id, active_listing_id, status, action,
+            next_suggested_action, is_allowed_to_revise, templates_on_item,
+            revise_proven; plus via_variation_parent / listed_via_children where
+            a variation group was resolved). Deduped by template id: inputs
+            sharing one template = one row, but an item with several templates
+            on one channel (e.g. Amazon merchant + FBA) produces one row PER
+            template. Each row also carries `staleness` (when check_staleness):
             template_last_modified, snapshot_age_days, compared{title,price,
             image_count}, stale_fields[], comparable_fields_match,
             skipped_comparisons[], undetectable_fields[], warning.
@@ -12351,12 +12441,21 @@ def refresh_channel_listing(
             staleness_unchecked_count / staleness_note
           - unresolved: per-SKU error rows (not found / not listed on the store /
             no template / locked / no allowed revise action)
-          - results: per-SKU push outcome (live run only)
+          - results: per-template push outcome (live run only)
+
+        The single-listing live proof this needs before `revise_proven` on a
+        channel can be flipped to True (see the note in GLT_CHANNELS and
+        CLAUDE.md): pick ONE low-risk listing on that channel, check its
+        template's freshness first (LastModificationTime / `staleness` here),
+        push it, then read the listing DATA back (get_channel_listings or the
+        channel's own reporting) — never the detail page — to confirm the
+        change actually landed before trusting the flag.
     """
     if not skus:
         raise ValueError("skus must contain at least one SKU.")
 
     _check_injection("sub_source", sub_source or "")
+    _check_injection("channel", channel or "")
     _check_injection("action", action or "")
 
     if action is not None and action not in _GLT_PROCESS_ACTIONS:
@@ -12364,23 +12463,17 @@ def refresh_channel_listing(
             f"action '{action}' is not a valid GLT action. Valid: {sorted(_GLT_PROCESS_ACTIONS)}"
         )
 
-    # ── Resolve target store ChannelId from the configurator catalogue ────────
-    catalogue = _fetch_shopify_configurators()
-    available_sub_sources = sorted({c["sub_source"] for c in catalogue if c.get("sub_source")})
-    ss_to_channel: dict[str, int] = {}
-    for c in catalogue:
-        ss, cid = c.get("sub_source"), c.get("channel_id")
-        if ss and cid is not None:
-            ss_to_channel.setdefault(_norm_conf_name(ss), cid)
-    target_channel_id = ss_to_channel.get(_norm_conf_name(sub_source))
-    if target_channel_id is None:
-        return {
-            "error": (
-                f"sub_source '{sub_source}' is not a Shopify store in this tenant. "
-                f"Available: {available_sub_sources}"
-            ),
-            "available_sub_sources": available_sub_sources,
-        }
+    # ── Resolve the target channel + ChannelId from the configurator catalogue ─
+    # Shared with unpublish_channel_listing (issue #30/#42) — channel identity
+    # comes from the registry, never a hard-coded string, and a non-GLT channel
+    # (eBay/Etsy/Mirakl/CDiscount) raises here naming the supported channels.
+    target = _resolve_glt_target(channel, sub_source)
+    ch = target["channel"]
+    channel_source = ch["source"]
+    available_sub_sources = target["available_sub_sources"]
+    if not target["ok"]:
+        return {"error": target["error"], "available_sub_sources": available_sub_sources}
+    target_channel_id = target["channel_id"]
 
     # ── Resolve each SKU + confirm it's listed on the target store ────────────
     # Variation blind spot (issue #26): GLT variation listings hang off the
@@ -12420,7 +12513,7 @@ def refresh_channel_listing(
     def _rows_on_store(rows: list) -> list:
         return [
             r for r in (rows if isinstance(rows, list) else [])
-            if _norm_conf_name(r.get("Source")) == _norm_conf_name(GLT_SHOPIFY_CHANNEL_NAME)
+            if _norm_conf_name(r.get("Source")) == _norm_conf_name(channel_source)
             and _norm_conf_name(r.get("SubSource")) == _norm_conf_name(sub_source)
         ]
 
@@ -12482,43 +12575,49 @@ def refresh_channel_listing(
         unresolved.append({
             "sku": sku, "stock_item_id": sid, "title": title,
             "error": (
-                f"not listed on Shopify store '{sub_source}' — "
+                f"not listed on {ch['channel_type']} '{sub_source}' — "
                 "use list_to_shopify to create it first"
             ),
         })
 
     # ── Open the existing GLT templates for the resolved items (read) ──────────
-    templates_by_sid: dict[str, dict] = {}
+    # An item can have MORE THAN ONE template on a channel (live-observed on
+    # Amazon: a merchant template and an ".FBA" template on one StockItemId), so
+    # templates are collected as a LIST per item — keying by id would drop all
+    # but the last and silently leave the other listing on the stale snapshot.
+    templates_by_sid: dict[str, list[dict]] = {}
     ids = [r["stock_item_id"] for r in resolved]
     for i in range(0, len(ids), 200):
         chunk = ids[i:i + 200]
         resp = call_linnworks(
             "GenericListings/OpenTemplatesByInventory",
             {"request": {
-                "ChannelType": GLT_SHOPIFY_CHANNEL_TYPE,
-                "ChannelName": GLT_SHOPIFY_CHANNEL_NAME,
+                "ChannelType": ch["channel_type"],
+                "ChannelName": ch["channel_name"],
                 "Parameters": {
                     "SelectedRegions":  [],
                     "Token":            _ZERO_GUID,
                     "InventoryItemIds": chunk,
                     "ChannelId":        target_channel_id,
                 },
-                "PaginationParameters": {"PageNumber": 1, "EntriesPerPage": max(len(chunk), 1)},
+                # One item can return several templates on one channel, so ask
+                # for headroom rather than exactly len(chunk) entries.
+                "PaginationParameters": {"PageNumber": 1, "EntriesPerPage": max(len(chunk) * 4, 10)},
             }},
         )
         for t in (resp.get("TemplatesInfo") if isinstance(resp, dict) else None) or []:
             tsid = t.get("StockItemId")
             if tsid:
-                templates_by_sid[tsid.lower()] = t
+                templates_by_sid.setdefault(tsid.lower(), []).append(t)
 
     # ── Variation-child fallback: no own template → use the PARENT's template ──
     # A child mapped on the store but with no template of its own inherits its
-    # variation parent's template (the multi-variant Shopify product is managed
-    # there). Revising the parent template pushes ALL variants of the listing.
+    # variation parent's template (the multi-variant listing is managed there).
+    # Revising the parent template pushes ALL variants of the listing.
     child_fallback: dict[str, dict] = {}  # input sku (lower) -> {parent_sku, parent_sid}
     parent_sids_to_open: list[str] = []
     for r in resolved:
-        if r["stock_item_id"].lower() in templates_by_sid or "listed_via_children" in r:
+        if templates_by_sid.get(r["stock_item_id"].lower()) or "listed_via_children" in r:
             continue
         entry = _parent_of_child(r["sku"], r["stock_item_id"])
         if entry and entry.get("parent_sid"):
@@ -12531,26 +12630,30 @@ def refresh_channel_listing(
         resp = call_linnworks(
             "GenericListings/OpenTemplatesByInventory",
             {"request": {
-                "ChannelType": GLT_SHOPIFY_CHANNEL_TYPE,
-                "ChannelName": GLT_SHOPIFY_CHANNEL_NAME,
+                "ChannelType": ch["channel_type"],
+                "ChannelName": ch["channel_name"],
                 "Parameters": {
                     "SelectedRegions":  [],
                     "Token":            _ZERO_GUID,
                     "InventoryItemIds": chunk,
                     "ChannelId":        target_channel_id,
                 },
-                "PaginationParameters": {"PageNumber": 1, "EntriesPerPage": max(len(chunk), 1)},
+                "PaginationParameters": {"PageNumber": 1, "EntriesPerPage": max(len(chunk) * 4, 10)},
             }},
         )
         for t in (resp.get("TemplatesInfo") if isinstance(resp, dict) else None) or []:
             tsid = t.get("StockItemId")
             if tsid:
-                templates_by_sid[tsid.lower()] = t
+                templates_by_sid.setdefault(tsid.lower(), []).append(t)
 
     # ── Build the plan, deciding the push action per template ─────────────────
-    # Deduped by template: several input SKUs (e.g. all children of one
-    # variation group) resolving to the SAME template become ONE push, with the
-    # covered inputs listed in covers_skus.
+    # One row PER TEMPLATE (issue #42): an item can have several templates on
+    # one channel (live-observed on Amazon: a merchant + an ".FBA" template on
+    # one StockItemId) — keying by stock item id, as this used to, would drop
+    # all but the last and silently leave the other template on its stale
+    # snapshot while reporting a clean refresh. Several input SKUs resolving to
+    # the SAME template (e.g. all children of one variation group) still dedupe
+    # to ONE push, with the covered inputs listed in covers_skus.
     plan: list[dict] = []
     plan_by_template: dict = {}
     base_info_by_sid: dict[str, dict] = {
@@ -12558,13 +12661,13 @@ def refresh_channel_listing(
         for r in resolved
     }
     for r in resolved:
-        t = templates_by_sid.get(r["stock_item_id"].lower())
+        templates = templates_by_sid.get(r["stock_item_id"].lower()) or []
         via_parent = None
-        if not t:
+        if not templates:
             via_parent = child_fallback.get(r["sku"].strip().lower())
             if via_parent and via_parent.get("parent_sid"):
-                t = templates_by_sid.get(via_parent["parent_sid"].lower())
-        if not t:
+                templates = templates_by_sid.get(via_parent["parent_sid"].lower()) or []
+        if not templates:
             unresolved.append({
                 **r,
                 "error": (
@@ -12574,78 +12677,88 @@ def refresh_channel_listing(
             })
             continue
 
-        existing = plan_by_template.get(t.get("Id"))
-        if existing is not None:
-            existing["covers_skus"].append(r["sku"])
-            continue
+        for t in templates:
+            existing = plan_by_template.get(t.get("Id"))
+            if existing is not None:
+                if r["sku"] not in existing["covers_skus"]:
+                    existing["covers_skus"].append(r["sku"])
+                continue
 
-        if t.get("IsLocked"):
-            unresolved.append({
-                **r, "template_id": t.get("Id"),
-                "error": "GLT template is locked — cannot revise right now",
-            })
-            continue
+            if t.get("IsLocked"):
+                unresolved.append({
+                    **r, "template_id": t.get("Id"),
+                    "error": "GLT template is locked — cannot revise right now",
+                })
+                continue
 
-        next_action  = t.get("NextSuggestedAction")
-        next_allowed = bool(t.get("IsNextSuggestedActionAllowed"))
-        can_revise   = bool(t.get("IsAllowedToRevise"))
+            next_action  = t.get("NextSuggestedAction")
+            next_allowed = bool(t.get("IsNextSuggestedActionAllowed"))
+            can_revise   = bool(t.get("IsAllowedToRevise"))
 
-        if action is not None:
-            chosen_action = action
-        elif next_allowed and next_action in _GLT_REFRESH_ACTIONS:
-            chosen_action = next_action
-        elif can_revise:
-            chosen_action = "Revise"
-        else:
-            unresolved.append({
-                **r, "template_id": t.get("Id"), "next_suggested_action": next_action,
-                "error": "GLT does not allow a revise/update on this template (no allowed push action)",
-            })
-            continue
+            if action is not None:
+                chosen_action = action
+            elif next_allowed and next_action in _GLT_REFRESH_ACTIONS:
+                chosen_action = next_action
+            elif can_revise:
+                chosen_action = "Revise"
+            else:
+                unresolved.append({
+                    **r, "template_id": t.get("Id"), "next_suggested_action": next_action,
+                    "error": "GLT does not allow a revise/update on this template (no allowed push action)",
+                })
+                continue
 
-        info = t.get("Info") if isinstance(t.get("Info"), dict) else {}
-        row = {
-            "sku":                   via_parent["parent_sku"] if via_parent else r["sku"],
-            "stock_item_id":         via_parent["parent_sid"] if via_parent else r["stock_item_id"],
-            "title":                 r["title"],
-            "template_id":           t.get("Id"),
-            "configurator_id":       t.get("ConfiguratorId"),
-            "active_listing_id":     _glt_field(info, "ActiveListingId"),
-            "status":                _glt_field(info, "Status"),
-            "action":                chosen_action,
-            "next_suggested_action": next_action,
-            "is_allowed_to_revise":  can_revise,
-            "covers_skus":           [r["sku"]],
-        }
-        if via_parent:
-            row["via_variation_parent"] = True
-        if "listed_via_children" in r:
-            row["listed_via_children"] = r["listed_via_children"]
-
-        # Pre-flight staleness (issue #40): does the template's STORED snapshot
-        # still agree with the item's current values? Costs 3 GETs per template.
-        # A via-parent row is judged on the PARENT's values — the template holds
-        # the parent's title, not the child's.
-        if check_staleness:
-            base_title, base_price = r.get("title"), r.get("base_price")
+            info = t.get("Info") if isinstance(t.get("Info"), dict) else {}
+            row = {
+                "sku":                   via_parent["parent_sku"] if via_parent else r["sku"],
+                "stock_item_id":         via_parent["parent_sid"] if via_parent else r["stock_item_id"],
+                "title":                 r["title"],
+                "channel":               ch["channel_type"],
+                "sub_source":            sub_source,
+                "templates_on_item":     len(templates),
+                "revise_proven":         ch["revise_proven"],
+                "template_id":           t.get("Id"),
+                "configurator_id":       t.get("ConfiguratorId"),
+                "active_listing_id":     _glt_field(info, "ActiveListingId"),
+                "status":                _glt_field(info, "Status"),
+                "action":                chosen_action,
+                "next_suggested_action": next_action,
+                "is_allowed_to_revise":  can_revise,
+                "covers_skus":           [r["sku"]],
+            }
             if via_parent:
-                cached = base_info_by_sid.get(row["stock_item_id"].lower())
-                if cached is None:
-                    try:
-                        pitem = call_linnworks(
-                            "Inventory/GetInventoryItem", {"sku": row["sku"]})
-                        cached = {"title": pitem.get("ItemTitle"),
-                                  "base_price": pitem.get("RetailPrice")}
-                    except (RateLimitError, RuntimeError):
-                        cached = {}
-                    base_info_by_sid[row["stock_item_id"].lower()] = cached
-                base_title = cached.get("title")
-                base_price = cached.get("base_price")
-            row["staleness"] = _glt_template_staleness(
-                t, row["stock_item_id"], base_title, base_price, sub_source)
+                row["via_variation_parent"] = True
+            if "listed_via_children" in r:
+                row["listed_via_children"] = r["listed_via_children"]
 
-        plan.append(row)
-        plan_by_template[t.get("Id")] = row
+            # Pre-flight staleness (issue #40): does the template's STORED
+            # snapshot still agree with the item's current values? Costs 3 GETs
+            # per template. A via-parent row is judged on the PARENT's values —
+            # the template holds the parent's title, not the child's. The
+            # title/price comparison is scoped to THIS channel's Source
+            # (issue #42) — comparing against Shopify's override on an Amazon
+            # refresh would misjudge the very thing being refreshed.
+            if check_staleness:
+                base_title, base_price = r.get("title"), r.get("base_price")
+                if via_parent:
+                    cached = base_info_by_sid.get(row["stock_item_id"].lower())
+                    if cached is None:
+                        try:
+                            pitem = call_linnworks(
+                                "Inventory/GetInventoryItem", {"sku": row["sku"]})
+                            cached = {"title": pitem.get("ItemTitle"),
+                                      "base_price": pitem.get("RetailPrice")}
+                        except (RateLimitError, RuntimeError):
+                            cached = {}
+                        base_info_by_sid[row["stock_item_id"].lower()] = cached
+                    base_title = cached.get("title")
+                    base_price = cached.get("base_price")
+                row["staleness"] = _glt_template_staleness(
+                    t, row["stock_item_id"], base_title, base_price, sub_source,
+                    channel_source)
+
+            plan.append(row)
+            plan_by_template[t.get("Id")] = row
 
     stale_rows       = [r for r in plan if r.get("staleness", {}).get("stale_fields")]
     unchecked_rows   = [r for r in plan if "staleness" in r and not r["staleness"].get("checked")]
@@ -12654,8 +12767,12 @@ def refresh_channel_listing(
 
     base_out = {
         "item_count":            len(skus),
+        "target_channel":        ch["channel_type"],
+        "target_source":         channel_source,
         "target_sub_source":     sub_source,
         "target_channel_id":     target_channel_id,
+        "sub_source_resolution": target["resolution"],
+        "revise_proven":         ch["revise_proven"],
         "available_sub_sources": available_sub_sources,
         "plan":                  plan,
         "unresolved":            unresolved,
@@ -12683,17 +12800,33 @@ def refresh_channel_listing(
     if guard is not None:
         return {**guard, **base_out}
 
+    # Name the channels actually proven rather than hard-coding one — the delete
+    # side of this made exactly this mistake once already (see
+    # _proven_delete_channels's docstring): a hard-coded "Shopify only" string
+    # would still say that after Amazon or TikTok gets proven.
+    unproven_note = (
+        ""
+        if ch["revise_proven"]
+        else (
+            f" ⚠️  ProcessTemplates Revise/Update is NOT yet live-proven on {ch['channel_type']} "
+            f"(proven: {_proven_revise_channels()}) — prove it on ONE low-risk listing (check the "
+            "template's freshness first, then read the listing DATA back, not the detail page) "
+            "before trusting a bulk run on this channel."
+        )
+    )
+
     if dry_run:
         return {
             "dry_run": True,
             **base_out,
             "message": (
-                f"Dry run — nothing pushed. {len(plan)} listing(s) on '{sub_source}' would be "
-                f"revised; {len(unresolved)} SKU(s) could not be revised (see unresolved). "
+                f"Dry run — nothing pushed. {len(plan)} {ch['channel_type']} listing(s) on "
+                f"'{sub_source}' would be revised; {len(unresolved)} SKU(s) could not be revised "
+                "(see unresolved). "
                 + _refresh_staleness_message(check_staleness, stale_rows, no_diff_rows,
                                              unchecked_rows) +
-                "Review the plan, then set dry_run=False to push the revisions. A live run "
-                "changes real customer-facing Shopify listings."
+                "Review the plan, then set dry_run=False to push the revisions. A live run changes "
+                f"real customer-facing listings.{unproven_note}"
             ),
         }
 
@@ -12702,7 +12835,10 @@ def refresh_channel_listing(
             "dry_run": False,
             **base_out,
             "results": [],
-            "message": "Nothing to revise — no SKU resolved to an existing, revisable Shopify template.",
+            "message": (
+                f"Nothing to revise — no SKU resolved to an existing, revisable {ch['channel_type']} "
+                "template."
+            ),
         }
 
     # ── Live execution: ProcessTemplates per template (Revise/Update push) ─────
@@ -12711,6 +12847,9 @@ def refresh_channel_listing(
     for row in plan:
         res = {
             "sku":         row["sku"],
+            "covers_skus": list(row.get("covers_skus") or [row["sku"]]),
+            "channel":     ch["channel_type"],
+            "sub_source":  sub_source,
             "template_id": row["template_id"],
             "action":      row["action"],
             "processed":   False,
@@ -12724,8 +12863,8 @@ def refresh_channel_listing(
             call_linnworks(
                 "GenericListings/ProcessTemplates",
                 {"request": {
-                    "ChannelType": GLT_SHOPIFY_CHANNEL_TYPE,
-                    "ChannelName": GLT_SHOPIFY_CHANNEL_NAME,
+                    "ChannelType": ch["channel_type"],
+                    "ChannelName": ch["channel_name"],
                     "TemplateRequests": [
                         {"TemplateId": row["template_id"], "Action": row["action"]}
                     ],
@@ -12738,19 +12877,33 @@ def refresh_channel_listing(
             res["error"] = f"ProcessTemplates ({row['action']}) failed: {exc}"
         results.append(res)
 
+    # Acceptance of the push is NOT proof of a change (issue #40/#42): ONE 2xx
+    # whether the channel changed or not, and a detail page — Amazon's
+    # especially — can lag the catalogue by up to a day, so an unchanged detail
+    # page proves nothing either way. Read the listing DATA back.
+    readback_note = (
+        "ProcessTemplates returns no body, so `processed: true` means the push was ACCEPTED, "
+        "never that the listing changed — this is NOT proof of a change. READ THE LISTING DATA "
+        "BACK NOW (e.g. get_channel_listings), not the channel's detail/storefront page — "
+    )
+    if ch["channel_type"] == "Amazon":
+        readback_note += "Amazon detail pages in particular can lag the catalogue by up to a day. "
+    else:
+        readback_note += "a green result plus an unchanged detail page proves nothing either way. "
+
     return {
         "dry_run": False,
         **base_out,
         "results": results,
         "message": (
-            f"{pushed}/{len(plan)} Shopify listing(s) on '{sub_source}' revised and pushed. "
+            f"{pushed}/{len(plan)} {ch['channel_type']} listing(s) on '{sub_source}' revised and "
+            "pushed. "
             + _refresh_staleness_message(check_staleness, stale_rows, no_diff_rows,
                                          unchecked_rows, live=True) +
-            "ProcessTemplates returns no body, so `processed: true` means the push was ACCEPTED, "
-            "never that the listing changed — READ THE LIVE LISTING BACK NOW: the push sends the "
-            "template's STORED field snapshot, which can be stale and overwrite current "
-            "prices/content (live-proven 14 Jul 2026) or change nothing at all (issue #40). "
-            "Per-item errors are in results[].error."
+            readback_note +
+            "The push sends the template's STORED field snapshot, which can be stale and overwrite "
+            "current prices/content (live-proven on Shopify 14 Jul 2026) or change nothing at all "
+            f"(issue #40). Per-item errors are in results[].error.{unproven_note}"
         ),
     }
 
