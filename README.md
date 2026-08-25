@@ -1,7 +1,7 @@
 # Linnworks MCP Server
 
-![Version](https://img.shields.io/badge/version-1.47.1-blue)
-![Tools](https://img.shields.io/badge/tools-84-blue)
+![Version](https://img.shields.io/badge/version-1.48.0-blue)
+![Tools](https://img.shields.io/badge/tools-85-blue)
 
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
 
@@ -100,6 +100,7 @@ Once installed, Claude gets access to these tools:
 | `repair_channel_listing_images` | Push an item's CURRENT Linnworks images onto its EXISTING Shopify listing — attach what's missing, make the Linnworks main image the featured image, and detach media the item no longer has. Talks to the Shopify Admin API directly, because the GLT cannot do this (it re-pushes the template's stored, sometimes deleted, image URL and silently no-ops). Images are matched by the Linnworks GUID that Shopify preserves in the CDN filename, so it compares pictures rather than counts. Hand-uploaded media is never removed, and on a variation group (one Shopify product, per-variant Linnworks images) a sibling's photo is never mistaken for a stale one. Needs Shopify Admin credentials |
 | `delist_all_channel_listings` | Take down every listing for an item across all channels and stores at once. eBay, Etsy and Mirakl are reported as skipped and left up — they can only be ended in their own admin. Every SKU that can't be retired carries a `blocked_reason`, so a small take-down count never reads as a completed cleanup |
 | `delist_all_shopify_listings` | The Shopify-only slice of the above, for when you deliberately want just Shopify |
+| `revise_ebay_listing_description` | Revise an existing eBay listing's description — the first eBay write in this server, via eBay's own separate (non-GLT) Listings API. SKUs sharing one eBay listing (variations) dedupe to a single push. Not yet live-proven — every live-run result is reported `unconfirmed`, never `success`, and points at the description-frame URL to verify, since the eBay item page won't show a fresh push |
 
 **Reporting**
 
@@ -302,6 +303,7 @@ All write tools default to `dry_run=True` — they will describe what they would
 | `repair_channel_listing_images` | 10 listings |
 | `delist_all_channel_listings` | 10 listings |
 | `delist_all_shopify_listings` | 10 listings |
+| `revise_ebay_listing_description` | 10 listings |
 | `delete_inventory_item_images` | 10 images |
 | `delete_inventory_item` | 10 items |
 | `delete_purchase_order` | 10 POs |
