@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.47.1"
+__version__ = "1.48.0"
 
 import json
 import os
@@ -501,6 +501,7 @@ WRITE_THRESHOLDS: dict[str, int] = {
     "repair_channel_listing_images":  10,   # WRITES to live customer-facing product pages (Shopify Admin)
     "delist_all_shopify_listings":    10,   # TAKES DOWN every Shopify listing for an item — destructive
     "delist_all_channel_listings":    10,   # TAKES DOWN every GLT listing (all channels) — destructive
+    "revise_ebay_listing_description": 10,  # WRITES to a live eBay listing; push is not yet live-proven
     "delete_categories":              10,   # IRREVERSIBLE — deletes categories (non-empty → items reassigned)
     "delete_empty_categories":        10,   # IRREVERSIBLE — bulk-deletes empty categories
     "archive_inventory_items":        25,   # hides items from channels; reversible via unarchive
@@ -10461,9 +10462,18 @@ GLT_CHANNELS: dict[str, dict] = {
 }
 
 # Channels seen in this tenant's channel-SKU table that the GLT cannot touch at
-# all — no configurators, no dedicated listing-management spec in the public API.
-# They can only be ended in that channel's own admin, so "delisted everywhere" is
-# never true for them and they are always reported under `skipped_channels`.
+# all — no configurators, no GLT templates. They can only be CREATED, DELETED or
+# RELISTED in that channel's own admin, so "delisted everywhere" is never true
+# for them and they are always reported under `skipped_channels`.
+#
+# ⚠️  eBay is a partial exception (issue #43, 25 Aug 2026): it has NO GLT
+# templates (still true — GetConfiguratorsInfoPaged 400s for it, see above), but
+# it DOES have its own dedicated, non-GLT Listings/ family
+# (GeteBayConfigurators / GeteBayTemplates / ProcesseBayListings — see
+# `revise_ebay_listing_description`) that can REVISE an existing listing's
+# description. That is the one eBay write this server supports; create/end/
+# relist remain out of reach here. Mirakl/Etsy/CDiscount are unaffected by this
+# — still fully manual, not re-probed by issue #43.
 NON_GLT_SOURCES = ("EBAY", "MIRAKL MP", "ETSY", "CDISCOUNT")
 
 
@@ -10490,12 +10500,33 @@ def _proven_revise_channels() -> str:
     return ", ".join(proven) if proven else "none"
 
 
+# eBay's own (non-GLT) revise capability (issue #43) — see
+# `revise_ebay_listing_description` and the NON_GLT_SOURCES note above. Kept as
+# a registry, like GLT_CHANNELS, rather than a bare bool, so a warning message
+# can always be *derived* rather than hard-coded (the mistake this codebase has
+# already made and fixed twice for GLT_CHANNELS — see `_proven_delete_channels`).
+EBAY_CHANNELS: dict[str, dict] = {
+    "ebay": {
+        "source": "EBAY",
+        "revise_proven": False,
+    },
+}
+
+
+def _proven_ebay_revise_channels() -> str:
+    """Comma-joined list of eBay accounts whose description-revise is live-proven."""
+    proven = sorted(c["source"] for c in EBAY_CHANNELS.values() if c["revise_proven"])
+    return ", ".join(proven) if proven else "none"
+
+
 def _resolve_glt_channel(channel: str) -> dict:
     """Map a channel name ("Shopify", "amazon", "AMAZON"…) to its GLT identity.
 
     Returns {key, channel_type, channel_name, source, delete_proven}.
     Raises ValueError naming the supported channels for anything else — notably
-    eBay / Etsy / Mirakl, which are not GLT channels at all.
+    eBay / Etsy / Mirakl, which are not GLT channels at all. This is a GLT-only
+    refusal — eBay has its OWN separate revise route outside the GLT, see
+    `revise_ebay_listing_description` (issue #43).
     """
     key = _norm_conf_name(channel).replace(" ", "")
     entry = GLT_CHANNELS.get(key)
@@ -10503,8 +10534,10 @@ def _resolve_glt_channel(channel: str) -> dict:
         raise ValueError(
             f"'{channel}' is not a GLT-managed channel. Supported: "
             f"{sorted(c['channel_type'] for c in GLT_CHANNELS.values())}. "
-            f"Channels like {', '.join(NON_GLT_SOURCES)} have no GLT templates and no public "
-            "listing-management API — they must be ended in that channel's own admin."
+            f"Channels like {', '.join(NON_GLT_SOURCES)} have no GLT templates, so they cannot "
+            "be revised or deleted through this GLT machinery — they must be managed through "
+            "that channel's own admin, or (eBay only) through "
+            "revise_ebay_listing_description for description revises."
         )
     return {"key": key, **entry}
 
@@ -12980,8 +13013,11 @@ def unpublish_channel_listing(
     row carries `delete_proven` so an unproven channel is never silently assumed.
 
     ⚠️  eBay, Etsy, Mirakl and CDiscount are NOT GLT channels — they have no
-    templates and no public listing-management API, so they can only be ended in
-    that channel's own admin. Passing them raises a ValueError.
+    templates, so this tool cannot END a listing on any of them; that must be
+    done in the channel's own admin. Passing them raises a ValueError. (eBay
+    DOES have its own separate, non-GLT route for REVISING a listing's
+    description — see `revise_ebay_listing_description`, issue #43 — but that
+    is not this tool and does not change what's said here.)
 
     VARIATION GROUPS (issue #35). A variation CHILD holds the channel-SKU rows
     but no template of its own — the template lives on the variation PARENT and
@@ -13788,10 +13824,12 @@ def delist_all_channel_listings(
     (GLT ProcessTemplates Delete). It does NOT touch the base item or its stock.
 
     ⚠️  "EVERYWHERE" IS NEVER LITERALLY TRUE. eBay, Etsy, Mirakl and CDiscount are
-    not GLT channels — no templates, no public listing-management API — so their
-    listings are reported under `skipped_channels` and LEFT UP for manual take-down
-    in that channel's own admin. Same for any channel with no configurators in this
-    tenant (Magento/Walmart here).
+    not GLT channels — no templates — so this tool cannot END their listings;
+    they are reported under `skipped_channels` and LEFT UP for manual take-down
+    in that channel's own admin. Same for any channel with no configurators in
+    this tenant (Magento/Walmart here). (eBay has a separate non-GLT route for
+    REVISING a description — see `revise_ebay_listing_description` — which does
+    not help end a listing.)
 
     ⚠️  ONLY SHOPIFY DELETES ARE LIVE-PROVEN. Amazon/TikTok rows carry
     delete_proven=false — prove the Delete on ONE throwaway listing per channel
@@ -13920,8 +13958,8 @@ def delist_all_channel_listings(
                     "source": src, "sub_source": ss,
                     "channel_reference_id": r.get("ChannelReferenceId"),
                     "reason": (
-                        "not a GLT channel — no template, no public listing API; end it in the "
-                        "channel's own admin"
+                        "not a GLT channel — no template, so it cannot be ended here; end it in "
+                        "the channel's own admin"
                         if _norm_conf_name(src) in {_norm_conf_name(s) for s in NON_GLT_SOURCES}
                         else "channel not selected / not GLT-manageable in this tenant"
                     ),
@@ -14347,6 +14385,800 @@ def _set_archive_state(
             f"{verb.capitalize()} {len(ids)} item(s); {confirmed} confirmed by read-back. "
             + ("Archived SKUs no longer resolve." if archive
                else "Unarchived items now resolve as active.")
+        ),
+    }
+
+
+# ---------- eBay listing description revise (issue #43) ----------
+#
+# eBay is not a GLT channel (NON_GLT_SOURCES) — no configurator, no template,
+# refresh_channel_listing/unpublish_channel_listing both refuse it by design.
+# But Linnworks DOES expose a SEPARATE, dedicated (non-GLT) Listings/ API
+# family for eBay specifically — live-probed 25 Aug 2026:
+#
+#   GET  Listings/GeteBayConfigurators   -> every EBAY configurator, incl.
+#                                           AssociatedTemplates count (no body)
+#   POST Listings/GeteBayTemplates       -> paged EbayListing templates for
+#                                           one configurator (or by
+#                                           TemplateIds); body {"parameters":
+#                                           {...}} — see gotchas below
+#   POST Listings/ProcesseBayListings    -> push an updated EbayListing back
+#                                           (204 No Content); NOT fired live by
+#                                           this build (out of scope)
+#
+# ⚠️  GeteBayTemplates REQUIRES either a non-zero ConfigId or a non-empty
+# TemplateIds — both confirmed live (Source/SubSource alone, or an empty/zero
+# parameters object, returns HTTP 400 "Parameter 'parameters' has invalid
+# value"). `InventoryItemIds` is documented in the GetTemplatesParameters
+# schema but has NO server-side effect (confirmed live: passing a real
+# StockItemId alongside a real ConfigId returns the exact same first page as
+# omitting it). So there is NO endpoint that answers "which eBay template
+# covers SKU/listing X" directly — the only route is to sweep every EBAY
+# configurator's templates and match on ListingIds, the same situation
+# find_composite_parents (issue #31) hit for composite parents.
+#
+# ⚠️  eBay's variation shape (live-probed): ONE template = ONE eBay listing.
+# For a multi-variation listing the template's top-level SKU is a group-style
+# identifier (may not even be a real sellable SKU) and the real child SKUs
+# live in the template's Variations[] array, each with its own
+# StockItemId/SKU. ListingIds (usually one entry, the eBay item id) is on the
+# TEMPLATE — shared by every variation it covers (live-confirmed on
+# vnm-triplepads-yellowblack: adult + junior variants, one template, one
+# ListingId). This is why dedupe below is done on the CHANNEL-SKU table's
+# ChannelReferenceId, which is confirmed live to equal ListingIds[0]
+# (vnm_art_cruiser_deck: ChannelReferenceId "287277885799" ==
+# GeteBayTemplates ListingIds[0]) — the channel-SKU table already IS the
+# per-SKU -> listing-id index, for free, with no eBay-API sweep needed for
+# planning.
+#
+# ⚠️  Sub-source naming mismatch (live-confirmed, same tenant, same SKU,
+# 25 Aug 2026): the channel-SKU table's SubSource is "EBAY0" (matches the
+# Listings API's AccountId/SubsourceName), but Inventory/
+# GetInventoryItemDescriptions' EBAY row uses "EBAY0_UK" — a DIFFERENT
+# string. An exact `_effective_channel_value` match against the channel-SKU
+# store id would silently miss the real per-channel description override and
+# fall back to the (usually absent) default row every time. `store` and
+# `sub_source` are NOT interchangeable strings on this API family — matching
+# the wrong one silently resolves nothing, exactly the trap this issue named.
+# `_ebay_effective_description` below tries the exact match first (the same
+# rule used elsewhere in the server), then a case-insensitive PREFIX match —
+# the same shape as the Amazon account-prefix precedent in
+# `_resolve_glt_target`.
+#
+# ⚠️  Seller design-template preservation: across ~1,600 live templates read
+# while probing this (9 configurators with AssociatedTemplates > 0, every
+# template with a populated Description), NONE contained wrapper markers such
+# as "Check out our eBay reviews" or "Need Help Deciding?" — Description reads
+# as inner content only, byte-identical to the item's own eBay-channel
+# description row (vnm_art_cruiser_deck: identical string on both). So
+# sending ONLY the Description field — Title, Attributes, Categories, Price
+# and everything else on the template are read and carried through UNCHANGED,
+# matching the "nulls clear omitted fields" convention this codebase has hit
+# on every other Linnworks update endpoint — is believed to preserve the
+# seller's design wrapper, which appears to be applied by eBay outside of
+# anything Linnworks stores. This is NOT proven on a listing KNOWN to use a
+# visible design wrapper — verify on one before trusting a bulk run (see the
+# post-merge verification steps in CLAUDE.md).
+#
+# ⚠️  STALE-SNAPSHOT FAMILY (issue #43's own trap list, echoing v1.27.1 —
+# ProcessTemplates Update on Shopify pushed a 5-month-stale price and reverted
+# a live listing). The push here sends the FULL stored EbayListing template
+# back, Description swapped — Title/Price/Categories/Attributes/everything
+# else on it is whatever Linnworks last stored, not necessarily current. So
+# the template is now resolved (and its Title/Price shown) during PLANNING —
+# including on a dry run, not just before a live push — so a human reviewing
+# the manifest can see the stored Title/Price before confirming, and title is
+# additionally compared against the item's own current base title (free —
+# already resolved) so an obviously stale title is flagged rather than only
+# shown. Price is shown but NOT independently re-fetched against a "current"
+# value here (that would cost another read per plan row); compare the shown
+# stored_price against the live listing/Linnworks yourself before confirming
+# a batch. A cheap, single-configurator re-sweep after a live push reports
+# whether the STORED template's Description now matches what was sent — a
+# read-back of Linnworks' own record, not proof the live eBay listing changed
+# (that remains unconfirmable — see the verification-surface note above).
+#
+# ⚠️  A CHANNEL-SKU ROW PROVES A MAPPING, NOT A LIVE LISTING (issue #43's own
+# trap list, echoing v1.42.1 — TikTok rows with LastUpdate 0001-01-01 were
+# mistaken for live channel state). A non-empty EBAY channel-SKU row here
+# only means Linnworks once recorded a mapping; `LastUpdate` of the null date
+# 0001-01-01T00:00:00 (or missing) means that mapping has never been
+# confirmed by the channel. Each plan row now carries `never_synced_skus` and
+# a warning naming them — the listing may not actually be live even though it
+# resolved a listing id (see CLAUDE.md assumption #13).
+#
+# ⚠️  EBAY-SIDE REFUSAL (issue #43's own trap list). eBay can refuse or only
+# partially apply a revise on a listing with active bids, a recent sale, or
+# certain category restrictions — that comes back as a per-listing CONDITION,
+# not a transport error, so `ProcesseBayListings` still returns its ordinary
+# 204 and looks like success unless it is read explicitly. The post-push
+# read-back template already carries `Status`/`ErrorMessage`, so each live
+# result row surfaces them verbatim as `post_push_status` /
+# `post_push_error_message` rather than reading them and discarding them —
+# this tool does not interpret or block on them, it only reports them.
+EBAY_DESCRIPTION_FRAME_URL_TEMPLATE = "https://vi.vipr.ebaydesc.com/itmdesc/{item_id}"
+EBAY_NEVER_SYNCED_DATE_PREFIX = "0001-01-01"
+
+
+def _ebay_effective_description(raw_rows, store: str, default_description):
+    """
+    The eBay channel description Linnworks would use for `store`, with the
+    same fallback shape as `_effective_channel_value` — plus a prefix-match
+    fallback for the "EBAY0" vs "EBAY0_UK" sub-source naming mismatch
+    (issue #43; see the module note above). Returns (value, source) where
+    source is "channel_override" (exact match, the same rule used elsewhere),
+    "channel_override_prefix" (eBay-specific fallback), or "base".
+    """
+    value, source = _effective_channel_value(
+        raw_rows, store, "Description", channel_source="EBAY", fallback=None)
+    if value:
+        return value, source
+    store_norm = _norm_conf_name(store)
+    if store_norm:
+        for r in (raw_rows if isinstance(raw_rows, list) else []):
+            if (_norm_conf_name(r.get("Source")) == "ebay"
+                    and _norm_conf_name(r.get("SubSource")).startswith(store_norm)):
+                val = r.get("Description")
+                if val:
+                    return val, "channel_override_prefix"
+    return default_description, "base"
+
+
+def _is_never_synced_channel_sku(last_update) -> bool:
+    """
+    True when a channel-SKU row's LastUpdate is the null date (0001-01-01) —
+    or missing entirely — meaning the mapping has never been confirmed by
+    the channel (v1.42.1: TikTok rows in this exact state were mistaken for
+    live channel state). A row like this proves a MAPPING exists, not that a
+    listing is actually live. Missing/falsy is treated as never-synced too —
+    "unknown" must not read as "confirmed live".
+    """
+    if not last_update:
+        return True
+    return str(last_update).startswith(EBAY_NEVER_SYNCED_DATE_PREFIX)
+
+
+def _sweep_ebay_config_for_listing(config_id, listing_id: str) -> dict | None:
+    """Page Listings/GeteBayTemplates for ONE known ConfigId until a template
+    whose ListingIds contains `listing_id` is found, or the pages run out.
+
+    A RateLimitError (quota exhausted) is deliberately NOT caught here — it
+    PROPAGATES to the caller. This tool's heaviest quota consumer is this
+    sweep (no by-listing-id lookup exists on this API — see the module note
+    above), and folding a 429 into the same `None` this function returns for
+    a genuine "not found" is exactly the #34/#37 mistake this repo has fixed
+    twice elsewhere (assumption #12): a partial run would silently read as a
+    complete one, and a quota exhaustion would be reported as "no template
+    covers this listing" (QA round 3, issue #43). A `RuntimeError` (a real
+    400 from a bad request) still returns None — that IS a data-shaped
+    failure, not a quota one."""
+    if not config_id:
+        return None
+    page = 1
+    while True:
+        try:
+            resp = call_linnworks("Listings/GeteBayTemplates", {
+                "parameters": {
+                    "ConfigId": config_id,
+                    "PageNumber": page,
+                    "EntriesPerPage": 200,
+                    "TemplatesType": "Both",
+                }
+            })
+        except RuntimeError:
+            return None
+        items = resp.get("Items") if isinstance(resp, dict) else None
+        if not items:
+            return None
+        for it in items:
+            if listing_id in (it.get("ListingIds") or []):
+                return it
+        total = resp.get("TotalItems") or 0
+        if page * 200 >= total:
+            return None
+        page += 1
+
+
+def _find_ebay_template_for_listing(listing_id: str, config_id: str | None = None) -> dict | None:
+    """
+    Locate the eBay template serving `listing_id`.
+
+    There is no direct by-listing-id, by-SKU or by-inventory-item lookup on
+    Listings/GeteBayTemplates (see the module note above) — ConfigId or
+    TemplateIds is mandatory and InventoryItemIds is a no-op server-side.
+
+    If `config_id` is already known (e.g. re-checking a template just pushed,
+    whose ConfigId was already read), this sweeps ONLY that one configurator —
+    cheap, used for the post-push read-back. Otherwise it walks every EBAY
+    configurator that has AssociatedTemplates > 0 (from GeteBayConfigurators),
+    largest first, until a match is found. Returns the raw EbayListing dict,
+    or None if nothing covers it.
+
+    Costs are bounded by this tenant's eBay footprint (live-probed: ~1,600
+    templates across 9 populated configurators) but are NOT capped here beyond
+    that. Called during PLANNING (including on a dry run — issue #43's own
+    stale-snapshot trap requires the stored Title/Price to be shown in the
+    manifest before a write is confirmed, not just before a live push) and
+    once more, config-scoped, after a live push as a read-back. Never fired
+    live by this build (issue #43 keeps proving the push live out of scope).
+
+    Raises `RateLimitError` (does NOT catch/swallow it) when the quota is
+    exhausted, at either the configurator list or the template sweep — the
+    caller must bucket that separately from "no template found" (QA round 3).
+    A `RuntimeError` still degrades to None, same as the sweep helper.
+    """
+    if config_id:
+        return _sweep_ebay_config_for_listing(config_id, listing_id)
+    try:
+        configs = call_linnworks_get("Listings/GeteBayConfigurators")
+    except RuntimeError:
+        return None
+    if not isinstance(configs, list):
+        return None
+    populated = sorted(
+        (c for c in configs if isinstance(c, dict) and c.get("AssociatedTemplates")),
+        key=lambda c: -(c.get("AssociatedTemplates") or 0),
+    )
+    for cfg in populated:
+        found = _sweep_ebay_config_for_listing(cfg.get("pkConfigId"), listing_id)
+        if found is not None:
+            return found
+    return None
+
+
+def _ebay_template_staleness(template: dict, current_title) -> dict:
+    """
+    Surface an eBay template's STORED Title/Price and, where possible, flag
+    them as stale against the item's CURRENT value — the same stale-snapshot
+    hazard v1.27.1 hit on Shopify (ProcessTemplates Update silently pushed a
+    5-month-old price). A revise here sends the WHOLE stored template back
+    with only Description swapped, so Title/Price/etc. go live exactly as
+    stored — "whatever gets pushed must be shown", per the brief's own trap.
+
+    Title is compared against `current_title` (the item's base ItemTitle,
+    already resolved for free — no extra read). Price is shown but NOT
+    independently re-compared here (that would cost another read per plan
+    row, and a multi-variation template's top-level Price is meaningless
+    per-variant anyway) — review the shown `stored_price` yourself. Never
+    raises; a missing comparable value is reported as "not compared", never
+    silently as "matches".
+    """
+    stored_title = template.get("Title")
+    stored_price = template.get("Price")
+    out: dict = {
+        "stored_title": stored_title,
+        "stored_price": stored_price,
+        "title_stale": None,
+    }
+    if stored_title is not None and current_title is not None:
+        out["title_stale"] = str(stored_title).strip() != str(current_title).strip()
+    if out["title_stale"]:
+        out["warning"] = (
+            f"STALE SNAPSHOT — the stored template title ('{stored_title}') disagrees "
+            f"with the item's current title ('{current_title}'). Pushing this template "
+            "re-sends the STORED title/price and will overwrite the current one on the "
+            "live eBay listing (the same hazard the Shopify GLT push hit in v1.27.1) — "
+            "review stored_price above too before confirming."
+        )
+    else:
+        out["warning"] = (
+            "Title shows no detectable difference, but stored_price is NOT independently "
+            "re-checked here — review it against the live listing before confirming."
+        )
+    return out
+
+
+@mcp.tool()
+def revise_ebay_listing_description(
+    skus: list[str],
+    store: str = "EBAY0",
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Revise an EXISTING eBay listing's description to match Linnworks' current
+    eBay-channel description for the item(s) — the first eBay write capability
+    in this server (issue #43).
+
+    ⚠️  eBay is NOT a GLT channel (see NON_GLT_SOURCES) — refresh_channel_listing
+    and unpublish_channel_listing both refuse it. This tool uses a SEPARATE,
+    dedicated (non-GLT) Linnworks API family instead: Listings/GeteBayConfigurators
+    + Listings/GeteBayTemplates (read) and Listings/ProcesseBayListings (write).
+    Confirmed live 25 Aug 2026 — see CLAUDE.md's confirmed-endpoints table for
+    the exact request/response evidence. It does NOT change what
+    refresh_channel_listing/unpublish_channel_listing can do, and it cannot
+    create, end or relist a listing — revise of an EXISTING listing's
+    description only.
+
+    ⚠️  NOT LIVE-PROVEN. Listings/ProcesseBayListings has never been fired
+    against a real listing by this build (deliberately out of scope — see the
+    issue and CLAUDE.md's post-merge verification steps). A `processed`/
+    `unconfirmed` result here means Linnworks ACCEPTED the push, never that
+    the listing changed. EBAY_CHANNELS["ebay"]["revise_proven"] stays False
+    until a human runs those steps on ONE low-risk listing.
+
+    ⚠️  STALE-SNAPSHOT FAMILY (v1.27.1 echo). The push sends the FULL stored
+    eBay template back with only Description swapped — Title, Price and
+    everything else on it goes live exactly as Linnworks last stored it, not
+    necessarily as it is now. So every plan row resolves the template (even
+    on a dry run) and shows `staleness.stored_title` / `staleness.stored_price`
+    plus a `title_stale` flag (title compared against the item's own current
+    title for free; price is shown but not independently re-fetched) —
+    "whatever gets pushed must be shown in the manifest", per the trap this
+    issue itself names. A live push also re-checks the template afterwards
+    (`post_push_description_matches` in each result row) — a read-back of
+    Linnworks' own stored record, not proof the live eBay listing changed.
+
+    ⚠️  EBAY-SIDE REFUSAL. eBay can refuse or only partially apply a revise —
+    active bids, a recent sale, or certain category restrictions all come back
+    as a per-listing CONDITION, not a transport error, so `ProcesseBayListings`
+    still returns its ordinary 204 and this tool still reports `unconfirmed`.
+    The post-push read-back template's `Status`/`ErrorMessage` fields are the
+    only place that condition is visible to us, so each result row carries
+    them verbatim as `post_push_status` / `post_push_error_message` (None when
+    the read-back itself failed) — read them before treating an `unconfirmed`
+    row as good news; this tool does NOT interpret them or block on them.
+
+    ⚠️  A CHANNEL-SKU ROW PROVES A MAPPING, NOT A LIVE LISTING. Judging "is it
+    listed" from a non-empty channel-SKU row alone repeats the v1.42.1 TikTok
+    incident (rows with LastUpdate 0001-01-01 mistaken for live channel
+    state). Each plan row carries `never_synced_skus` — covered SKUs whose
+    eBay channel-SKU row has a null/missing LastUpdate, i.e. this mapping has
+    never been confirmed by the channel — with a `never_synced_warning` when
+    non-empty. These SKUs are still planned (not auto-blocked), because a
+    never-synced mapping is a caution for review, not proof the listing is
+    dead.
+
+    ⚠️  VERIFICATION SURFACE. Do NOT judge success from the eBay item page —
+    the description sits in a cross-origin frame there and a fresh push can
+    render as unchanged even when it landed. Check the description-frame URL
+    directly (https://vi.vipr.ebaydesc.com/itmdesc/<item_id> — see
+    EBAY_DESCRIPTION_FRAME_URL_TEMPLATE), which serves the description content
+    on its own.
+
+    ⚠️  MULTI-VARIATION LISTINGS. One eBay item id can cover many Linnworks
+    SKUs (eBay variations). SKUs are deduped to ONE plan row per eBay listing
+    id (the channel-SKU table's ChannelReferenceId) — a naive per-SKU loop
+    would revise the SAME listing once per covered SKU, burning revise quota
+    and making any failure impossible to attribute to one push.
+
+    ⚠️  SELLER DESIGN TEMPLATE. eBay listings can render with a seller-defined
+    wrapper (headers/footers, "Check out our eBay reviews", etc.) around the
+    description. This tool ONLY ever sets the Description field of the
+    existing eBay template — Title, Attributes, Categories, Price and
+    everything else on the template are read and carried through UNCHANGED
+    (the ProcesseBayListings payload is the full existing EbayListing object
+    with only Description replaced), matching the "nulls clear omitted
+    fields" convention this codebase has hit on every other Linnworks update
+    endpoint. Live evidence (this build, 25 Aug 2026): across ~1,600 real
+    eBay templates read while building this tool, Description consistently
+    held plain inner content, byte-identical to the item's own eBay-channel
+    description row, with NO wrapper markers found in any of them —
+    supporting that Description is inner-content-only and that this risk is
+    structural (Linnworks never stores the wrapper), not something this tool
+    could accidentally strip. This has NOT been checked against a listing
+    known to use a visible design wrapper — verify on one before trusting a
+    bulk run.
+
+    Flow per SKU (read-before-write):
+      1. Resolve SKU -> StockItemId (Inventory/GetInventoryItem).
+      2. Read the channel-SKU link table (BatchGetInventoryItemChannelSKUs)
+         and keep only rows whose Source is EBAY and whose SubSource matches
+         `store` case-insensitively. No match -> not_listed.
+      3. Group matched SKUs by ChannelReferenceId (the eBay item id) — this
+         is the listing-id dedupe. One plan row per listing; covers_skus
+         lists every SKU it serves.
+      4. For each plan row, resolve the description to push: the item's own
+         eBay-channel description row for `store` (Inventory/
+         GetInventoryItemDescriptions, EBAY source), falling back to the
+         item's default (blank Source/SubSource) description row via the
+         same effective-value rule refresh_channel_listing's staleness check
+         uses (_effective_channel_value), plus an eBay-specific prefix-match
+         fallback for the "EBAY0" vs "EBAY0_UK" sub-source naming mismatch
+         (live-confirmed same tenant, same SKU — see CLAUDE.md). No usable
+         description on any covered SKU -> the row is `blocked` with a named
+         reason, and NOTHING is pushed with empty/default content.
+      5. For each UNBLOCKED plan row (dry run included — see the
+         stale-snapshot note above), locate the eBay template serving that
+         listing id by sweeping GeteBayConfigurators + GeteBayTemplates (no
+         direct lookup exists — see the module note above
+         _find_ebay_template_for_listing) and record its stored Title/Price
+         (`staleness`) plus whether the title looks stale. The found template
+         is cached for the rest of this call, so a live run right after does
+         NOT re-sweep for it. This sweep is the tool's heaviest quota
+         consumer; a RateLimitError here is NEVER folded into "not found" —
+         the row is bucketed into `rate_limited` (flipping `complete` false)
+         and blocked with reason "rate_limited_locating_template". A genuine
+         "no template covers this listing" (no quota issue) ALSO marks the
+         row `blocked` (reason "could not locate the eBay template serving
+         this listing id"), so the dry-run pushable count never promises a
+         push the live run would then refuse (QA round 3).
+      6. (live run only) Blocked rows (incl. both flavours above) never
+         reach Listings/ProcesseBayListings. Found -> push the full template
+         object with only Description replaced via Listings/
+         ProcesseBayListings, then re-check (config-scoped, cheap) whether
+         the template's Description now matches what was sent
+         (`post_push_description_matches`), and carry that same read-back's
+         `Status`/`ErrorMessage` through verbatim (`post_push_status` /
+         `post_push_error_message`) — eBay's own per-listing refusal (active
+         bids, a recent sale, category restrictions) surfaces there, not as a
+         call failure. A RateLimitError on THIS read-back is also bucketed
+         into `rate_limited` (`post_push_read_back_rate_limited: True`)
+         rather than silently reading as "read back found nothing".
+      7. Every live-run row that reached a push is reported `unconfirmed`
+         (never `success`) — a 204/accepted response is not evidence the
+         listing actually changed. A row blocked purely by a locate-time
+         quota failure is reported `rate_limited`, not `blocked`.
+
+    Staging: threshold 10 (the destructive tier shared with
+    unpublish_channel_listing / delist_all_channel_listings — this writes to
+    a live, customer-facing, NOT-yet-proven channel). For batches over that
+    this returns the plan + manifest and asks for confirmed_count=<N> before
+    executing.
+
+    Args:
+        skus: Exact SKUs / ItemNumbers whose eBay listing description to
+            revise.
+        store: eBay account/store identifier, matched case-insensitively
+            against the channel-SKU table's SubSource. Default "EBAY0" (this
+            tenant's only eBay account, confirmed live via
+            Listings/GetAllEbayConfigurators 25 Aug 2026 — see CLAUDE.md).
+        confirmed_count: For batches over the threshold, pass len(skus) after
+            reviewing the plan to confirm the write.
+        dry_run: If True (default), returns the plan without pushing
+            anything. A dry run makes ZERO calls to
+            Listings/ProcesseBayListings (no write). It DOES sweep
+            GeteBayConfigurators/GeteBayTemplates for each unblocked plan row
+            to preview the stored Title/Price (the stale-snapshot check) —
+            that's a read, not a write, and it's what lets the manifest show
+            what would actually be pushed.
+
+    Returns:
+        A dict with:
+          - dry_run, sku_count, store, revise_proven, verification_note
+          - plan: one row per eBay listing id — listing_id, covers_skus,
+            description (the value that would be/was pushed),
+            description_source (channel_override / channel_override_prefix /
+            base), blocked (bool), blocked_reason (when blocked — includes
+            "rate_limited_locating_template" when the template sweep hit the
+            Linnworks quota, and "could not locate the eBay template serving
+            this listing id" when it genuinely found nothing; both mark
+            `blocked: True` so a dry run never counts an unpushable row as
+            pushable), never_synced_skus (covered SKUs whose channel-SKU row
+            has never synced — see the trap note above), never_synced_warning
+            (when non-empty), template_found (bool|None — None when blocked
+            before resolution was attempted, or when the sweep hit a quota
+            failure), staleness (stored_title / stored_price / title_stale /
+            warning — None if the template could not be located), revise_proven
+            (from EBAY_CHANNELS — derived per row, not hard-coded, same as the
+            top-level flag)
+          - not_listed: SKUs with no matching eBay channel-SKU row for `store`
+          - unresolved: SKUs that failed to resolve
+          - rate_limited: SKUs/reads/listings that hit the Linnworks quota — a
+            429 here is NEVER folded into not_listed, unresolved, or reported
+            as "template not found"; covers SKU resolution, the channel-SKU
+            read, the description read, the template-locate sweep, and the
+            post-push read-back
+          - complete: False whenever anything landed in rate_limited
+          - results: per-row outcome (live run only) — each row's outcome is
+            one of `unconfirmed`, `blocked`, `push_failed`, `rate_limited`
+            (the last one reserved for a locate-time quota failure, so it is
+            never confused with an ordinary block); never `success`; an
+            `unconfirmed` row also carries `post_push_description_matches`
+            (bool|None), `post_push_read_back_rate_limited` (bool — True when
+            the post-push re-check itself hit the quota, so a None match
+            isn't mistaken for "read back found nothing"), `post_push_status`
+            and `post_push_error_message` (both from the read-back template
+            verbatim, None if the read-back failed) — eBay's own per-listing
+            refusal (active bids, a recent sale, category restrictions) shows
+            up here, not as an exception, and this tool does not act on it
+          - message
+    """
+    if not skus:
+        raise ValueError("skus must contain at least one SKU.")
+    _check_injection("store", store or "")
+
+    resolved, titles, unresolved, rate_limited = _resolve_bulk_inputs(skus, None)
+
+    not_listed: list[dict] = []
+    planned_skus: list[dict] = []   # {sku, sid, listing_id, last_update}
+
+    channel_rows_by_sid: dict[str, list] = {}
+    if resolved:
+        sid_list = [sid for _sku, sid in resolved]
+        try:
+            channel_rows_by_sid = _fetch_channel_skus_for_ids(sid_list)
+        except RateLimitError as exc:
+            for sku, _sid in resolved:
+                rate_limited.append({"sku": sku, "error": str(exc)})
+            resolved = []
+        except RuntimeError as exc:
+            for sku, _sid in resolved:
+                unresolved.append({"sku": sku, "error": f"channel-SKU read failed: {exc}"})
+            resolved = []
+
+    for sku, sid in resolved:
+        rows = channel_rows_by_sid.get(sid.lower(), [])
+        ebay_rows = [
+            r for r in rows
+            if _norm_conf_name(r.get("Source")) == "ebay"
+            and _norm_conf_name(r.get("SubSource")) == _norm_conf_name(store)
+        ]
+        if not ebay_rows:
+            not_listed.append({
+                "sku": sku, "stock_item_id": sid,
+                "reason": f"no eBay channel-SKU row for store '{store}'",
+            })
+            continue
+        listing_id = ebay_rows[0].get("ChannelReferenceId")
+        if not listing_id:
+            not_listed.append({
+                "sku": sku, "stock_item_id": sid,
+                "reason": "eBay channel-SKU row has no ChannelReferenceId (listing id)",
+            })
+            continue
+        planned_skus.append({
+            "sku": sku, "sid": sid, "listing_id": listing_id,
+            "last_update": ebay_rows[0].get("LastUpdate"),
+        })
+
+    # ── Group by listing id (the dedupe) and resolve each row's description ──
+    by_listing: dict[str, dict] = {}
+    for row in planned_skus:
+        entry = by_listing.setdefault(row["listing_id"], {
+            "listing_id": row["listing_id"], "covers_skus": [], "sids": [],
+            "never_synced_skus": [],
+        })
+        entry["covers_skus"].append(row["sku"])
+        entry["sids"].append(row["sid"])
+        if _is_never_synced_channel_sku(row["last_update"]):
+            entry["never_synced_skus"].append(row["sku"])
+
+    template_by_listing: dict[str, dict | None] = {}
+
+    plan: list[dict] = []
+    for listing_id, entry in by_listing.items():
+        description = None
+        description_source = None
+        blocked = False
+        blocked_reason = None
+        mismatched: list[str] = []
+        for sku, sid in zip(entry["covers_skus"], entry["sids"]):
+            try:
+                raw_desc_rows = call_linnworks_get(
+                    "Inventory/GetInventoryItemDescriptions", {"inventoryItemId": sid})
+            except RateLimitError as exc:
+                rate_limited.append({"sku": sku, "error": str(exc)})
+                blocked = True
+                blocked_reason = "rate_limited_reading_description"
+                continue
+            except RuntimeError as exc:
+                blocked = True
+                blocked_reason = f"description read failed: {exc}"
+                continue
+            default_desc = next(
+                (r.get("Description") for r in raw_desc_rows
+                 if isinstance(raw_desc_rows, list) and not r.get("Source")
+                 and not r.get("SubSource")),
+                None,
+            )
+            sku_desc, sku_desc_source = _ebay_effective_description(
+                raw_desc_rows, store, default_desc)
+            if not sku_desc or not str(sku_desc).strip():
+                blocked = True
+                blocked_reason = blocked_reason or f"no usable description for SKU '{sku}'"
+                continue
+            if description is None:
+                description, description_source = sku_desc, sku_desc_source
+            elif sku_desc != description:
+                mismatched.append(sku)
+
+        if description is None and not blocked:
+            blocked = True
+            blocked_reason = "no usable description found for any covered SKU"
+
+        row_out = {
+            "listing_id": listing_id,
+            "covers_skus": entry["covers_skus"],
+            "description": description,
+            "description_source": description_source,
+            "blocked": blocked,
+            "blocked_reason": blocked_reason,
+            "never_synced_skus": entry["never_synced_skus"],
+            "revise_proven": EBAY_CHANNELS["ebay"]["revise_proven"],
+        }
+        if entry["never_synced_skus"]:
+            row_out["never_synced_warning"] = (
+                f"{len(entry['never_synced_skus'])} covered SKU(s) "
+                f"({', '.join(entry['never_synced_skus'])}) have an eBay channel-SKU "
+                "LastUpdate of 0001-01-01 (or missing) — this mapping has never been "
+                "confirmed by the channel, so the listing may not actually be live even "
+                "though it resolved a listing id (see CLAUDE.md assumption #13)."
+            )
+        if mismatched:
+            row_out["description_mismatch_skus"] = mismatched
+            row_out["warning"] = (
+                "Covered SKUs disagree on eBay description content — pushing the first "
+                "resolved SKU's value; review before a live run."
+            )
+
+        # ── Stale-snapshot preview: resolve the template even on a dry run,
+        # so whatever would actually be pushed (Title/Price on the stored
+        # template) is visible in the manifest, not just discovered on a
+        # live push. Cached here so a live run right after doesn't re-sweep.
+        #
+        # A RateLimitError here (QA round 3, issue #43) must NOT be folded
+        # into "template not found" — that is the same #34/#37 quota mistake
+        # already fixed twice elsewhere. This sweep is the tool's heaviest
+        # quota consumer (no direct by-listing-id lookup exists — see the
+        # module note above), and it now runs on every unblocked row of
+        # every call, dry run included. A quota failure here is bucketed
+        # into rate_limited (which flips `complete` false) and the row is
+        # BLOCKED with a distinct reason — never reported as "not found".
+        if not blocked:
+            try:
+                template = _find_ebay_template_for_listing(listing_id)
+            except RateLimitError as exc:
+                rate_limited.append({
+                    "listing_id": listing_id, "skus": entry["covers_skus"],
+                    "error": str(exc),
+                })
+                template = None
+                template_by_listing[listing_id] = None
+                blocked = True
+                blocked_reason = "rate_limited_locating_template"
+                row_out["blocked"] = True
+                row_out["blocked_reason"] = blocked_reason
+                row_out["template_found"] = None
+                row_out["staleness"] = None
+            else:
+                template_by_listing[listing_id] = template
+                row_out["template_found"] = template is not None
+                if template is not None:
+                    first_sid = entry["sids"][0]
+                    current_title = titles.get(first_sid.lower())
+                    row_out["staleness"] = _ebay_template_staleness(template, current_title)
+                else:
+                    row_out["staleness"] = None
+                    row_out["stale_snapshot_warning"] = (
+                        "Could not locate the eBay template for this listing — stored "
+                        "Title/Price cannot be previewed."
+                    )
+                    # A row whose template can't be located can never actually
+                    # be pushed (the live loop below refuses it) — reflect
+                    # that in `blocked` here too, so the dry-run "N would be
+                    # revised" count doesn't promise a push the live run will
+                    # then refuse (QA round 3's related finding).
+                    blocked = True
+                    blocked_reason = "could not locate the eBay template serving this listing id"
+                    row_out["blocked"] = True
+                    row_out["blocked_reason"] = blocked_reason
+        else:
+            row_out["template_found"] = None
+            row_out["staleness"] = None
+
+        plan.append(row_out)
+
+    verification_note = (
+        "An 'unconfirmed' result is NOT evidence the listing changed — Linnworks' 204 "
+        "response only means the push was ACCEPTED. Verify on the description-frame URL "
+        f"({EBAY_DESCRIPTION_FRAME_URL_TEMPLATE.format(item_id='<item_id>')}), never the item "
+        "page — the description sits in a cross-origin frame there and can report stale/old "
+        f"text even when the new description is already live. Proven eBay accounts: "
+        f"{_proven_ebay_revise_channels()}."
+    )
+
+    base_out = {
+        "sku_count": len(skus),
+        "store": store,
+        "revise_proven": EBAY_CHANNELS["ebay"]["revise_proven"],
+        "verification_note": verification_note,
+        "plan": plan,
+        "not_listed": not_listed,
+        "unresolved": unresolved,
+        "rate_limited": rate_limited,
+        "complete": not rate_limited,
+    }
+
+    guard = _write_guard("revise_ebay_listing_description", skus, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, **base_out}
+
+    pushable = [r for r in plan if not r["blocked"]]
+
+    if dry_run:
+        return {
+            "dry_run": True, **base_out,
+            "message": (
+                f"{len(pushable)} listing(s) would be revised, {len(plan) - len(pushable)} "
+                f"blocked, {len(not_listed)} not listed on '{store}', {len(unresolved)} "
+                f"unresolved, {len(rate_limited)} rate-limited. No write calls were made."
+            ),
+        }
+
+    # ── Live run ──────────────────────────────────────────────────────────
+    results: list[dict] = []
+    for row in plan:
+        if row["blocked"]:
+            # A quota failure while locating the template is a distinct
+            # outcome from an ordinary block (QA round 3) — never "blocked",
+            # which this criterion treats the same as a data-shaped failure.
+            outcome = (
+                "rate_limited" if row.get("blocked_reason") == "rate_limited_locating_template"
+                else "blocked"
+            )
+            results.append({**row, "outcome": outcome})
+            continue
+        # Reuse the template resolved during planning above — it was already
+        # swept for (dry run or not), so this never sweeps twice in one call.
+        template = template_by_listing.get(row["listing_id"])
+        if template is None:
+            results.append({
+                **row, "outcome": "blocked",
+                "error": "could not locate the eBay template serving this listing id",
+            })
+            continue
+        payload = dict(template)
+        payload["Description"] = row["description"]
+        try:
+            call_linnworks_void("Listings/ProcesseBayListings", {
+                "items": [payload], "force": True, "action": "Update",
+            })
+        except RateLimitError as exc:
+            rate_limited.append({"listing_id": row["listing_id"], "error": str(exc)})
+            results.append({**row, "outcome": "rate_limited", "error": str(exc)})
+            continue
+        except RuntimeError as exc:
+            results.append({**row, "outcome": "push_failed", "error": str(exc)})
+            continue
+        # Read-back: re-fetch (cheap, config-scoped) the STORED template and
+        # confirm it now shows the Description we sent. This confirms
+        # Linnworks' own record, NOT that the live eBay listing changed (see
+        # the verification-surface warning above) — the closest thing to a
+        # read-back this API allows.
+        #
+        # A quota failure here (QA round 3) must not be silently
+        # indistinguishable from a clean read-back that simply found nothing
+        # — it is bucketed into rate_limited (flipping `complete` false) and
+        # flagged on the row, rather than folded into the ordinary
+        # post_push_description_matches: None case.
+        try:
+            fresh = _find_ebay_template_for_listing(
+                row["listing_id"], config_id=template.get("ConfigId"))
+            post_push_read_back_rate_limited = False
+        except RateLimitError as exc:
+            rate_limited.append({"listing_id": row["listing_id"], "error": str(exc)})
+            fresh = None
+            post_push_read_back_rate_limited = True
+        post_push_match = (
+            fresh.get("Description") == row["description"]
+            if isinstance(fresh, dict) else None
+        )
+        # eBay can refuse or partially apply a revise (active bids, recent
+        # sales, category restrictions) — a per-listing CONDITION, not a
+        # transport error, so it never raises and a bodyless 204 can't carry
+        # it either. The re-read template is the only place this signal is
+        # visible to us; surface it rather than reading it and discarding it.
+        post_push_status = fresh.get("Status") if isinstance(fresh, dict) else None
+        post_push_error_message = (
+            fresh.get("ErrorMessage") if isinstance(fresh, dict) else None
+        )
+        results.append({
+            **row, "outcome": "unconfirmed",
+            "post_push_description_matches": post_push_match,
+            "post_push_status": post_push_status,
+            "post_push_error_message": post_push_error_message,
+            "post_push_read_back_rate_limited": post_push_read_back_rate_limited,
+        })
+
+    base_out["rate_limited"] = rate_limited
+    base_out["complete"] = not rate_limited
+    unconfirmed_count = sum(1 for r in results if r["outcome"] == "unconfirmed")
+    return {
+        "dry_run": False, **base_out, "results": results,
+        "message": (
+            f"{unconfirmed_count} push(es) accepted (unconfirmed — acceptance is not "
+            "evidence of change). " + verification_note
         ),
     }
 
