@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.48.1"
+__version__ = "1.48.2"
 
 import json
 import os
@@ -10421,24 +10421,51 @@ _ZERO_GUID = "00000000-0000-0000-0000-000000000000"
 # "… - Spain", "… - Netherlands", "… - Sweden". So a regional sub_source has NO
 # configurator of its own and must resolve to the account's ChannelId — see
 # _resolve_glt_target()'s account-prefix fallback.
+# "revise_attempted" (issue #45) is the tri-state companion to "revise_proven":
+# a channel can be (a) never attempted (revise_attempted=False, revise_proven=
+# False — TikTok/Magento/Walmart), (b) attempted live and shown ineffective
+# (revise_attempted=True, revise_proven=False — Amazon, see below), or
+# (c) attempted and proven (revise_attempted=True, revise_proven=True —
+# Shopify). Without this field "not proven" reads as "untried", which was
+# false for Amazon after 24-25 Aug 2026 and made the tool's own warnings less
+# accurate than the evidence already sitting in CLAUDE.md.
 GLT_CHANNELS: dict[str, dict] = {
     "shopify": {"channel_type": "Shopify", "channel_name": "SHOPIFY", "source": "SHOPIFY",
-                "delete_proven": True, "revise_proven": True},
+                "delete_proven": True, "revise_proven": True, "revise_attempted": True},
     # Amazon Delete LIVE-PROVEN 5 Aug 2026 on MOB-GRP-3080 (template 31703, ASIN
     # B0B311TFG3): ProcessTemplates Delete → 2xx, the AMAZON channel-SKU row and
     # the template both disappeared, eBay/Shopify rows and stock untouched. NB it
     # succeeded even though the template read NextSuggestedAction:"NotAllowed" —
     # that flag describes the SUGGESTED action, it does not gate a forced Delete.
-    # Revise/Update (refresh_channel_listing) is NOT proven on Amazon (issue #42)
-    # — only the Delete action has been fired live here. Amazon carries hundreds
-    # of templates of unknown age and no API route rebuilds a stale one (#27), so
-    # a well-intentioned bulk refresh could silently revert live content the same
-    # way the Shopify catnip push did (v1.27.1). Prove it on ONE low-risk listing
-    # (template freshness checked first, read-back on listing data, not the
-    # detail page — Amazon's can lag the catalogue by up to a day) before flipping
-    # this flag.
+    # ⚠️  Revise/Update (refresh_channel_listing) has been FIRED LIVE ON AMAZON
+    # TWICE (issue #45, 24-25 Aug 2026) and is NOT merely untried — it is TRIED
+    # AND SHOWN INEFFECTIVE:
+    #  • vnm_bushings_con_80a.FBA (template 32064, 24 Aug ~20:10Z) — title push;
+    #    the observable itself turned out invalid (a variation child's displayed
+    #    title is parent/contribution-driven, so it can't prove a revise either
+    #    way) but the push was accepted (processed:true) and polled unchanged
+    #    for 12h regardless.
+    #  • vnm_artdeck_8.0 (template 32239, ASIN B08QW9NJ2Y, 25 Aug ~08:12Z) — a
+    #    price push on an MFN standalone listing, a seller-feed-controlled field
+    #    immune to the variation/contribution merging that invalidated the first
+    #    proof. ProcessTemplates accepted it (processed:true) and the offer price
+    #    NEVER MOVED off its pre-push value across an hour of 3-minute polling.
+    #  No Linnworks-side error surfaced on any readable surface (template status
+    #  stayed "Listed", LastModificationTime didn't advance — no rebuild), and
+    #  Seller Central carries no feed log for either push (Linnworks submits
+    #  under its own SP-API app). See CLAUDE.md's v1.47.1 entry and issue #45 for
+    #  the full write-up. `revise_proven` stays False — accepted-with-no-effect
+    #  is not proof of a working route, and flipping it would need a push that
+    #  demonstrably DID land. The still-open question is whether the defect is
+    #  in this tool's API call or in Linnworks' own Amazon integration; that
+    #  needs a manual GLT-UI revise on the same listing and/or a Linnworks
+    #  support ticket, both external to this repo (see the issue's post-merge
+    #  verification steps). Amazon also still carries hundreds of templates of
+    #  unknown age with no API route to rebuild a stale one (#27) — if the route
+    #  is ever fixed, the same bulk call would revert live content the way the
+    #  Shopify catnip push did (v1.27.1); the current inertness is not safety.
     "amazon":  {"channel_type": "Amazon",  "channel_name": "AMAZON",  "source": "AMAZON",
-                "delete_proven": True, "revise_proven": False},
+                "delete_proven": True, "revise_proven": False, "revise_attempted": True},
     # TikTok Delete LIVE-PROVEN 7 Aug 2026 on ven-20-black-raw-core-complete-7.5
     # (template 30006, configurator 112, listing 1729486505080953421): the TIKTOK
     # channel-SKU row vanished, OpenTemplatesByInventory on ChannelId 30 went 1 → 0,
@@ -10451,14 +10478,15 @@ GLT_CHANNELS: dict[str, dict] = {
     #    (#26) — so a TikTok child usually needs no whole-group gate at all. The
     #    gate still fires correctly for the children that genuinely have no
     #    template (live-confirmed on vnm-triplepads-yellowblack-jnr).
-    # Revise/Update is NOT proven on TikTok either (issue #42) — same caution as
-    # Amazon applies.
+    # Revise/Update has NEVER been attempted live on TikTok (issue #45 tried
+    # Amazon only) — genuinely untried, not merely unproven; do not conflate
+    # with Amazon's tried-and-ineffective state above.
     "tiktok":  {"channel_type": "TikTok",  "channel_name": "TIKTOK",  "source": "TIKTOK",
-                "delete_proven": True, "revise_proven": False},
+                "delete_proven": True, "revise_proven": False, "revise_attempted": False},
     "magento": {"channel_type": "Magento", "channel_name": "MAGENTO", "source": "MAGENTO",
-                "delete_proven": False, "revise_proven": False},
+                "delete_proven": False, "revise_proven": False, "revise_attempted": False},
     "walmart": {"channel_type": "Walmart", "channel_name": "WALMART", "source": "WALMART",
-                "delete_proven": False, "revise_proven": False},
+                "delete_proven": False, "revise_proven": False, "revise_attempted": False},
 }
 
 # Channels seen in this tenant's channel-SKU table that the GLT cannot touch at
@@ -12319,13 +12347,18 @@ def refresh_channel_listing(
     CDiscount) raises a clear ValueError naming the channels that ARE supported
     instead of silently doing nothing.
 
-    ⚠️  REVISE IS NOT LIVE-PROVEN ON AMAZON OR TIKTOK. `ProcessTemplates`
-    Revise/Update is live-proven on SHOPIFY only (v1.27.1, 14 Jul 2026) — only
-    the Delete action has been fired live on Amazon/TikTok
-    (`unpublish_channel_listing`). Each plan row and the response carry
-    `revise_proven` from the registry, and an unproven channel is warned about
-    in every message — see `channel` below for what the eventual single-listing
-    live proof needs to check.
+    ⚠️  `ProcessTemplates` Revise/Update is live-proven on SHOPIFY only
+    (v1.27.1, 14 Jul 2026). On AMAZON it has been FIRED LIVE TWICE and
+    PRODUCED NO OBSERVABLE CHANGE on either listing (issue #45, 24-25 Aug
+    2026, templates 32064 + 32239) — tried and shown ineffective, not merely
+    untried (see `GLT_CHANNELS["amazon"]["revise_attempted"]`). On TIKTOK it
+    has never been attempted live at all — only the Delete action has been
+    fired live there (`unpublish_channel_listing`). Each plan row and the
+    response carry `revise_proven` (proof) and the registry also carries
+    `revise_attempted` (whether a live push was ever tried) — an unproven
+    channel is warned about in every message, worded differently depending on
+    which state it's in — see `channel` below for what the eventual
+    single-listing live proof needs to check.
 
     This is the revise counterpart to `list_to_shopify`: that tool CREATES new
     listings; this one REVISES listings that already exist. It never creates a
@@ -12429,14 +12462,16 @@ def refresh_channel_listing(
         channel: GLT channel — "Shopify" (default), "Amazon", "TikTok",
             "Magento", "Walmart". A non-GLT channel (eBay, Etsy, Mirakl,
             CDiscount) raises a ValueError naming the supported channels.
-            ⚠️ Whether an Amazon variation family's template hangs off the
-            parent (Shopify's shape) or off each child (TikTok's shape) is
-            unestablished — nothing in this repo has observed it either way.
-            The child→parent fallback described above (issue #26) runs
-            unchanged regardless of channel, so on an Amazon variation SKU it
-            could open the correct parent template, the wrong one, or none at
-            all. Treat any Amazon variation result as unverified until the
-            single-listing live proof settles this.
+            ⚠️ ONE Amazon variation family has been observed live (bushings,
+            issue #45, 25 Aug 2026): every child SKU resolved its OWN template
+            directly (TikTok's shape, not Shopify's) — the child→parent
+            fallback never fired. That is one observation, not a rule — other
+            Amazon variation families may still hang off the parent, the same
+            as Shopify. The child→parent fallback described above (issue #26)
+            runs unchanged regardless of channel, so on an unobserved Amazon
+            variation SKU it could still open the correct parent template, the
+            wrong one, or none at all. Treat any Amazon variation result as
+            unverified until more families are observed.
         action: Optional GLT action override (e.g. "Revise", "Update"). Default
             None = auto (use the template's NextSuggestedAction, else "Revise").
         check_staleness: If True (default), compare each template's stored
@@ -12837,16 +12872,30 @@ def refresh_channel_listing(
     # side of this made exactly this mistake once already (see
     # _proven_delete_channels's docstring): a hard-coded "Shopify only" string
     # would still say that after Amazon or TikTok gets proven.
-    unproven_note = (
-        ""
-        if ch["revise_proven"]
-        else (
-            f" ⚠️  ProcessTemplates Revise/Update is NOT yet live-proven on {ch['channel_type']} "
-            f"(proven: {_proven_revise_channels()}) — prove it on ONE low-risk listing (check the "
-            "template's freshness first, then read the listing DATA back, not the detail page) "
-            "before trusting a bulk run on this channel."
+    #
+    # Two distinct unproven states (issue #45): "never attempted" (TikTok/
+    # Magento/Walmart — genuinely untried) and "attempted, no observable
+    # effect" (Amazon — tried live twice and shown ineffective). Collapsing
+    # both into one "not yet live-proven" message understated what is already
+    # known about Amazon, so the wording is derived from `revise_attempted`
+    # on the registry rather than hard-coded to either state.
+    if ch["revise_proven"]:
+        unproven_note = ""
+    elif ch.get("revise_attempted"):
+        unproven_note = (
+            f" ⚠️  ProcessTemplates Revise/Update has been fired live on {ch['channel_type']} "
+            "and produced no observable change on either listing it was tried against "
+            f"(issue #45) — this channel is TRIED AND SHOWN INEFFECTIVE, not merely untried "
+            f"(proven: {_proven_revise_channels()}). Do not trust a bulk push here without "
+            "independently reading the listing data back afterwards."
         )
-    )
+    else:
+        unproven_note = (
+            f" ⚠️  ProcessTemplates Revise/Update has NEVER been attempted live on "
+            f"{ch['channel_type']} (proven: {_proven_revise_channels()}) — prove it on ONE "
+            "low-risk listing (check the template's freshness first, then read the listing "
+            "DATA back, not the detail page) before trusting a bulk run on this channel."
+        )
 
     if dry_run:
         return {

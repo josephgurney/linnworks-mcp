@@ -324,10 +324,15 @@ class TestUnprovenChannelWarning:
         assert server._proven_revise_channels() == "Shopify"
 
     def test_amazon_dry_run_warns_unproven_and_names_registry_channels(self):
+        # Deliberately updated for issue #45: Amazon has now been fired live
+        # twice with no observable effect, so the old "NOT yet live-proven"
+        # wording (which reads as "untried") is no longer accurate and the
+        # tool must say so instead — see TestAmazonTriedAndIneffective below.
         out, _ = _run([SKU_AMZ], sub_source="The Warehouse Group", channel="Amazon",
                       check_staleness=False)
         assert out["revise_proven"] is False
-        assert "NOT yet live-proven on Amazon" in out["message"]
+        assert "fired live on Amazon" in out["message"]
+        assert "no observable change" in out["message"]
         assert "Shopify" in out["message"]
 
     def test_shopify_dry_run_carries_no_unproven_warning(self):
@@ -337,10 +342,12 @@ class TestUnprovenChannelWarning:
         assert "NOT yet live-proven" not in out["message"]
 
     def test_live_run_message_also_carries_the_unproven_warning(self):
+        # Deliberately updated for issue #45, same reason as above.
         h = _Harness()
         out, _ = _run([SKU_AMZ], harness=h, sub_source="The Warehouse Group",
                       channel="Amazon", check_staleness=False, dry_run=False)
-        assert "NOT yet live-proven on Amazon" in out["message"]
+        assert "fired live on Amazon" in out["message"]
+        assert "no observable change" in out["message"]
 
 
 # ── AC8: dry_run defaults True, and a dry run never pushes ──────────────────
@@ -368,3 +375,160 @@ class TestLiveRunReadbackMessage:
         assert "read the listing data back" in msg
         assert "detail page" in msg
         assert "lag the catalogue by up to a day" in msg
+
+
+# ── Issue #45 — Amazon revise: accepted, no observable effect (two live proofs) ──
+#
+# Two live revise pushes were fired against Amazon (24-25 Aug 2026, templates
+# 32064 + 32239) and were accepted (processed:true) but produced no observable
+# change on either listing. Amazon's registry entry and the tool's own warnings
+# must therefore read "tried and shown ineffective", not "untried" — that is a
+# meaningfully different, more accurate claim than the old "not yet
+# live-proven" wording, which collapsed the two states into one.
+
+class TestAmazonRegistryRecordsAttemptedNoEffect:
+    """AC1: the Amazon entry carries a machine-readable attempted/no-effect
+    record and revise_proven stays False."""
+
+    def test_amazon_entry_is_attempted_but_not_proven(self):
+        entry = server.GLT_CHANNELS["amazon"]
+        assert entry["revise_attempted"] is True
+        assert entry["revise_proven"] is False
+
+
+class TestTikTokRegistryStillReadsAsNeverAttempted:
+    """AC2: TikTok's entry is unchanged in substance (never attempted) and
+    distinguishable from Amazon's on the new field."""
+
+    def test_tiktok_entry_is_never_attempted_and_not_proven(self):
+        entry = server.GLT_CHANNELS["tiktok"]
+        assert entry["revise_attempted"] is False
+        assert entry["revise_proven"] is False
+
+    def test_amazon_and_tiktok_are_distinguishable_on_revise_attempted(self):
+        amazon = server.GLT_CHANNELS["amazon"]
+        tiktok = server.GLT_CHANNELS["tiktok"]
+        # Both are equally NOT proven -- the new field is what tells them apart.
+        assert amazon["revise_proven"] == tiktok["revise_proven"] is False
+        assert amazon["revise_attempted"] != tiktok["revise_attempted"]
+
+
+class TestAmazonTriedAndIneffective:
+    """AC3 + AC4: dry run and live run against Amazon both state the revise
+    was fired live and produced no observable change, not merely 'unproven',
+    and revise_proven is still False on the live-run response."""
+
+    def test_amazon_dry_run_states_fired_live_no_observable_change(self):
+        out, _ = _run([SKU_AMZ], sub_source="The Warehouse Group", channel="Amazon",
+                      check_staleness=False)
+        assert "fired live on Amazon" in out["message"]
+        assert "no observable change" in out["message"]
+        assert "NOT yet live-proven on Amazon" not in out["message"]
+
+    def test_amazon_live_run_carries_the_same_message_and_stays_unproven(self):
+        h = _Harness()
+        out, _ = _run([SKU_AMZ], harness=h, sub_source="The Warehouse Group",
+                      channel="Amazon", check_staleness=False, dry_run=False)
+        assert "fired live on Amazon" in out["message"]
+        assert "no observable change" in out["message"]
+        assert out["revise_proven"] is False
+        assert all(row["revise_proven"] is False for row in out["plan"])
+
+
+TIKTOK_CATALOGUE_ENTRY = {
+    "TikTok": [{"id": 30, "name": "Default", "channel_id": 30,
+                "sub_source": "SKATEWAREHOUSE_UK", "show_in_inventory": True}],
+}
+
+
+class TestTikTokStillReadsAsNeverAttempted:
+    """AC5: a TikTok dry run still reads as never-attempted and its message
+    text differs from Amazon's.
+
+    SKU_AMZ isn't mapped to a TIKTOK channel-SKU row (see CHANNEL_SKUS), so it
+    lands in `unresolved` -- but the dry-run message is built regardless of
+    plan/unresolved size, so this still exercises the unproven-channel wording
+    for a channel that has genuinely never been attempted live.
+    """
+
+    def test_tiktok_dry_run_never_attempted_wording(self):
+        with patch.dict(CATALOGUES, TIKTOK_CATALOGUE_ENTRY):
+            out, _ = _run([SKU_AMZ], sub_source="SKATEWAREHOUSE_UK", channel="TikTok",
+                          check_staleness=False)
+        assert "NEVER been attempted live" in out["message"]
+        assert "fired live on Amazon" not in out["message"]
+
+    def test_tiktok_message_textually_differs_from_amazon(self):
+        with patch.dict(CATALOGUES, TIKTOK_CATALOGUE_ENTRY):
+            tiktok_out, _ = _run([SKU_AMZ], sub_source="SKATEWAREHOUSE_UK", channel="TikTok",
+                                 check_staleness=False)
+        amazon_out, _ = _run([SKU_AMZ], sub_source="The Warehouse Group", channel="Amazon",
+                             check_staleness=False)
+        assert tiktok_out["message"] != amazon_out["message"]
+
+
+class TestShopifyStillCarriesNoWarning:
+    """AC6: Shopify dry run and live run carry no unproven/ineffective
+    warning at all, and revise_proven is True."""
+
+    def test_shopify_dry_run_clean(self):
+        out, _ = _run([SKU_SHOPIFY_ONLY], sub_source="SWH Shopify", channel="Shopify",
+                      check_staleness=False)
+        assert out["revise_proven"] is True
+        assert "fired live" not in out["message"]
+        assert "NEVER been attempted" not in out["message"]
+
+    def test_shopify_live_run_clean(self):
+        h = _Harness()
+        out, _ = _run([SKU_SHOPIFY_ONLY], harness=h, sub_source="SWH Shopify",
+                      channel="Shopify", check_staleness=False, dry_run=False)
+        assert out["revise_proven"] is True
+        assert "fired live" not in out["message"]
+        assert "NEVER been attempted" not in out["message"]
+
+
+class TestProvenListStillDerivedFromRegistry:
+    """AC7: the proven-channel list named in the warning is still derived
+    from the registry, not hard-coded -- flipping a fixture flag changes it."""
+
+    def test_flipping_amazon_proven_in_a_fixture_changes_the_named_list(self):
+        with patch.dict(server.GLT_CHANNELS["amazon"], {"revise_proven": True}):
+            assert "Amazon" in server._proven_revise_channels()
+            out, _ = _run([SKU_AMZ], sub_source="The Warehouse Group", channel="Amazon",
+                          check_staleness=False)
+            assert out["revise_proven"] is True
+            assert "fired live on Amazon" not in out["message"]
+        # Reverted outside the patch -- the real registry is untouched.
+        assert server.GLT_CHANNELS["amazon"]["revise_proven"] is False
+
+
+class TestDocstringNoLongerClaimsAmazonVariationShapeUnobserved:
+    """AC8: the docstring records one Amazon family observed carrying a
+    template per child, and that this is one observation, not a rule."""
+
+    def test_stale_unestablished_phrase_is_gone(self):
+        doc = server.refresh_channel_listing.__doc__
+        assert "unestablished — nothing in this repo has observed it either way" not in doc
+
+    def test_docstring_records_the_bushings_observation(self):
+        doc = server.refresh_channel_listing.__doc__
+        assert "bushings" in doc
+        assert "one observation, not a rule" in doc
+
+
+class TestNoBehaviouralChange:
+    """AC10 (partial -- the rest is covered by the full suite passing with
+    only the two deliberately-updated substrings): plan building, action
+    selection and the ProcessTemplates payload are unaffected by the new
+    registry field and message wording."""
+
+    def test_plan_shape_and_process_payload_unaffected_by_the_new_field(self):
+        h = _Harness()
+        out, h = _run([SKU_AMZ], harness=h, sub_source="The Warehouse Group",
+                      channel="Amazon", check_staleness=False, dry_run=False)
+        assert len(out["plan"]) == 2
+        tids = sorted(r["template_id"] for r in out["plan"])
+        assert tids == [32115, 32381]
+        pushed_ids = sorted(c["TemplateId"] for c in h.process_calls)
+        assert pushed_ids == [32115, 32381]
+        assert all(c["Action"] == "Revise" for c in h.process_calls)
