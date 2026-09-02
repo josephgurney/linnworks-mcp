@@ -18,9 +18,20 @@ Live-probed shapes these tests encode (25 Aug 2026, this tenant):
     design-wrapper markers ("Check out our eBay reviews", etc.) in
     `Description` — it reads as plain inner content, matching the item's own
     channel description row byte-for-byte.
-  * `Listings/ProcesseBayListings` was never fired live (out of scope for
-    this issue) — `EBAY_CHANNELS["ebay"]["revise_proven"]` stays False and
-    every live-run result is reported "unconfirmed", never "success".
+  * `Listings/ProcesseBayListings` was NOT fired live in this build (issue
+    #43) — `EBAY_CHANNELS["ebay"]["revise_proven"]` stays False and every
+    live-run result is reported "unconfirmed", never "success".
+
+Issue #47 (26 Aug 2026, docs-only correction): the push WAS since fired live
+against a real eBay listing and turned out to be ACCEPTED by Linnworks but
+never observed to reach the channel — a distinct fact from `revise_proven`
+(which still stays False). `EBAY_CHANNELS["ebay"]` now also carries
+`push_observed_state` / `push_observed_reason` recording that observation as
+data, and every message/plan-row/result-row that mentions it must DERIVE from
+those two fields rather than hard-code the wording — the tests below pin
+that, plus a stale-phrase guard asserting the old "never fired against a
+real listing" claim no longer survives (uncorrected) anywhere in server.py,
+README.md or CLAUDE.md.
 """
 from unittest.mock import patch
 
@@ -790,3 +801,255 @@ def test_post_push_read_back_rate_limit_is_bucketed_not_silently_none():
     assert row["post_push_read_back_rate_limited"] is True
     assert any(rl.get("listing_id") == LISTING_ID for rl in r["rate_limited"])
     assert r["complete"] is False
+
+
+# ── Issue #47: "accepted but never observed to process" — a distinct fact ──
+# from `revise_proven`, recorded as DATA on EBAY_CHANNELS and derived into
+# every message, plan row and result row, rather than hard-coded prose.
+
+import ast as _ast
+import re as _re
+from pathlib import Path as _Path
+
+_REPO_ROOT = _Path(__file__).resolve().parent.parent
+_SERVER_SRC = (_REPO_ROOT / "server.py").read_text(encoding="utf-8")
+_README_SRC = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
+_CLAUDE_MD_SRC = (_REPO_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+
+
+def _normalize_comment_prose(text: str) -> str:
+    """Collapse a `#`-commented block (or a docstring) into one whitespace-
+    normalised line, so a phrase that happens to wrap across source lines is
+    still findable as a plain substring."""
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            stripped = stripped[1:].strip()
+        lines.append(stripped)
+    return _re.sub(r"\s+", " ", " ".join(lines))
+
+
+def test_ac1_ebay_channels_registry_defaults_revise_proven_and_observation_fields():
+    entry = server.EBAY_CHANNELS["ebay"]
+    assert entry["revise_proven"] is False
+    # AC1: a field recording the observation state (that a live push was
+    # submitted and no channel-side effect was observed)...
+    assert "push_observed_state" in entry
+    assert entry["push_observed_state"] == "accepted_but_not_processed"
+    # ...and a human-readable reason string.
+    assert "push_observed_reason" in entry
+    reason = entry["push_observed_reason"]
+    assert isinstance(reason, str) and len(reason) > 20
+    assert "accepted" in reason.lower()
+    assert "not" in reason.lower()
+
+
+def test_ac2_verification_note_is_derived_from_the_registry_reason():
+    """Patching the registry entry's reason changes the emitted text — proving
+    the message is DERIVED, not hard-coded (the twice-fixed GLT_CHANNELS
+    lesson, now applied here). Checks BOTH `verification_note` and the
+    dry-run `message` (round 1 fixed only the former and shipped a message
+    that stayed counts-only)."""
+    original_reason = server.EBAY_CHANNELS["ebay"]["push_observed_reason"]
+
+    patches, _ = _mock()
+    r = _run(patches, skus=[SKU_ADULT], store="EBAY0", dry_run=True)
+    assert original_reason in r["verification_note"]
+    assert original_reason in r["message"]
+
+    with patch.dict(server.EBAY_CHANNELS["ebay"],
+                     {"push_observed_reason": "TOTALLY DIFFERENT REASON TEXT xyzzy"}):
+        patches2, _ = _mock()
+        r2 = _run(patches2, skus=[SKU_ADULT], store="EBAY0", dry_run=True)
+        assert "TOTALLY DIFFERENT REASON TEXT xyzzy" in r2["verification_note"]
+        assert original_reason not in r2["verification_note"]
+        assert "TOTALLY DIFFERENT REASON TEXT xyzzy" in r2["message"]
+        assert original_reason not in r2["message"]
+
+    # And it reverts once the patch is undone — proving the message reads the
+    # registry live at call time, not a cached copy.
+    patches3, _ = _mock()
+    r3 = _run(patches3, skus=[SKU_ADULT], store="EBAY0", dry_run=True)
+    assert original_reason in r3["verification_note"]
+    assert original_reason in r3["message"]
+
+
+def test_ac2_reason_string_literal_appears_exactly_once_in_server_source():
+    """The reason text must be written ONCE, in the registry — every message
+    that shows it must interpolate the field, never retype the literal.
+    Parsed with `ast` (not a raw substring search) because Python's implicit
+    adjacent-string-literal concatenation means the runtime string is not
+    contiguous text in the source file — `ast` reconstructs it exactly."""
+    reason = server.EBAY_CHANNELS["ebay"]["push_observed_reason"]
+    tree = _ast.parse(_SERVER_SRC)
+    matches = [
+        node for node in _ast.walk(tree)
+        if isinstance(node, _ast.Constant)
+        and isinstance(node.value, str)
+        and node.value == reason
+    ]
+    assert len(matches) == 1, (
+        f"push_observed_reason literal must appear exactly once in server.py "
+        f"(in the EBAY_CHANNELS registry) — found {len(matches)} occurrence(s)."
+    )
+
+
+def test_ac3_live_run_message_states_not_observed_and_names_the_ui_route():
+    template = {
+        "TemplateId": "tpl-1", "InventoryItemId": SID_ADULT, "ConfigId": "cfg-1",
+        "SKU": SKU_ADULT, "ListingIds": [LISTING_ID], "Title": "T", "Description": "old",
+    }
+    patches, _ = _mock(template_for_listing=template)
+    r = _run(patches, skus=[SKU_ADULT, SKU_JUNIOR], store="EBAY0", dry_run=False)
+
+    msg = r["message"]
+    # Fact 1: an accepted push has not been observed to reach the channel.
+    assert "accepted" in msg.lower()
+    assert "not" in msg.lower() and "observed" in msg.lower()
+    # Fact 2: the working route today is the Linnworks listing UI, after
+    # reviewing this tool's dry-run manifest.
+    assert "linnworks listing ui" in msg.lower()
+    assert "dry-run manifest" in msg.lower() or "dry run manifest" in msg.lower()
+
+
+def test_ac4_plan_row_and_result_row_carry_push_observed_state():
+    template = {
+        "TemplateId": "tpl-1", "InventoryItemId": SID_ADULT, "ConfigId": "cfg-1",
+        "SKU": SKU_ADULT, "ListingIds": [LISTING_ID], "Title": "T", "Description": "old",
+    }
+    patches, _ = _mock(template_for_listing=template)
+    dry = _run(patches, skus=[SKU_ADULT], store="EBAY0", dry_run=True)
+    assert dry["plan"], "expected at least one plan row"
+    for row in dry["plan"]:
+        assert "push_observed_state" in row
+        assert row["push_observed_state"] == server.EBAY_CHANNELS["ebay"]["push_observed_state"]
+        # alongside the existing per-row revise_proven, not replacing it
+        assert "revise_proven" in row
+
+    patches2, _ = _mock(template_for_listing=template)
+    live = _run(patches2, skus=[SKU_ADULT], store="EBAY0", dry_run=False)
+    assert live["results"], "expected at least one result row"
+    for row in live["results"]:
+        assert "push_observed_state" in row
+        assert row["push_observed_state"] == server.EBAY_CHANNELS["ebay"]["push_observed_state"]
+        assert "revise_proven" in row
+
+
+def test_ac5_docstring_no_longer_claims_the_push_was_never_fired():
+    doc = server.revise_ebay_listing_description.__doc__
+    assert doc is not None
+    lowered = doc.lower()
+    assert "never been fired against a real listing" not in lowered
+    assert "never called against a real listing" not in lowered
+    # States it WAS fired, gives the date, and the observed outcome.
+    assert "fired live on 26 aug 2026" in lowered
+    assert "accepted" in lowered
+    # Names the UI as the current workaround.
+    assert "linnworks listing ui" in lowered
+
+
+def test_ac6_module_note_attributes_wrapper_survival_to_the_ui_push_only():
+    """The wrapper is composed at push time by the design template, and it
+    survived a UI-INITIATED revise with both furniture blocks intact — this
+    must be explicitly attributed to the UI push, not claimed as proof about
+    the API path, and scoped to the configurator it was observed on."""
+    # The module note is a plain `#`-commented block, not a docstring —
+    # normalise it so a phrase wrapped across source lines is still findable.
+    normalized = _normalize_comment_prose(_SERVER_SRC)
+    assert "composed by the SELLER'S DESIGN TEMPLATE AT PUSH TIME" in normalized
+    assert "UI-INITIATED push" in normalized
+    assert "BOTH furniture blocks intact" in normalized
+    assert "NOT evidence about the API path" in normalized
+    assert '"EVRi - Single Image" configurator' in normalized
+    assert "not all 33 on this tenant" in normalized
+    # Must not overclaim a general "wrapper preservation proven" result.
+    assert "wrapper preservation proven for this tool" in normalized
+    assert "that has not been shown" in normalized
+
+
+def test_ac7_stale_never_fired_phrase_does_not_survive_uncorrected_anywhere():
+    """No claim that the eBay push has never been fired / was never called
+    against a real listing may survive as a LIVE (uncorrected) assertion in
+    server.py, README.md or CLAUDE.md. Historical version-log entries may
+    keep the old wording only when explicitly marked superseded via the
+    repo's own ~~strikethrough~~ convention (see v1.44.0/v1.42.1 precedent)
+    — so those spans are stripped before checking."""
+    banned = [
+        "never been fired against a real listing",
+        "never called against a real listing",
+        "not fired live by this build",
+        "never fired live by this build",
+        "not live-fired",
+    ]
+    for name, text in (
+        ("server.py", _SERVER_SRC),
+        ("README.md", _README_SRC),
+        ("CLAUDE.md", _CLAUDE_MD_SRC),
+    ):
+        # Normalise line-wrapped comments/docstrings so a phrase split across
+        # lines is still detected, then drop anything marked superseded.
+        collapsed = _re.sub(r"\s+", " ", text)
+        live_only = _re.sub(r"~~.*?~~", " ", collapsed, flags=_re.S)
+        lowered = live_only.lower()
+        for phrase in banned:
+            assert phrase not in lowered, (
+                f"{name} still asserts (uncorrected) that the eBay push {phrase!r}"
+            )
+
+
+def test_ac8_claude_md_tables_no_longer_contradict_the_v1_48_1_entry():
+    assert "FIRED LIVE 26 Aug 2026" in _CLAUDE_MD_SRC
+    # the confirmed-endpoints row for the write endpoint must say it was
+    # fired, not that it was never called
+    idx = _CLAUDE_MD_SRC.index("| `Listings/ProcesseBayListings` | POST |")
+    row = _CLAUDE_MD_SRC[idx:idx + 2000]
+    assert "ACCEPTED, NOT OBSERVED TO PROCESS" in row
+    assert "Called against a real listing" in row
+
+
+def test_ac8_readme_row_describes_observed_state_not_merely_unproven():
+    idx = _README_SRC.index("`revise_ebay_listing_description`")
+    row = _README_SRC[idx:idx + 500]
+    assert "Fired live 26 Aug 2026" in row
+    assert "no channel-side effect was observed" in row
+    assert row.strip().rstrip("|").strip() != ""
+
+
+def test_ac9_tenant_traps_recorded_in_the_endpoint_tables():
+    """Both new tenant traps must be readable from the endpoint tables
+    themselves, not only from the version-log note."""
+    create_idx = _CLAUDE_MD_SRC.index("| `Listings/CreateEbayTemplates` |")
+    create_row = _CLAUDE_MD_SRC[create_idx:create_idx + 600]
+    assert "REPLACES the item's template on EVERY call" in create_row
+    assert "new `TemplateId`" in create_row or "fresh `TemplateId`" in create_row
+    assert "Never use it to poll status" in create_row
+
+    ops_idx = _CLAUDE_MD_SRC.index("| `Listings/GetEbayListingOperations` |")
+    ops_row = _CLAUDE_MD_SRC[ops_idx:ops_idx + 400]
+    assert "400" in ops_row
+    assert "body" in ops_row.lower() and "query" in ops_row.lower()
+
+
+def test_ac10_tool_signature_threshold_default_and_outcome_vocabulary_unchanged():
+    import asyncio
+    tool_names = [t.name for t in asyncio.run(server.mcp.list_tools())]
+    assert len(tool_names) == 85
+    assert "revise_ebay_listing_description" in tool_names
+    assert server.WRITE_THRESHOLDS["revise_ebay_listing_description"] == 10
+
+    import inspect
+    sig = inspect.signature(server.revise_ebay_listing_description)
+    assert list(sig.parameters) == ["skus", "store", "confirmed_count", "dry_run"]
+    assert sig.parameters["dry_run"].default is True
+    assert sig.parameters["store"].default == "EBAY0"
+    assert sig.parameters["confirmed_count"].default is None
+
+    template = {
+        "TemplateId": "tpl-1", "InventoryItemId": SID_ADULT, "ConfigId": "cfg-1",
+        "SKU": SKU_ADULT, "ListingIds": [LISTING_ID], "Title": "T", "Description": "old",
+    }
+    patches, _ = _mock(template_for_listing=template)
+    r = _run(patches, skus=[SKU_ADULT], store="EBAY0", dry_run=False)
+    outcomes = {row["outcome"] for row in r["results"]}
+    assert outcomes <= {"unconfirmed", "blocked", "push_failed", "rate_limited"}

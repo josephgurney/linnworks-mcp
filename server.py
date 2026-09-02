@@ -10533,12 +10533,62 @@ def _proven_revise_channels() -> str:
 # a registry, like GLT_CHANNELS, rather than a bare bool, so a warning message
 # can always be *derived* rather than hard-coded (the mistake this codebase has
 # already made and fixed twice for GLT_CHANNELS — see `_proven_delete_channels`).
+#
+# Issue #47 (26 Aug 2026): the live push was fired for the first time and
+# turned out to be ACCEPTED by Linnworks but not observed to reach the
+# channel — a distinct fact from `revise_proven`, which only answers "has a
+# full round-trip been confirmed?". `push_observed_state` /
+# `push_observed_reason` record that distinction as DATA, not prose, so every
+# message DERIVES it instead of a hand-typed string drifting out of sync (the
+# same twice-fixed lesson as `_proven_delete_channels`/`_proven_revise_channels`
+# above). `push_observed_reason` is the ONLY place its literal text may be
+# written — every caller below interpolates it via `_ebay_push_observation_
+# reason()`, never retypes it. This is subordinate evidence, not a second
+# proof flag: `revise_proven` alone remains the single gate a caller trusts.
+#
+# #45 conflict decision (recorded here, not acted on elsewhere): Amazon's GLT
+# Revise is in the identical situation — accepted, no observable channel
+# effect, `revise_proven` False on evidence rather than caution. Rather than
+# extend `GLT_CHANNELS` in THIS eBay-only change (out of scope — see the
+# brief's Conflicts section), these two field names are deliberately generic,
+# not eBay-specific, so issue #45 can add the SAME two keys to each
+# `GLT_CHANNELS` entry VERBATIM and the two registries stay one shape.
+# `GLT_CHANNELS` itself is untouched by this change.
 EBAY_CHANNELS: dict[str, dict] = {
     "ebay": {
         "source": "EBAY",
         "revise_proven": False,
+        "push_observed_state": "accepted_but_not_processed",
+        "push_observed_reason": (
+            "A live push was submitted against a real eBay listing on 26 Aug 2026 "
+            "(ven-grip-cleaner, item 286493672322) and accepted by Linnworks (2xx), "
+            "but across a two-hour polling window on the description-frame URL no "
+            "channel-side effect was observed; the identical edit pushed from the "
+            "Linnworks listing UI landed within minutes. This records what was "
+            "observed on that one listing at that time -- it is not a proven rule "
+            "about the API path. revise_proven remains the single gate and stays "
+            "False until a fresh proof lands."
+        ),
     },
 }
+
+# The route that DOES work today, appended to every message that also carries
+# the observation reason above (issue #47, AC3) — kept as its own constant
+# rather than folded into `push_observed_reason` so the registry's reason
+# field stays a pure description of what was observed, not instructions.
+EBAY_UI_WORKAROUND_NOTE = (
+    "The route that works today for propagating an eBay description edit is "
+    "the Linnworks listing UI -- review this tool's dry-run manifest first to "
+    "see what would be sent, then make the same edit there."
+)
+
+
+def _ebay_push_observation_reason() -> str:
+    """The single read site for `push_observed_reason` (issue #47) -- every
+    message below interpolates this, never retypes the literal text, so a
+    correction to the registry entry is a one-line change everywhere it's
+    surfaced (the same discipline `_proven_delete_channels` established)."""
+    return EBAY_CHANNELS["ebay"]["push_observed_reason"]
 
 
 def _proven_ebay_revise_channels() -> str:
@@ -14452,8 +14502,12 @@ def _set_archive_state(
 #                                           TemplateIds); body {"parameters":
 #                                           {...}} — see gotchas below
 #   POST Listings/ProcesseBayListings    -> push an updated EbayListing back
-#                                           (204 No Content); NOT fired live by
-#                                           this build (out of scope)
+#                                           (204 No Content); fired live
+#                                           26 Aug 2026 (issue #47) — ACCEPTED
+#                                           (204) but not observed to reach
+#                                           the channel on this tenant; see
+#                                           the wrapper note below and
+#                                           EBAY_CHANNELS["ebay"] above
 #
 # ⚠️  GeteBayTemplates REQUIRES either a non-zero ConfigId or a non-empty
 # TemplateIds — both confirmed live (Source/SubSource alone, or an empty/zero
@@ -14503,11 +14557,25 @@ def _set_archive_state(
 # sending ONLY the Description field — Title, Attributes, Categories, Price
 # and everything else on the template are read and carried through UNCHANGED,
 # matching the "nulls clear omitted fields" convention this codebase has hit
-# on every other Linnworks update endpoint — is believed to preserve the
-# seller's design wrapper, which appears to be applied by eBay outside of
-# anything Linnworks stores. This is NOT proven on a listing KNOWN to use a
-# visible design wrapper — verify on one before trusting a bulk run (see the
-# post-merge verification steps in CLAUDE.md).
+# on every other Linnworks update endpoint.
+#
+# Issue #47 (26 Aug 2026) confirmed WHY the wrapper never appears in
+# Description: it is composed by the SELLER'S DESIGN TEMPLATE AT PUSH TIME,
+# around whatever inner content it is given — Linnworks never stores it. On
+# `ven-grip-cleaner` (item 286493672322, in the "EVRi - Single Image"
+# configurator — ~150 of this tenant's templates, NOT re-checked across the
+# other 32 configurators), a UI-INITIATED push of the same edited description
+# — made through the Linnworks listing UI, not this tool's API path — landed
+# with BOTH furniture blocks intact. That is UI-initiated evidence about the
+# wrapper only. It is NOT evidence about the API path: the API-submitted push
+# on that same listing was accepted (204) but was never observed to reach the
+# channel at all across a two-hour poll (see
+# EBAY_CHANNELS["ebay"]["push_observed_reason"] and CLAUDE.md's v1.48.1
+# entry), so it produced no observation one way or the other about what an
+# API-initiated push would do to the wrapper. Do not read this as "wrapper
+# preservation proven for this tool" — that has not been shown, and the one
+# UI observation is scoped to the "EVRi - Single Image" configurator, not all
+# 33 on this tenant.
 #
 # ⚠️  STALE-SNAPSHOT FAMILY (issue #43's own trap list, echoing v1.27.1 —
 # ProcessTemplates Update on Shopify pushed a 5-month-stale price and reverted
@@ -14648,8 +14716,10 @@ def _find_ebay_template_for_listing(listing_id: str, config_id: str | None = Non
     that. Called during PLANNING (including on a dry run — issue #43's own
     stale-snapshot trap requires the stored Title/Price to be shown in the
     manifest before a write is confirmed, not just before a live push) and
-    once more, config-scoped, after a live push as a read-back. Never fired
-    live by this build (issue #43 keeps proving the push live out of scope).
+    once more, config-scoped, after a live push as a read-back. The live push
+    itself was fired for the first time 26 Aug 2026 (issue #47) — accepted
+    (204) but not observed to reach the channel; see
+    EBAY_CHANNELS["ebay"]["push_observed_reason"].
 
     Raises `RateLimitError` (does NOT catch/swallow it) when the quota is
     exhausted, at either the configurator list or the template sweep — the
@@ -14739,12 +14809,21 @@ def revise_ebay_listing_description(
     create, end or relist a listing — revise of an EXISTING listing's
     description only.
 
-    ⚠️  NOT LIVE-PROVEN. Listings/ProcesseBayListings has never been fired
-    against a real listing by this build (deliberately out of scope — see the
-    issue and CLAUDE.md's post-merge verification steps). A `processed`/
-    `unconfirmed` result here means Linnworks ACCEPTED the push, never that
-    the listing changed. EBAY_CHANNELS["ebay"]["revise_proven"] stays False
-    until a human runs those steps on ONE low-risk listing.
+    ⚠️  ACCEPTED BUT NOT OBSERVED TO PROCESS — revise_proven still False.
+    Listings/ProcesseBayListings WAS fired live on 26 Aug 2026 (issue #47)
+    against a real listing (ven-grip-cleaner, item 286493672322): Linnworks
+    ACCEPTED the push (204), but across a two-hour poll of the
+    description-frame URL no channel-side effect was observed, while the
+    identical edit pushed from the Linnworks listing UI landed within
+    minutes. See EBAY_CHANNELS["ebay"]["push_observed_reason"] for the full
+    observation and CLAUDE.md's v1.48.1 entry for the write-up. A
+    `processed`/`unconfirmed` result here means Linnworks ACCEPTED the push,
+    never that the listing changed. EBAY_CHANNELS["ebay"]["revise_proven"]
+    stays False on that EVIDENCE, not on caution, until a fresh proof lands
+    (see CLAUDE.md's post-merge verification steps). Until then, the route
+    that works today for propagating a description edit is the Linnworks
+    listing UI — review this tool's dry-run manifest first, then make the
+    same edit there.
 
     ⚠️  STALE-SNAPSHOT FAMILY (v1.27.1 echo). The push sends the FULL stored
     eBay template back with only Description swapped — Title, Price and
@@ -14884,7 +14963,8 @@ def revise_ebay_listing_description(
 
     Returns:
         A dict with:
-          - dry_run, sku_count, store, revise_proven, verification_note
+          - dry_run, sku_count, store, revise_proven, push_observed_state,
+            verification_note
           - plan: one row per eBay listing id — listing_id, covers_skus,
             description (the value that would be/was pushed),
             description_source (channel_override / channel_override_prefix /
@@ -14900,7 +14980,9 @@ def revise_ebay_listing_description(
             failure), staleness (stored_title / stored_price / title_stale /
             warning — None if the template could not be located), revise_proven
             (from EBAY_CHANNELS — derived per row, not hard-coded, same as the
-            top-level flag)
+            top-level flag), push_observed_state (from EBAY_CHANNELS — the
+            observation-state code, e.g. "accepted_but_not_processed";
+            subordinate to revise_proven, which remains the single gate)
           - not_listed: SKUs with no matching eBay channel-SKU row for `store`
           - unresolved: SKUs that failed to resolve
           - rate_limited: SKUs/reads/listings that hit the Linnworks quota — a
@@ -15035,6 +15117,7 @@ def revise_ebay_listing_description(
             "blocked_reason": blocked_reason,
             "never_synced_skus": entry["never_synced_skus"],
             "revise_proven": EBAY_CHANNELS["ebay"]["revise_proven"],
+            "push_observed_state": EBAY_CHANNELS["ebay"]["push_observed_state"],
         }
         if entry["never_synced_skus"]:
             row_out["never_synced_warning"] = (
@@ -15114,13 +15197,15 @@ def revise_ebay_listing_description(
         f"({EBAY_DESCRIPTION_FRAME_URL_TEMPLATE.format(item_id='<item_id>')}), never the item "
         "page — the description sits in a cross-origin frame there and can report stale/old "
         f"text even when the new description is already live. Proven eBay accounts: "
-        f"{_proven_ebay_revise_channels()}."
+        f"{_proven_ebay_revise_channels()}. {_ebay_push_observation_reason()} "
+        f"{EBAY_UI_WORKAROUND_NOTE}"
     )
 
     base_out = {
         "sku_count": len(skus),
         "store": store,
         "revise_proven": EBAY_CHANNELS["ebay"]["revise_proven"],
+        "push_observed_state": EBAY_CHANNELS["ebay"]["push_observed_state"],
         "verification_note": verification_note,
         "plan": plan,
         "not_listed": not_listed,
@@ -15141,7 +15226,8 @@ def revise_ebay_listing_description(
             "message": (
                 f"{len(pushable)} listing(s) would be revised, {len(plan) - len(pushable)} "
                 f"blocked, {len(not_listed)} not listed on '{store}', {len(unresolved)} "
-                f"unresolved, {len(rate_limited)} rate-limited. No write calls were made."
+                f"unresolved, {len(rate_limited)} rate-limited. No write calls were made. "
+                + verification_note
             ),
         }
 
