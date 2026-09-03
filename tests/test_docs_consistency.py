@@ -112,3 +112,78 @@ def test_every_documented_threshold_actually_exists_in_code():
     for doc_name, text in (("CLAUDE.md", CLAUDE_MD), ("README.md", README_MD)):
         stale = sorted(k for k in _threshold_rows(text) if k not in code)
         assert not stale, f"{doc_name} lists thresholds not in WRITE_THRESHOLDS: {stale}"
+
+
+# --- revise-proven channels (issue #45) --------------------------------------
+# refresh_channel_listing's own GLT_CHANNELS registry, not just human prose, is
+# the source of truth for which channels' Revise/Update is live-proven. Amazon
+# was fired live twice (24-25 Aug 2026) and accepted with no observable effect
+# -- "not yet live-proven" on its own reads as "untried", which stopped being
+# true and both docs had drifted from the registry as a result.
+
+def _refresh_channel_listing_readme_row() -> str:
+    match = re.search(r"^\| `refresh_channel_listing` \|.*\|$", README_MD, re.M)
+    assert match, "README.md is missing the refresh_channel_listing row"
+    return match.group(0)
+
+
+def _refresh_channel_listing_claude_row() -> str:
+    match = re.search(r"^\| `refresh_channel_listing\(.*$", CLAUDE_MD, re.M)
+    assert match, "CLAUDE.md is missing the refresh_channel_listing tools-table row"
+    return match.group(0)
+
+
+def test_registry_carries_a_revise_attempted_bool_on_every_channel():
+    for key, entry in server.GLT_CHANNELS.items():
+        assert isinstance(entry.get("revise_attempted"), bool), (
+            f"GLT_CHANNELS['{key}'] is missing a bool revise_attempted field"
+        )
+        # A channel cannot be proven without having been attempted at all.
+        if entry["revise_proven"]:
+            assert entry["revise_attempted"] is True, key
+
+
+def test_readme_and_claude_md_agree_with_the_registry_on_amazon_revise():
+    """Amazon: revise_proven is False in the registry -- neither doc may
+    claim it as proven, and both must state the tried-and-ineffective fact
+    the registry now carries (revise_attempted) rather than merely 'untried'.
+    """
+    amazon = server.GLT_CHANNELS["amazon"]
+    assert amazon["revise_proven"] is False
+    assert amazon["revise_attempted"] is True
+
+    readme_row = _refresh_channel_listing_readme_row()
+    claude_row = _refresh_channel_listing_claude_row()
+
+    for doc_name, row in (("README.md", readme_row), ("CLAUDE.md", claude_row)):
+        assert "spec-based, not yet live-proven" not in row, (
+            f"{doc_name} still collapses Amazon revise into merely 'not yet live-proven'"
+        )
+        assert "NOT LIVE-PROVEN ON AMAZON OR TIKTOK" not in row, (
+            f"{doc_name} still lumps Amazon in with TikTok as equally untried"
+        )
+        assert "no observable change" in row.lower(), (
+            f"{doc_name} no longer states the tried-and-ineffective fact for Amazon"
+        )
+
+
+def test_readme_and_claude_md_agree_with_the_registry_on_tiktok_revise():
+    """TikTok: still genuinely never attempted -- neither doc may claim it
+    was tried, and it must read distinctly from Amazon's wording."""
+    tiktok = server.GLT_CHANNELS["tiktok"]
+    assert tiktok["revise_proven"] is False
+    assert tiktok["revise_attempted"] is False
+
+    readme_row = _refresh_channel_listing_readme_row()
+    claude_row = _refresh_channel_listing_claude_row()
+
+    for doc_name, row in (("README.md", readme_row), ("CLAUDE.md", claude_row)):
+        assert "TikTok: fired live" not in row, (
+            f"{doc_name} wrongly claims TikTok's revise was fired live"
+        )
+
+
+def test_docstring_no_longer_claims_amazon_variation_shape_is_unobserved():
+    doc = server.refresh_channel_listing.__doc__
+    assert "unestablished — nothing in this repo has observed it either way" not in doc
+    assert "one observation, not a rule" in doc

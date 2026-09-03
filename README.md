@@ -1,6 +1,6 @@
 # Linnworks MCP Server
 
-![Version](https://img.shields.io/badge/version-1.48.1-blue)
+![Version](https://img.shields.io/badge/version-1.48.2-blue)
 ![Tools](https://img.shields.io/badge/tools-85-blue)
 
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
@@ -95,7 +95,7 @@ Once installed, Claude gets access to these tools:
 | `get_channel_listings` | Check whether a SKU is listed, and on which channel/store |
 | `get_channel_listings_bulk` | The same listing check across many SKUs at once. Pass `stock_item_ids` instead of SKUs for large batches — it skips per-SKU resolution entirely (5,391 items: 15.6s vs 187s). Rate-limited lookups are reported separately from genuinely-missing ones |
 | `list_to_shopify` | List existing inventory to Shopify via a saved configurator. Two dedupe layers: the same item already listed, **and** a different SKU with the same title already live (the SKU-migration case that created 177 duplicate products) — the latter is excluded unless `allow_duplicate_titles=True` |
-| `refresh_channel_listing` | Re-push edited item data to a live listing on any GLT channel (Shopify, Amazon, TikTok) — revise; pre-flight staleness check scoped to the channel being refreshed. Amazon/TikTok are spec-based, not yet live-proven |
+| `refresh_channel_listing` | Re-push edited item data to a live listing on any GLT channel (Shopify, Amazon, TikTok) — revise; pre-flight staleness check scoped to the channel being refreshed. Amazon: fired live twice, accepted, no observable change (tried and ineffective, issue #45). TikTok: never attempted live |
 | `unpublish_channel_listing` | Take down / end a live listing on one channel and store — Shopify, Amazon, TikTok, Magento or Walmart. Each template is verified individually after the delete, so a template that survived is never reported as taken down. A variation child is retired via its parent's template only when no other member of the group would lose a listing; otherwise it is blocked with the parent and its live siblings named |
 | `repair_channel_listing_images` | Push an item's CURRENT Linnworks images onto its EXISTING Shopify listing — attach what's missing, make the Linnworks main image the featured image, and detach media the item no longer has. Talks to the Shopify Admin API directly, because the GLT cannot do this (it re-pushes the template's stored, sometimes deleted, image URL and silently no-ops). Images are matched by the Linnworks GUID that Shopify preserves in the CDN filename, so it compares pictures rather than counts. Hand-uploaded media is never removed, and on a variation group (one Shopify product, per-variant Linnworks images) a sibling's photo is never mistaken for a stale one. Needs Shopify Admin credentials |
 | `delist_all_channel_listings` | Take down every listing for an item across all channels and stores at once. eBay, Etsy and Mirakl are reported as skipped and left up — they can only be ended in their own admin. Every SKU that can't be retired carries a `blocked_reason`, so a small take-down count never reads as a completed cleanup |
