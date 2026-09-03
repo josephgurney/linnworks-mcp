@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.48.2"
+__version__ = "1.48.3"
 
 import json
 import os
@@ -10421,17 +10421,34 @@ _ZERO_GUID = "00000000-0000-0000-0000-000000000000"
 # "… - Spain", "… - Netherlands", "… - Sweden". So a regional sub_source has NO
 # configurator of its own and must resolve to the account's ChannelId — see
 # _resolve_glt_target()'s account-prefix fallback.
-# "revise_attempted" (issue #45) is the tri-state companion to "revise_proven":
-# a channel can be (a) never attempted (revise_attempted=False, revise_proven=
-# False — TikTok/Magento/Walmart), (b) attempted live and shown ineffective
-# (revise_attempted=True, revise_proven=False — Amazon, see below), or
-# (c) attempted and proven (revise_attempted=True, revise_proven=True —
-# Shopify). Without this field "not proven" reads as "untried", which was
-# false for Amazon after 24-25 Aug 2026 and made the tool's own warnings less
-# accurate than the evidence already sitting in CLAUDE.md.
+# ONE vocabulary for "what has a live revise push actually shown?", shared by
+# GLT_CHANNELS below and EBAY_CHANNELS further down. Issues #45 (Amazon) and
+# #47 (eBay) found the same defect one channel apart and each needed the same
+# distinction: "not proven" was being rendered as "untried", which was false
+# for both once a push had actually been fired. #47 introduced these two keys
+# and deliberately named them generically so #45 could adopt them verbatim;
+# this is that adoption, replacing #45's interim `revise_attempted` bool.
+#
+# A bool pair (attempted × proven) could represent the nonsense state
+# "never attempted but proven", and nothing stopped a future flag flip from
+# creating it. A single enum cannot: PROVEN is one of the three values, so the
+# contradiction is unrepresentable rather than merely untested.
+PUSH_PROVEN = "proven"                                  # full round-trip confirmed
+PUSH_NEVER_ATTEMPTED = "never_attempted"                # no live push ever fired
+PUSH_ACCEPTED_NOT_PROCESSED = "accepted_but_not_processed"  # fired, 2xx, no channel effect
+PUSH_OBSERVED_STATES = (PUSH_PROVEN, PUSH_NEVER_ATTEMPTED,
+                        PUSH_ACCEPTED_NOT_PROCESSED)
+
+# `push_observed_reason` is the ONLY place the evidence text for a channel may
+# be written; every message interpolates it via `_push_observation_reason()`
+# and never retypes it. Hard-coding a channel's state into a message is the
+# mistake this codebase has already made and fixed twice (see
+# `_proven_delete_channels`), and a third time is what #45's message branch
+# would have been.
 GLT_CHANNELS: dict[str, dict] = {
     "shopify": {"channel_type": "Shopify", "channel_name": "SHOPIFY", "source": "SHOPIFY",
-                "delete_proven": True, "revise_proven": True, "revise_attempted": True},
+                "delete_proven": True, "revise_proven": True,
+                "push_observed_state": PUSH_PROVEN, "push_observed_reason": None},
     # Amazon Delete LIVE-PROVEN 5 Aug 2026 on MOB-GRP-3080 (template 31703, ASIN
     # B0B311TFG3): ProcessTemplates Delete → 2xx, the AMAZON channel-SKU row and
     # the template both disappeared, eBay/Shopify rows and stock untouched. NB it
@@ -10465,7 +10482,19 @@ GLT_CHANNELS: dict[str, dict] = {
     #  is ever fixed, the same bulk call would revert live content the way the
     #  Shopify catnip push did (v1.27.1); the current inertness is not safety.
     "amazon":  {"channel_type": "Amazon",  "channel_name": "AMAZON",  "source": "AMAZON",
-                "delete_proven": True, "revise_proven": False, "revise_attempted": True},
+                "delete_proven": True, "revise_proven": False,
+                "push_observed_state": PUSH_ACCEPTED_NOT_PROCESSED,
+                "push_observed_reason": (
+                    "ProcessTemplates Revise/Update was fired live on Amazon twice "
+                    "(issue #45, 24-25 Aug 2026, templates 32064 and 32239). Both "
+                    "pushes were accepted (processed:true) and produced no "
+                    "observable change on the listing -- the second, a price push on "
+                    "an MFN standalone, never moved the offer price across an hour of "
+                    "3-minute polling. This records what was observed on those two "
+                    "listings at that time; it is not a proven rule about the API "
+                    "path. revise_proven remains the single gate and stays False "
+                    "until a push demonstrably lands."
+                )},
     # TikTok Delete LIVE-PROVEN 7 Aug 2026 on ven-20-black-raw-core-complete-7.5
     # (template 30006, configurator 112, listing 1729486505080953421): the TIKTOK
     # channel-SKU row vanished, OpenTemplatesByInventory on ChannelId 30 went 1 → 0,
@@ -10482,11 +10511,14 @@ GLT_CHANNELS: dict[str, dict] = {
     # Amazon only) — genuinely untried, not merely unproven; do not conflate
     # with Amazon's tried-and-ineffective state above.
     "tiktok":  {"channel_type": "TikTok",  "channel_name": "TIKTOK",  "source": "TIKTOK",
-                "delete_proven": True, "revise_proven": False, "revise_attempted": False},
+                "delete_proven": True, "revise_proven": False,
+                "push_observed_state": PUSH_NEVER_ATTEMPTED, "push_observed_reason": None},
     "magento": {"channel_type": "Magento", "channel_name": "MAGENTO", "source": "MAGENTO",
-                "delete_proven": False, "revise_proven": False, "revise_attempted": False},
+                "delete_proven": False, "revise_proven": False,
+                "push_observed_state": PUSH_NEVER_ATTEMPTED, "push_observed_reason": None},
     "walmart": {"channel_type": "Walmart", "channel_name": "WALMART", "source": "WALMART",
-                "delete_proven": False, "revise_proven": False, "revise_attempted": False},
+                "delete_proven": False, "revise_proven": False,
+                "push_observed_state": PUSH_NEVER_ATTEMPTED, "push_observed_reason": None},
 }
 
 # Channels seen in this tenant's channel-SKU table that the GLT cannot touch at
@@ -10533,12 +10565,120 @@ def _proven_revise_channels() -> str:
 # a registry, like GLT_CHANNELS, rather than a bare bool, so a warning message
 # can always be *derived* rather than hard-coded (the mistake this codebase has
 # already made and fixed twice for GLT_CHANNELS — see `_proven_delete_channels`).
+#
+# Issue #47 (26 Aug 2026): the live push was fired for the first time and
+# turned out to be ACCEPTED by Linnworks but not observed to reach the
+# channel — a distinct fact from `revise_proven`, which only answers "has a
+# full round-trip been confirmed?". `push_observed_state` /
+# `push_observed_reason` record that distinction as DATA, not prose, so every
+# message DERIVES it instead of a hand-typed string drifting out of sync (the
+# same twice-fixed lesson as `_proven_delete_channels`/`_proven_revise_channels`
+# above). `push_observed_reason` is the ONLY place its literal text may be
+# written — every caller below interpolates it via `_ebay_push_observation_
+# reason()`, never retypes it. This is subordinate evidence, not a second
+# proof flag: `revise_proven` alone remains the single gate a caller trusts.
+#
+# #45 adoption: Amazon's GLT Revise is in the identical situation — accepted,
+# no observable channel effect, `revise_proven` False on evidence rather than
+# caution. These two field names were deliberately named generically rather
+# than eBay-specifically so `GLT_CHANNELS` could take the SAME two keys
+# verbatim, and it now does: both registries share the one vocabulary defined
+# beside `GLT_CHANNELS` above, and `_assert_push_observations_consistent()`
+# holds both to it. #45 shipped an interim `revise_attempted` bool for the
+# same job; it is gone, because a bool pair can represent a contradiction the
+# enum cannot.
 EBAY_CHANNELS: dict[str, dict] = {
     "ebay": {
         "source": "EBAY",
         "revise_proven": False,
+        "push_observed_state": PUSH_ACCEPTED_NOT_PROCESSED,
+        "push_observed_reason": (
+            "A live push was submitted against a real eBay listing on 26 Aug 2026 "
+            "(ven-grip-cleaner, item 286493672322) and accepted by Linnworks (2xx), "
+            "but across a two-hour polling window on the description-frame URL no "
+            "channel-side effect was observed; the identical edit pushed from the "
+            "Linnworks listing UI landed within minutes. This records what was "
+            "observed on that one listing at that time -- it is not a proven rule "
+            "about the API path. revise_proven remains the single gate and stays "
+            "False until a fresh proof lands."
+        ),
     },
 }
+
+# The route that DOES work today, appended to every message that also carries
+# the observation reason above (issue #47, AC3) — kept as its own constant
+# rather than folded into `push_observed_reason` so the registry's reason
+# field stays a pure description of what was observed, not instructions.
+EBAY_UI_WORKAROUND_NOTE = (
+    "The route that works today for propagating an eBay description edit is "
+    "the Linnworks listing UI -- review this tool's dry-run manifest first to "
+    "see what would be sent, then make the same edit there."
+)
+
+
+def _push_observation_reason(entry: dict) -> str:
+    """The single read site for any registry's `push_observed_reason`.
+
+    Every message interpolates this and never retypes the literal text, so a
+    correction to a registry entry is a one-line change everywhere it is
+    surfaced (the discipline `_proven_delete_channels` established). Works for
+    both GLT_CHANNELS and EBAY_CHANNELS entries -- they share one shape.
+
+    Returns "" for a channel with nothing observed, so a caller can always
+    interpolate the result without a None check.
+    """
+    return entry.get("push_observed_reason") or ""
+
+
+def _ebay_push_observation_reason() -> str:
+    """eBay's reason text. Kept as a named accessor because #47's messages and
+    tests read it by name; the logic lives in `_push_observation_reason`."""
+    return _push_observation_reason(EBAY_CHANNELS["ebay"])
+
+
+def _assert_push_observations_consistent() -> None:
+    """Hold every listing registry to the one vocabulary, at import time.
+
+    Two invariants, both of which a bool pair left to a test at best:
+      - `push_observed_state` is one of PUSH_OBSERVED_STATES.
+      - `revise_proven` is True exactly when the state is PUSH_PROVEN, so the
+        registry can never claim a channel is proven while also recording that
+        no push was ever fired (or vice versa). #45's own brief named this as a
+        trap -- "two sources of truth ... constrain the pair, or derive one
+        from the other" -- and shipped without either. This is the constraint.
+
+    An evidence reason is required for PUSH_ACCEPTED_NOT_PROCESSED, because a
+    channel recorded as tried-and-ineffective with no reason gives a caller a
+    warning it cannot act on.
+
+    Raised at import rather than asserted in a test: a contradictory registry
+    is a programming error in this file, and failing fast beats serving a tool
+    whose warnings contradict themselves.
+    """
+    for name, registry in (("GLT_CHANNELS", GLT_CHANNELS),
+                           ("EBAY_CHANNELS", EBAY_CHANNELS)):
+        for key, entry in registry.items():
+            state = entry.get("push_observed_state")
+            if state not in PUSH_OBSERVED_STATES:
+                raise ValueError(
+                    f"{name}['{key}'].push_observed_state={state!r} is not one of "
+                    f"{PUSH_OBSERVED_STATES}"
+                )
+            if entry.get("revise_proven") is not (state == PUSH_PROVEN):
+                raise ValueError(
+                    f"{name}['{key}'] contradicts itself: revise_proven="
+                    f"{entry.get('revise_proven')!r} with push_observed_state="
+                    f"{state!r}"
+                )
+            if state == PUSH_ACCEPTED_NOT_PROCESSED and not entry.get(
+                    "push_observed_reason"):
+                raise ValueError(
+                    f"{name}['{key}'] is {PUSH_ACCEPTED_NOT_PROCESSED} but carries "
+                    "no push_observed_reason"
+                )
+
+
+_assert_push_observations_consistent()
 
 
 def _proven_ebay_revise_channels() -> str:
@@ -12351,14 +12491,16 @@ def refresh_channel_listing(
     (v1.27.1, 14 Jul 2026). On AMAZON it has been FIRED LIVE TWICE and
     PRODUCED NO OBSERVABLE CHANGE on either listing (issue #45, 24-25 Aug
     2026, templates 32064 + 32239) — tried and shown ineffective, not merely
-    untried (see `GLT_CHANNELS["amazon"]["revise_attempted"]`). On TIKTOK it
+    untried (see `GLT_CHANNELS["amazon"]["push_observed_state"]`). On TIKTOK it
     has never been attempted live at all — only the Delete action has been
     fired live there (`unpublish_channel_listing`). Each plan row and the
     response carry `revise_proven` (proof) and the registry also carries
-    `revise_attempted` (whether a live push was ever tried) — an unproven
-    channel is warned about in every message, worded differently depending on
-    which state it's in — see `channel` below for what the eventual
-    single-listing live proof needs to check.
+    `push_observed_state` — "proven", "never_attempted" or
+    "accepted_but_not_processed", the same vocabulary `EBAY_CHANNELS` uses —
+    so an unproven channel is warned about in every message, worded from the
+    registry's own evidence text depending on which state it's in. See
+    `channel` below for what the eventual single-listing live proof needs to
+    check.
 
     This is the revise counterpart to `list_to_shopify`: that tool CREATES new
     listings; this one REVISES listings that already exist. It never creates a
@@ -12785,6 +12927,7 @@ def refresh_channel_listing(
                 "sub_source":            sub_source,
                 "templates_on_item":     len(templates),
                 "revise_proven":         ch["revise_proven"],
+                "push_observed_state":   ch["push_observed_state"],
                 "template_id":           t.get("Id"),
                 "configurator_id":       t.get("ConfiguratorId"),
                 "active_listing_id":     _glt_field(info, "ActiveListingId"),
@@ -12841,6 +12984,7 @@ def refresh_channel_listing(
         "target_channel_id":     target_channel_id,
         "sub_source_resolution": target["resolution"],
         "revise_proven":         ch["revise_proven"],
+        "push_observed_state":   ch["push_observed_state"],
         "available_sub_sources": available_sub_sources,
         "plan":                  plan,
         "unresolved":            unresolved,
@@ -12873,21 +13017,22 @@ def refresh_channel_listing(
     # _proven_delete_channels's docstring): a hard-coded "Shopify only" string
     # would still say that after Amazon or TikTok gets proven.
     #
-    # Two distinct unproven states (issue #45): "never attempted" (TikTok/
-    # Magento/Walmart — genuinely untried) and "attempted, no observable
-    # effect" (Amazon — tried live twice and shown ineffective). Collapsing
+    # Two distinct unproven states (issues #45, #47): "never attempted"
+    # (TikTok/Magento/Walmart — genuinely untried) and "accepted but not
+    # processed" (Amazon — fired live twice and shown ineffective). Collapsing
     # both into one "not yet live-proven" message understated what is already
-    # known about Amazon, so the wording is derived from `revise_attempted`
-    # on the registry rather than hard-coded to either state.
+    # known about Amazon, so the state comes from `push_observed_state` and
+    # the evidence text is interpolated from the registry's own
+    # `push_observed_reason` — never retyped here, so a correction to the
+    # evidence is a one-line change and this message cannot drift from it.
     if ch["revise_proven"]:
         unproven_note = ""
-    elif ch.get("revise_attempted"):
+    elif ch["push_observed_state"] == PUSH_ACCEPTED_NOT_PROCESSED:
         unproven_note = (
-            f" ⚠️  ProcessTemplates Revise/Update has been fired live on {ch['channel_type']} "
-            "and produced no observable change on either listing it was tried against "
-            f"(issue #45) — this channel is TRIED AND SHOWN INEFFECTIVE, not merely untried "
-            f"(proven: {_proven_revise_channels()}). Do not trust a bulk push here without "
-            "independently reading the listing data back afterwards."
+            f" ⚠️  {_push_observation_reason(ch)} This channel is TRIED AND SHOWN "
+            f"INEFFECTIVE, not merely untried (proven: {_proven_revise_channels()}). "
+            "Do not trust a bulk push here without independently reading the listing "
+            "data back afterwards."
         )
     else:
         unproven_note = (
@@ -14452,8 +14597,12 @@ def _set_archive_state(
 #                                           TemplateIds); body {"parameters":
 #                                           {...}} — see gotchas below
 #   POST Listings/ProcesseBayListings    -> push an updated EbayListing back
-#                                           (204 No Content); NOT fired live by
-#                                           this build (out of scope)
+#                                           (204 No Content); fired live
+#                                           26 Aug 2026 (issue #47) — ACCEPTED
+#                                           (204) but not observed to reach
+#                                           the channel on this tenant; see
+#                                           the wrapper note below and
+#                                           EBAY_CHANNELS["ebay"] above
 #
 # ⚠️  GeteBayTemplates REQUIRES either a non-zero ConfigId or a non-empty
 # TemplateIds — both confirmed live (Source/SubSource alone, or an empty/zero
@@ -14503,11 +14652,25 @@ def _set_archive_state(
 # sending ONLY the Description field — Title, Attributes, Categories, Price
 # and everything else on the template are read and carried through UNCHANGED,
 # matching the "nulls clear omitted fields" convention this codebase has hit
-# on every other Linnworks update endpoint — is believed to preserve the
-# seller's design wrapper, which appears to be applied by eBay outside of
-# anything Linnworks stores. This is NOT proven on a listing KNOWN to use a
-# visible design wrapper — verify on one before trusting a bulk run (see the
-# post-merge verification steps in CLAUDE.md).
+# on every other Linnworks update endpoint.
+#
+# Issue #47 (26 Aug 2026) confirmed WHY the wrapper never appears in
+# Description: it is composed by the SELLER'S DESIGN TEMPLATE AT PUSH TIME,
+# around whatever inner content it is given — Linnworks never stores it. On
+# `ven-grip-cleaner` (item 286493672322, in the "EVRi - Single Image"
+# configurator — ~150 of this tenant's templates, NOT re-checked across the
+# other 32 configurators), a UI-INITIATED push of the same edited description
+# — made through the Linnworks listing UI, not this tool's API path — landed
+# with BOTH furniture blocks intact. That is UI-initiated evidence about the
+# wrapper only. It is NOT evidence about the API path: the API-submitted push
+# on that same listing was accepted (204) but was never observed to reach the
+# channel at all across a two-hour poll (see
+# EBAY_CHANNELS["ebay"]["push_observed_reason"] and CLAUDE.md's v1.48.1
+# entry), so it produced no observation one way or the other about what an
+# API-initiated push would do to the wrapper. Do not read this as "wrapper
+# preservation proven for this tool" — that has not been shown, and the one
+# UI observation is scoped to the "EVRi - Single Image" configurator, not all
+# 33 on this tenant.
 #
 # ⚠️  STALE-SNAPSHOT FAMILY (issue #43's own trap list, echoing v1.27.1 —
 # ProcessTemplates Update on Shopify pushed a 5-month-stale price and reverted
@@ -14648,8 +14811,10 @@ def _find_ebay_template_for_listing(listing_id: str, config_id: str | None = Non
     that. Called during PLANNING (including on a dry run — issue #43's own
     stale-snapshot trap requires the stored Title/Price to be shown in the
     manifest before a write is confirmed, not just before a live push) and
-    once more, config-scoped, after a live push as a read-back. Never fired
-    live by this build (issue #43 keeps proving the push live out of scope).
+    once more, config-scoped, after a live push as a read-back. The live push
+    itself was fired for the first time 26 Aug 2026 (issue #47) — accepted
+    (204) but not observed to reach the channel; see
+    EBAY_CHANNELS["ebay"]["push_observed_reason"].
 
     Raises `RateLimitError` (does NOT catch/swallow it) when the quota is
     exhausted, at either the configurator list or the template sweep — the
@@ -14739,12 +14904,21 @@ def revise_ebay_listing_description(
     create, end or relist a listing — revise of an EXISTING listing's
     description only.
 
-    ⚠️  NOT LIVE-PROVEN. Listings/ProcesseBayListings has never been fired
-    against a real listing by this build (deliberately out of scope — see the
-    issue and CLAUDE.md's post-merge verification steps). A `processed`/
-    `unconfirmed` result here means Linnworks ACCEPTED the push, never that
-    the listing changed. EBAY_CHANNELS["ebay"]["revise_proven"] stays False
-    until a human runs those steps on ONE low-risk listing.
+    ⚠️  ACCEPTED BUT NOT OBSERVED TO PROCESS — revise_proven still False.
+    Listings/ProcesseBayListings WAS fired live on 26 Aug 2026 (issue #47)
+    against a real listing (ven-grip-cleaner, item 286493672322): Linnworks
+    ACCEPTED the push (204), but across a two-hour poll of the
+    description-frame URL no channel-side effect was observed, while the
+    identical edit pushed from the Linnworks listing UI landed within
+    minutes. See EBAY_CHANNELS["ebay"]["push_observed_reason"] for the full
+    observation and CLAUDE.md's v1.48.1 entry for the write-up. A
+    `processed`/`unconfirmed` result here means Linnworks ACCEPTED the push,
+    never that the listing changed. EBAY_CHANNELS["ebay"]["revise_proven"]
+    stays False on that EVIDENCE, not on caution, until a fresh proof lands
+    (see CLAUDE.md's post-merge verification steps). Until then, the route
+    that works today for propagating a description edit is the Linnworks
+    listing UI — review this tool's dry-run manifest first, then make the
+    same edit there.
 
     ⚠️  STALE-SNAPSHOT FAMILY (v1.27.1 echo). The push sends the FULL stored
     eBay template back with only Description swapped — Title, Price and
@@ -14884,7 +15058,8 @@ def revise_ebay_listing_description(
 
     Returns:
         A dict with:
-          - dry_run, sku_count, store, revise_proven, verification_note
+          - dry_run, sku_count, store, revise_proven, push_observed_state,
+            verification_note
           - plan: one row per eBay listing id — listing_id, covers_skus,
             description (the value that would be/was pushed),
             description_source (channel_override / channel_override_prefix /
@@ -14900,7 +15075,9 @@ def revise_ebay_listing_description(
             failure), staleness (stored_title / stored_price / title_stale /
             warning — None if the template could not be located), revise_proven
             (from EBAY_CHANNELS — derived per row, not hard-coded, same as the
-            top-level flag)
+            top-level flag), push_observed_state (from EBAY_CHANNELS — the
+            observation-state code, e.g. "accepted_but_not_processed";
+            subordinate to revise_proven, which remains the single gate)
           - not_listed: SKUs with no matching eBay channel-SKU row for `store`
           - unresolved: SKUs that failed to resolve
           - rate_limited: SKUs/reads/listings that hit the Linnworks quota — a
@@ -15035,6 +15212,7 @@ def revise_ebay_listing_description(
             "blocked_reason": blocked_reason,
             "never_synced_skus": entry["never_synced_skus"],
             "revise_proven": EBAY_CHANNELS["ebay"]["revise_proven"],
+            "push_observed_state": EBAY_CHANNELS["ebay"]["push_observed_state"],
         }
         if entry["never_synced_skus"]:
             row_out["never_synced_warning"] = (
@@ -15114,13 +15292,15 @@ def revise_ebay_listing_description(
         f"({EBAY_DESCRIPTION_FRAME_URL_TEMPLATE.format(item_id='<item_id>')}), never the item "
         "page — the description sits in a cross-origin frame there and can report stale/old "
         f"text even when the new description is already live. Proven eBay accounts: "
-        f"{_proven_ebay_revise_channels()}."
+        f"{_proven_ebay_revise_channels()}. {_ebay_push_observation_reason()} "
+        f"{EBAY_UI_WORKAROUND_NOTE}"
     )
 
     base_out = {
         "sku_count": len(skus),
         "store": store,
         "revise_proven": EBAY_CHANNELS["ebay"]["revise_proven"],
+        "push_observed_state": EBAY_CHANNELS["ebay"]["push_observed_state"],
         "verification_note": verification_note,
         "plan": plan,
         "not_listed": not_listed,
@@ -15141,7 +15321,8 @@ def revise_ebay_listing_description(
             "message": (
                 f"{len(pushable)} listing(s) would be revised, {len(plan) - len(pushable)} "
                 f"blocked, {len(not_listed)} not listed on '{store}', {len(unresolved)} "
-                f"unresolved, {len(rate_limited)} rate-limited. No write calls were made."
+                f"unresolved, {len(rate_limited)} rate-limited. No write calls were made. "
+                + verification_note
             ),
         }
 
