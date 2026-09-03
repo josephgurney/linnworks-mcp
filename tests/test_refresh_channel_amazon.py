@@ -392,8 +392,15 @@ class TestAmazonRegistryRecordsAttemptedNoEffect:
 
     def test_amazon_entry_is_attempted_but_not_proven(self):
         entry = server.GLT_CHANNELS["amazon"]
-        assert entry["revise_attempted"] is True
+        assert entry["push_observed_state"] == server.PUSH_ACCEPTED_NOT_PROCESSED
         assert entry["revise_proven"] is False
+
+    def test_amazon_entry_carries_its_evidence_on_the_registry(self):
+        """The warning text is interpolated from this field, never retyped in
+        the message -- so the evidence has to live here."""
+        reason = server.GLT_CHANNELS["amazon"]["push_observed_reason"]
+        assert "fired live on Amazon" in reason
+        assert "no observable change" in reason
 
 
 class TestTikTokRegistryStillReadsAsNeverAttempted:
@@ -402,15 +409,17 @@ class TestTikTokRegistryStillReadsAsNeverAttempted:
 
     def test_tiktok_entry_is_never_attempted_and_not_proven(self):
         entry = server.GLT_CHANNELS["tiktok"]
-        assert entry["revise_attempted"] is False
+        assert entry["push_observed_state"] == server.PUSH_NEVER_ATTEMPTED
         assert entry["revise_proven"] is False
+        # Nothing observed, so nothing to interpolate into a message.
+        assert entry["push_observed_reason"] is None
 
-    def test_amazon_and_tiktok_are_distinguishable_on_revise_attempted(self):
+    def test_amazon_and_tiktok_are_distinguishable_on_push_observed_state(self):
         amazon = server.GLT_CHANNELS["amazon"]
         tiktok = server.GLT_CHANNELS["tiktok"]
-        # Both are equally NOT proven -- the new field is what tells them apart.
+        # Both are equally NOT proven -- the state field is what tells them apart.
         assert amazon["revise_proven"] == tiktok["revise_proven"] is False
-        assert amazon["revise_attempted"] != tiktok["revise_attempted"]
+        assert amazon["push_observed_state"] != tiktok["push_observed_state"]
 
 
 class TestAmazonTriedAndIneffective:
@@ -492,7 +501,12 @@ class TestProvenListStillDerivedFromRegistry:
     from the registry, not hard-coded -- flipping a fixture flag changes it."""
 
     def test_flipping_amazon_proven_in_a_fixture_changes_the_named_list(self):
-        with patch.dict(server.GLT_CHANNELS["amazon"], {"revise_proven": True}):
+        # Both keys move together: the pair is constrained, so patching only
+        # revise_proven would fabricate a state the registry cannot hold.
+        with patch.dict(server.GLT_CHANNELS["amazon"],
+                        {"revise_proven": True,
+                         "push_observed_state": server.PUSH_PROVEN}):
+            server._assert_push_observations_consistent()
             assert "Amazon" in server._proven_revise_channels()
             out, _ = _run([SKU_AMZ], sub_source="The Warehouse Group", channel="Amazon",
                           check_staleness=False)
@@ -500,6 +514,29 @@ class TestProvenListStillDerivedFromRegistry:
             assert "fired live on Amazon" not in out["message"]
         # Reverted outside the patch -- the real registry is untouched.
         assert server.GLT_CHANNELS["amazon"]["revise_proven"] is False
+
+    def test_the_warning_text_comes_from_the_registry_not_the_message(self):
+        """The mistake this codebase has already made and fixed twice: a
+        channel's state hand-typed into a message, which then survives a
+        change to the evidence. Patch the reason, and the message must follow.
+        """
+        with patch.dict(server.GLT_CHANNELS["amazon"],
+                        {"push_observed_reason": "PATCHED EVIDENCE zzyzx"}):
+            out, _ = _run([SKU_AMZ], sub_source="The Warehouse Group", channel="Amazon",
+                          check_staleness=False)
+            assert "PATCHED EVIDENCE zzyzx" in out["message"]
+            assert "fired live on Amazon" not in out["message"]
+
+    def test_the_state_is_surfaced_on_the_response_and_every_plan_row(self):
+        """One shape with EBAY_CHANNELS, which already surfaces this at both
+        levels -- a caller must be able to tell 'never tested' from 'tested,
+        does nothing' without reading our docs."""
+        out, _ = _run([SKU_AMZ], sub_source="The Warehouse Group", channel="Amazon",
+                      check_staleness=False)
+        assert out["push_observed_state"] == server.PUSH_ACCEPTED_NOT_PROCESSED
+        assert out["plan"]
+        for row in out["plan"]:
+            assert row["push_observed_state"] == server.PUSH_ACCEPTED_NOT_PROCESSED
 
 
 class TestDocstringNoLongerClaimsAmazonVariationShapeUnobserved:

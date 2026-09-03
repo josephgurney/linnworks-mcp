@@ -133,24 +133,71 @@ def _refresh_channel_listing_claude_row() -> str:
     return match.group(0)
 
 
-def test_registry_carries_a_revise_attempted_bool_on_every_channel():
-    for key, entry in server.GLT_CHANNELS.items():
-        assert isinstance(entry.get("revise_attempted"), bool), (
-            f"GLT_CHANNELS['{key}'] is missing a bool revise_attempted field"
-        )
-        # A channel cannot be proven without having been attempted at all.
-        if entry["revise_proven"]:
-            assert entry["revise_attempted"] is True, key
+def test_every_registry_uses_the_one_push_observed_vocabulary():
+    """#45 and #47 found the same defect one channel apart. They must not end
+    up with two names for it: GLT_CHANNELS and EBAY_CHANNELS share the single
+    PUSH_OBSERVED_STATES vocabulary, and no channel carries #45's interim
+    revise_attempted bool any more.
+    """
+    for name, registry in (("GLT_CHANNELS", server.GLT_CHANNELS),
+                           ("EBAY_CHANNELS", server.EBAY_CHANNELS)):
+        for key, entry in registry.items():
+            assert entry.get("push_observed_state") in server.PUSH_OBSERVED_STATES, (
+                f"{name}['{key}'] is missing a valid push_observed_state"
+            )
+            assert "revise_attempted" not in entry, (
+                f"{name}['{key}'] still carries the superseded revise_attempted bool"
+            )
+
+
+def test_a_registry_cannot_claim_proven_and_never_attempted_at_once():
+    """The reason the enum replaced the bool pair. #45's own brief named this
+    trap -- two sources of truth that can disagree -- and shipped without a
+    guard; the import-time check is that guard, so assert it actually bites.
+    """
+    for key, entry in list(server.GLT_CHANNELS.items()) + list(server.EBAY_CHANNELS.items()):
+        assert entry["revise_proven"] is (
+            entry["push_observed_state"] == server.PUSH_PROVEN), key
+
+    original = dict(server.GLT_CHANNELS["amazon"])
+    try:
+        # revise_proven True while nothing was ever pushed: the contradiction
+        # the bool pair allowed. The validator must refuse it.
+        server.GLT_CHANNELS["amazon"] = {
+            **original, "revise_proven": True,
+            "push_observed_state": server.PUSH_NEVER_ATTEMPTED,
+        }
+        with pytest.raises(ValueError, match="contradicts itself"):
+            server._assert_push_observations_consistent()
+    finally:
+        server.GLT_CHANNELS["amazon"] = original
+    # And the guard passes again once the contradiction is gone.
+    server._assert_push_observations_consistent()
+
+
+def test_tried_and_ineffective_channels_must_carry_their_evidence():
+    """A channel recorded as accepted-but-not-processed with no reason gives a
+    caller a warning it cannot act on -- and the warning text is interpolated
+    from that field, so an empty one silently guts the message."""
+    original = dict(server.GLT_CHANNELS["amazon"])
+    assert original["push_observed_state"] == server.PUSH_ACCEPTED_NOT_PROCESSED
+    assert original["push_observed_reason"]
+    try:
+        server.GLT_CHANNELS["amazon"] = {**original, "push_observed_reason": None}
+        with pytest.raises(ValueError, match="no push_observed_reason"):
+            server._assert_push_observations_consistent()
+    finally:
+        server.GLT_CHANNELS["amazon"] = original
 
 
 def test_readme_and_claude_md_agree_with_the_registry_on_amazon_revise():
     """Amazon: revise_proven is False in the registry -- neither doc may
     claim it as proven, and both must state the tried-and-ineffective fact
-    the registry now carries (revise_attempted) rather than merely 'untried'.
+    the registry now carries (push_observed_state) rather than merely 'untried'.
     """
     amazon = server.GLT_CHANNELS["amazon"]
     assert amazon["revise_proven"] is False
-    assert amazon["revise_attempted"] is True
+    assert amazon["push_observed_state"] == server.PUSH_ACCEPTED_NOT_PROCESSED
 
     readme_row = _refresh_channel_listing_readme_row()
     claude_row = _refresh_channel_listing_claude_row()
@@ -172,7 +219,7 @@ def test_readme_and_claude_md_agree_with_the_registry_on_tiktok_revise():
     was tried, and it must read distinctly from Amazon's wording."""
     tiktok = server.GLT_CHANNELS["tiktok"]
     assert tiktok["revise_proven"] is False
-    assert tiktok["revise_attempted"] is False
+    assert tiktok["push_observed_state"] == server.PUSH_NEVER_ATTEMPTED
 
     readme_row = _refresh_channel_listing_readme_row()
     claude_row = _refresh_channel_listing_claude_row()
