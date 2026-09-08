@@ -487,7 +487,7 @@ WRITE_THRESHOLDS: dict[str, int] = {
     "set_inventory_item_prices":      25,   # immediate channel price impact
     "create_or_update_inventory_item": 50,  # channel sync is async, less instant
     "set_extended_properties":        50,   # metadata, lower blast radius
-    "delete_extended_properties":     50,   # IRREVERSIBLE — but same metadata blast radius as its upsert sibling
+    "delete_extended_properties":     10,   # IRREVERSIBLE — matches every other delete in this table
     "set_inventory_item_descriptions": 50,  # content, lower blast radius
     "set_inventory_item_titles":      50,   # channel title overrides, lower blast radius
     "set_inventory_item_suppliers":   50,   # purchasing metadata, lower blast radius
@@ -8288,7 +8288,7 @@ def delete_extended_properties(
 
     IRREVERSIBLE — once a row is deleted, restoring it means calling
     set_extended_properties again with the value you saw in the manifest.
-    Batches where more than 50 property rows would actually be deleted
+    Batches where more than 10 property rows would actually be deleted
     require confirmed_count=<that number> (the staging count is the number
     of rows queued for deletion after resolving/matching, not the number of
     input entries — a batch of 5 input entries that expands to 60 matching
@@ -8313,7 +8313,7 @@ def delete_extended_properties(
             - expected_value (str): Optional guard — if supplied and it doesn't
                                     match the property's current value, the row
                                     is blocked rather than deleted.
-        confirmed_count: For batches where more than 50 rows would actually be
+        confirmed_count: For batches where more than 10 rows would actually be
             deleted, pass that resolved count here (see IRREVERSIBLE note above).
         dry_run: If True (default), returns the manifest without deleting.
             Set to False to execute.

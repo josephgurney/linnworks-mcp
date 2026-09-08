@@ -290,7 +290,7 @@ All write tools default to `dry_run=True` — they will describe what they would
 | `set_inventory_item_prices` | 25 items |
 | `create_or_update_inventory_item` | 50 items |
 | `set_extended_properties` | 50 items |
-| `delete_extended_properties` | 50 rows |
+| `delete_extended_properties` | 10 rows |
 | `set_inventory_item_descriptions` | 50 items |
 | `set_inventory_item_titles` | 50 items |
 | `set_inventory_item_suppliers` | 50 items |

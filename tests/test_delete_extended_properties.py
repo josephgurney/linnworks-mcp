@@ -336,8 +336,8 @@ def test_read_back_that_still_returns_the_row_reports_still_present_not_deleted(
 
 # ── criterion 11: WRITE_THRESHOLDS + staging ─────────────────────────────────
 
-def test_threshold_is_fifty():
-    assert server.WRITE_THRESHOLDS["delete_extended_properties"] == 50
+def test_threshold_is_ten():
+    assert server.WRITE_THRESHOLDS["delete_extended_properties"] == 10
 
 
 def test_batch_above_threshold_without_confirmed_count_stages_and_writes_nothing():
