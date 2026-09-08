@@ -1,7 +1,7 @@
 # Linnworks MCP Server
 
-![Version](https://img.shields.io/badge/version-1.48.3-blue)
-![Tools](https://img.shields.io/badge/tools-85-blue)
+![Version](https://img.shields.io/badge/version-1.49.0-blue)
+![Tools](https://img.shields.io/badge/tools-86-blue)
 
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
 
@@ -68,6 +68,7 @@ Once installed, Claude gets access to these tools:
 | `set_inventory_item_titles` | Set or update channel-specific listing titles (override the base title per channel) |
 | `set_inventory_item_descriptions` | Create or update channel-specific descriptions on items |
 | `set_extended_properties` | Create or update extended property key/value pairs on items |
+| `delete_extended_properties` | Remove extended properties by SKU + name — irreversible, staged. Matches ALL rows sharing a name and supports an `expected_value` guard |
 | `set_inventory_item_suppliers` | Attach or update an item's supplier links — supplier code, cost, lead time, default flag |
 | `add_inventory_item_images` | Attach images to items by URL |
 | `delete_inventory_item_images` | Remove images from an item by image ID — irreversible, staged |
@@ -289,6 +290,7 @@ All write tools default to `dry_run=True` — they will describe what they would
 | `set_inventory_item_prices` | 25 items |
 | `create_or_update_inventory_item` | 50 items |
 | `set_extended_properties` | 50 items |
+| `delete_extended_properties` | 10 rows |
 | `set_inventory_item_descriptions` | 50 items |
 | `set_inventory_item_titles` | 50 items |
 | `set_inventory_item_suppliers` | 50 items |
