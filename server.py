@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.48.3"
+__version__ = "1.49.0"
 
 import json
 import os
@@ -487,6 +487,7 @@ WRITE_THRESHOLDS: dict[str, int] = {
     "set_inventory_item_prices":      25,   # immediate channel price impact
     "create_or_update_inventory_item": 50,  # channel sync is async, less instant
     "set_extended_properties":        50,   # metadata, lower blast radius
+    "delete_extended_properties":     50,   # IRREVERSIBLE — but same metadata blast radius as its upsert sibling
     "set_inventory_item_descriptions": 50,  # content, lower blast radius
     "set_inventory_item_titles":      50,   # channel title overrides, lower blast radius
     "set_inventory_item_suppliers":   50,   # purchasing metadata, lower blast radius
@@ -4350,6 +4351,30 @@ def get_locations() -> dict:
     }
 
 
+def _fetch_extended_properties(stock_item_id: str) -> list:
+    """
+    Fetch the raw extended-property rows for one stock item.
+
+    Shared by get_extended_properties, set_extended_properties and
+    delete_extended_properties (issue #50) so the same
+    Inventory/GetInventoryItemExtendedProperties GET isn't inlined a third
+    time. Always issues a fresh call — callers that need a pre-write cache
+    (to avoid re-reading the same item once per property row in a batch)
+    should cache the RESULT of this call themselves; this function never
+    caches internally, so a caller that wants a guaranteed-fresh read-back
+    after a write (rather than a stale pre-write snapshot) just calls it
+    again.
+
+    Returns [] if the item has no extended properties (or the response
+    shape is unexpected) rather than raising.
+    """
+    rows = call_linnworks(
+        "Inventory/GetInventoryItemExtendedProperties",
+        {"inventoryItemId": stock_item_id},  # unwrapped — confirmed working
+    )
+    return rows if isinstance(rows, list) else []
+
+
 @mcp.tool()
 def get_extended_properties(sku: str) -> dict:
     """
@@ -4366,7 +4391,8 @@ def get_extended_properties(sku: str) -> dict:
 
     Returns:
         A dict with the item identity and a list of extended property records,
-        each with a name, value, and type.
+        each with a name, value, type, and row_id (the pkRowId — needed by
+        delete_extended_properties to remove a specific row).
     """
     try:
         item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
@@ -4377,23 +4403,21 @@ def get_extended_properties(sku: str) -> dict:
     if not stock_item_id:
         return {"error": f"Item found for SKU '{sku}' but StockItemId was missing", "sku": sku}
 
-    props = call_linnworks(
-        "Inventory/GetInventoryItemExtendedProperties",
-        {"inventoryItemId": stock_item_id},  # unwrapped — confirmed working
-    )
+    props = _fetch_extended_properties(stock_item_id)
 
     return {
         "sku": sku,
         "stock_item_id": stock_item_id,
         "title": item.get("ItemTitle"),
-        "count": len(props) if isinstance(props, list) else 0,
+        "count": len(props),
         "extended_properties": [
             {
                 "name": p.get("ProperyName"),   # NB: Linnworks API typo — 'ProperyName'
                 "value": p.get("PropertyValue"),
                 "type": p.get("PropertyType"),
+                "row_id": p.get("pkRowId"),
             }
-            for p in (props if isinstance(props, list) else [])
+            for p in props
         ],
     }
 
@@ -8137,11 +8161,7 @@ def set_extended_properties(
             continue
 
         if stock_item_id not in existing_props:
-            rows = call_linnworks(
-                "Inventory/GetInventoryItemExtendedProperties",
-                {"inventoryItemId": stock_item_id},
-            )
-            existing_props[stock_item_id] = rows if isinstance(rows, list) else []
+            existing_props[stock_item_id] = _fetch_extended_properties(stock_item_id)
 
         # Note the confirmed API typo: "ProperyName" not "PropertyName"
         match = next(
@@ -8239,6 +8259,251 @@ def set_extended_properties(
         "errors":     errors,
         "results":    results,
         "manifest":   manifest,
+    }
+
+
+@mcp.tool()
+def delete_extended_properties(
+    properties: list[dict],
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Delete extended-property rows from Linnworks inventory items — the missing
+    delete counterpart to set_extended_properties, which is upsert-only and has
+    no way to remove a property once it exists (issue #50).
+
+    Each row is matched by (sku, property_name); the match is EXACT and
+    CASE-SENSITIVE, the same semantics set_extended_properties already uses —
+    a differently-cased name will not match and is reported unresolved rather
+    than silently removing the wrong row.
+
+    Optionally pass expected_value to guard against removing a value you
+    didn't expect to see: if the current value on Linnworks doesn't match,
+    the row is BLOCKED (not deleted) rather than treated as "not found".
+
+    If an item carries more than one property row sharing the same name,
+    ALL matching rows are included in the manifest and deleted — the manifest
+    shows every row_id so you can see exactly what will be removed.
+
+    IRREVERSIBLE — once a row is deleted, restoring it means calling
+    set_extended_properties again with the value you saw in the manifest.
+    Batches where more than 50 property rows would actually be deleted
+    require confirmed_count=<that number> (the staging count is the number
+    of rows queued for deletion after resolving/matching, not the number of
+    input entries — a batch of 5 input entries that expands to 60 matching
+    rows on a duplicate-name item stages at 60, not 5).
+
+    Read-before-write: every SKU is resolved and the item's CURRENT properties
+    are read first, so the manifest shows the row's real current value and
+    row_id before anything is touched. After a live delete, each affected
+    item's properties are re-read with a FRESH call (never the pre-write
+    cache) and every deleted row_id is classified into `deleted` or
+    `still_present` — a 204 response alone is never reported as success.
+
+    A RateLimitError while resolving a SKU or reading an item's properties is
+    NOT the same as "property not found" — it is bucketed separately under
+    `rate_limited` and the response is marked `complete: False`, rather than
+    silently mislabelling a quota failure as a missing property (issue #34/#37).
+
+    Args:
+        properties: List of dicts, each with:
+            - sku (str):            Item SKU  [required]
+            - property_name (str):  Exact, case-sensitive property name  [required]
+            - expected_value (str): Optional guard — if supplied and it doesn't
+                                    match the property's current value, the row
+                                    is blocked rather than deleted.
+        confirmed_count: For batches where more than 50 rows would actually be
+            deleted, pass that resolved count here (see IRREVERSIBLE note above).
+        dry_run: If True (default), returns the manifest without deleting.
+            Set to False to execute.
+
+    Returns:
+        A dict with:
+          - dry_run:         whether this was a dry run
+          - item_count:      number of input property entries
+          - to_delete_count: number of property ROWS that would be/were deleted
+          - manifest:        per-row preview — sku, stock_item_id, property_name,
+                             expected_value, current_value, row_id, status
+                             ("resolved"/"unresolved"), action
+                             ("delete"/"blocked"/None), reason (when not deleting)
+          - rate_limited:    rows skipped due to a quota failure, not a genuine miss
+          - complete:        False if any row was skipped due to rate limiting
+          - deleted:         row_ids confirmed gone by the read-back (live run only)
+          - still_present:   row_ids the read-back still finds (live run only)
+    """
+    # ── Injection check (before any API call) ──────────────────────────────────
+    for p in properties:
+        _check_injection("property_name", p.get("property_name", ""))
+        if p.get("expected_value") is not None:
+            _check_injection("expected_value", p.get("expected_value"))
+
+    # ── Validate (before any API call) ──────────────────────────────────────────
+    for i, p in enumerate(properties):
+        if not p.get("sku"):
+            raise ValueError(f"properties[{i}] is missing 'sku'.")
+        if not p.get("property_name"):
+            raise ValueError(f"properties[{i}] (SKU '{p.get('sku')}') is missing 'property_name'.")
+
+    sku_cache: dict[str, str] = {}
+    # Pre-write snapshot only — read-before-write manifest building. NEVER
+    # reused for the post-delete read-back, which always issues a fresh call.
+    existing_props: dict[str, list] = {}
+
+    manifest: list[dict] = []
+    rate_limited: list[dict] = []
+    had_rate_limit = False
+
+    for p in properties:
+        sku = p["sku"].strip()
+        prop_name = p["property_name"]
+        expected_value = p.get("expected_value")
+
+        try:
+            stock_item_id = _resolve_sku_to_id(sku, sku_cache)
+        except RateLimitError as exc:
+            had_rate_limit = True
+            rate_limited.append({
+                "sku": sku, "property_name": prop_name,
+                "reason": f"Rate-limited while resolving SKU '{sku}': {exc}",
+            })
+            continue
+        except ValueError as exc:
+            manifest.append({
+                "sku": sku, "stock_item_id": None, "property_name": prop_name,
+                "expected_value": expected_value, "current_value": None,
+                "row_id": None, "status": "unresolved", "action": None,
+                "reason": str(exc),
+            })
+            continue
+
+        if stock_item_id not in existing_props:
+            try:
+                existing_props[stock_item_id] = _fetch_extended_properties(stock_item_id)
+            except RateLimitError as exc:
+                had_rate_limit = True
+                rate_limited.append({
+                    "sku": sku, "property_name": prop_name,
+                    "reason": f"Rate-limited while reading properties for SKU '{sku}': {exc}",
+                })
+                continue
+
+        # Note the confirmed API typo: "ProperyName" not "PropertyName".
+        # Exact, case-sensitive match — same semantics as set_extended_properties.
+        matches = [
+            r for r in existing_props[stock_item_id] if r.get("ProperyName") == prop_name
+        ]
+
+        if not matches:
+            manifest.append({
+                "sku": sku, "stock_item_id": stock_item_id, "property_name": prop_name,
+                "expected_value": expected_value, "current_value": None,
+                "row_id": None, "status": "unresolved", "action": None,
+                "reason": f"Property '{prop_name}' not found on SKU '{sku}'.",
+            })
+            continue
+
+        for match in matches:
+            current_value = match.get("PropertyValue")
+            row_id = match.get("pkRowId")
+            if expected_value is not None and str(current_value) != str(expected_value):
+                manifest.append({
+                    "sku": sku, "stock_item_id": stock_item_id, "property_name": prop_name,
+                    "expected_value": expected_value, "current_value": current_value,
+                    "row_id": row_id, "status": "resolved", "action": "blocked",
+                    "reason": (
+                        f"expected_value '{expected_value}' does not match current "
+                        f"value '{current_value}' for property '{prop_name}' on SKU '{sku}' "
+                        f"(row {row_id}) — not deleted."
+                    ),
+                })
+                continue
+            manifest.append({
+                "sku": sku, "stock_item_id": stock_item_id, "property_name": prop_name,
+                "expected_value": expected_value, "current_value": current_value,
+                "row_id": row_id, "status": "resolved", "action": "delete",
+                "reason": None,
+            })
+
+    to_delete_rows = [m for m in manifest if m["action"] == "delete"]
+
+    # ── Write guard ───────────────────────────────────────────────────────────
+    # Staged on the resolved rows actually queued for deletion (mirrors
+    # delete_inventory_item_images), not the raw input-entry count — one input
+    # entry can expand to several rows on a duplicate-name item.
+    guard = _write_guard("delete_extended_properties", to_delete_rows, confirmed_count, dry_run)
+    if guard is not None:
+        return {
+            **guard, "manifest": manifest, "rate_limited": rate_limited,
+            "complete": not had_rate_limit,
+        }
+
+    if dry_run:
+        return {
+            "dry_run":         True,
+            "item_count":      len(properties),
+            "to_delete_count": len(to_delete_rows),
+            "manifest":        manifest,
+            "rate_limited":    rate_limited,
+            "complete":        not had_rate_limit,
+            "message": (
+                f"Dry run — no properties deleted. {len(to_delete_rows)} row(s) would "
+                f"be removed. Set dry_run=False to execute."
+            ),
+        }
+
+    # ── Live execution — grouped by stock item, one call per item ──────────────
+    by_item: dict[str, list[str]] = {}
+    for m in to_delete_rows:
+        by_item.setdefault(m["stock_item_id"], []).append(m["row_id"])
+
+    deleted: list[str] = []
+    still_present: list[str] = []
+
+    for stock_item_id, row_ids in by_item.items():
+        try:
+            call_linnworks_void(
+                "Inventory/DeleteInventoryItemExtendedProperties",
+                {
+                    "inventoryItemId": stock_item_id,
+                    "inventoryItemExtendedPropertyIds": row_ids,
+                },
+            )
+        except RateLimitError as exc:
+            had_rate_limit = True
+            rate_limited.append({
+                "stock_item_id": stock_item_id, "row_ids": row_ids,
+                "reason": f"Rate-limited while deleting properties: {exc}",
+            })
+            continue
+
+        # ── Read back — a FRESH call, never the pre-write `existing_props` cache ──
+        try:
+            fresh_rows = _fetch_extended_properties(stock_item_id)
+        except RateLimitError as exc:
+            had_rate_limit = True
+            rate_limited.append({
+                "stock_item_id": stock_item_id, "row_ids": row_ids,
+                "reason": f"Rate-limited during read-back: {exc}",
+            })
+            continue
+
+        remaining_ids = {r.get("pkRowId") for r in fresh_rows}
+        for row_id in row_ids:
+            if row_id in remaining_ids:
+                still_present.append(row_id)
+            else:
+                deleted.append(row_id)
+
+    return {
+        "dry_run":         False,
+        "item_count":      len(properties),
+        "to_delete_count": len(to_delete_rows),
+        "manifest":        manifest,
+        "rate_limited":    rate_limited,
+        "complete":        not had_rate_limit,
+        "deleted":         deleted,
+        "still_present":   still_present,
     }
 
 
