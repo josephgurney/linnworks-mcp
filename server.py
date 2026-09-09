@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.51.0"
+__version__ = "1.51.1"
 
 import json
 import os
@@ -4811,6 +4811,15 @@ def find_unlinked_order_lines(
     never folded into `unknown` or silently dropped, so a throttled run can
     never read as a clean "0 unlinked found".
 
+    Separately, an order can be requested from Orders/GetOrdersById (as part
+    of an unthrottled batch) and simply not come back in its response — no
+    error, just absent. That order is reported under `missing_orders`
+    (matched case-insensitively against what was returned, with the entry
+    itself keeping the exact GUID it was requested with) and also sets
+    `complete` to False. This has never been observed live on this tenant;
+    the bucket exists so a scan can never silently under-report its own
+    coverage by counting a dropped order as scanned.
+
     Args:
         include_open: Include currently open (unprocessed) orders. Default True.
         from_date: Start of a processed-order date range, ISO format
@@ -4831,17 +4840,28 @@ def find_unlinked_order_lines(
         A dict with:
           - include_open, from_date, to_date, date_field, only_problems: the
             query parameters used
-          - order_count_scanned: orders successfully read (excludes
-            rate-limited ones)
+          - order_count_scanned: orders actually read and classified. This is
+            NOT the number of GUIDs requested — an order that was
+            rate-limited, or that GetOrdersById simply never returned, is not
+            counted here, and a duplicate order returned twice in one
+            response is only counted once
           - counts: {linked, unlinked, unknown, not_expected} totals across
-            every line in every successfully-read order
+            every line in every classified order
           - orders: per-order rows (order_id, num_order_id, reference_num,
             source, processed, lines), each line row carrying sku, title,
             channel_line_id, channel_line_source, channel_sku,
             is_composite_child, status, reason
           - rate_limited_orders: orders whose detail fetch was throttled and
             so were never classified — retry these
-          - complete: False when anything was rate-limited
+          - missing_orders: orders that were requested from GetOrdersById (on
+            an unthrottled batch) but never came back in its response — same
+            shape as rate_limited_orders (order_id plus whatever list
+            metadata is already held for it). Distinct from
+            rate_limited_orders: the two buckets never share an order
+          - complete: orders read and classified means orders read and
+            classified — this is False when ANYTHING was throttled OR did
+            not come back, whether that shows up in rate_limited_orders or
+            in missing_orders
     """
     if not include_open and not (from_date and to_date):
         raise ValueError(
@@ -4904,6 +4924,14 @@ def find_unlinked_order_lines(
     counts = {"linked": 0, "unlinked": 0, "unknown": 0, "not_expected": 0}
     order_rows: list[dict] = []
     rate_limited_orders: list[dict] = []
+    missing_orders: list[dict] = []
+    # Lowercased GUIDs already classified, across every batch. Matching is
+    # case-insensitive because the requested GUIDs come from pkOrderID on the
+    # list endpoints while the returned ones come from OrderId on the detail
+    # response, and this repo has seen no guarantee the two agree in case.
+    # This set also dedupes: a GUID seen once here is never classified again,
+    # so an order returned twice in one response contributes to counts once.
+    classified_guids: set[str] = set()
 
     batch_size = 50
     for i in range(0, len(guids), batch_size):
@@ -4918,8 +4946,25 @@ def find_unlinked_order_lines(
         if not isinstance(detail_orders, list):
             detail_orders = detail_orders.get("Orders") or []
 
+        # GUIDs (lowercased) actually seen in THIS batch's response, used
+        # only to diff against what was requested — never to decide whether
+        # to classify an order (that's classified_guids, above).
+        returned_guids_lower: set[str] = set()
+
         for order in detail_orders:
             guid = order.get("OrderId")
+            guid_lower = guid.lower() if guid else None
+            if guid_lower:
+                returned_guids_lower.add(guid_lower)
+                if guid_lower in classified_guids:
+                    continue  # already classified — a duplicate row
+                classified_guids.add(guid_lower)
+            # else: the row carries no OrderId at all. It is still classified
+            # below rather than silently dropped, but with nothing to match
+            # it back to one specific requested GUID it cannot clear any
+            # entry from this batch's missing set — a deliberate choice over
+            # guessing which request it answered.
+
             general = order.get("GeneralInfo") or {}
             source = general.get("Source")
             is_channel = _is_channel_order_source(source)
@@ -4941,6 +4986,15 @@ def find_unlinked_order_lines(
                 "lines": lines,
             })
 
+        for g in batch:
+            if g.lower() not in returned_guids_lower:
+                missing_orders.append({"order_id": g, **order_meta.get(g, {})})
+
+    # Captured before the only_problems filter below trims order_rows down to
+    # "orders with a problem" — order_count_scanned must mean every order
+    # actually classified, regardless of which of those get echoed back.
+    order_count_scanned = len(order_rows)
+
     if only_problems:
         order_rows = [
             o for o in order_rows
@@ -4953,11 +5007,12 @@ def find_unlinked_order_lines(
         "to_date": to_date,
         "date_field": date_field,
         "only_problems": only_problems,
-        "order_count_scanned": len(guids) - len(rate_limited_orders),
+        "order_count_scanned": order_count_scanned,
         "counts": counts,
         "orders": order_rows,
         "rate_limited_orders": rate_limited_orders,
-        "complete": not rate_limited_orders,
+        "missing_orders": missing_orders,
+        "complete": not rate_limited_orders and not missing_orders,
     }
 
 

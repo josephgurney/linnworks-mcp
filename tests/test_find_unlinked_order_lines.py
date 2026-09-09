@@ -518,6 +518,255 @@ class TestFindUnlinkedOrderLines:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# missing_orders bucket (issue #54) — GetOrdersById asked for a GUID and never
+# returned it, distinct from a rate-limited batch (that's already handled by
+# rate_limited_orders, untouched by this fix).
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestMissingOrdersBucket:
+    def test_short_response_order_count_scanned_is_orders_actually_classified(self):
+        """AC1 — GetOrdersById is stubbed to return fewer orders than the
+        GUIDs it was handed (no rate limit). order_count_scanned must equal
+        the number of orders actually classified, not the number requested."""
+        order = _raw_order(PROCESSED_ORDER_GUID, 605126, "SHOPIFY", True, [LINKED_ITEM])
+        dispatch = _make_dispatch(
+            processed_pages=[_processed_orders_page([
+                {"pkOrderID": PROCESSED_ORDER_GUID, "nOrderId": 605126,
+                 "ReferenceNum": "REF-605126", "Source": "SHOPIFY"},
+                {"pkOrderID": "guid-missing", "nOrderId": 999,
+                 "ReferenceNum": "REF-999", "Source": "SHOPIFY"},
+            ])],
+            order_details=[order],  # only one of the two requested GUIDs comes back
+        )
+        with patch.object(server, "call_linnworks", side_effect=dispatch):
+            result = server.find_unlinked_order_lines(
+                include_open=False, from_date="2026-01-01", to_date="2026-01-31",
+                only_problems=False,
+            )
+
+        assert result["order_count_scanned"] == 1
+
+    def test_short_response_lists_the_dropped_guid_under_missing_orders(self):
+        """AC2 — the GUID that never came back is listed in a new top-level
+        bucket, carrying the order GUID plus the same list metadata
+        rate_limited_orders already carries for its own entries."""
+        order = _raw_order(PROCESSED_ORDER_GUID, 605126, "SHOPIFY", True, [LINKED_ITEM])
+        dispatch = _make_dispatch(
+            processed_pages=[_processed_orders_page([
+                {"pkOrderID": PROCESSED_ORDER_GUID, "nOrderId": 605126,
+                 "ReferenceNum": "REF-605126", "Source": "SHOPIFY"},
+                {"pkOrderID": "guid-missing", "nOrderId": 999,
+                 "ReferenceNum": "REF-999", "Source": "SHOPIFY"},
+            ])],
+            order_details=[order],
+        )
+        with patch.object(server, "call_linnworks", side_effect=dispatch):
+            result = server.find_unlinked_order_lines(
+                include_open=False, from_date="2026-01-01", to_date="2026-01-31",
+                only_problems=False,
+            )
+
+        assert "missing_orders" in result
+        assert len(result["missing_orders"]) == 1
+        missing = result["missing_orders"][0]
+        assert missing["order_id"] == "guid-missing"
+        # Same list-metadata shape rate_limited_orders entries carry.
+        assert missing["reference_num"] == "REF-999"
+        assert missing["num_order_id"] == 999
+        assert missing["processed"] is True
+
+    def test_short_response_sets_complete_false(self):
+        """AC3."""
+        order = _raw_order(PROCESSED_ORDER_GUID, 605126, "SHOPIFY", True, [LINKED_ITEM])
+        dispatch = _make_dispatch(
+            processed_pages=[_processed_orders_page([
+                {"pkOrderID": PROCESSED_ORDER_GUID, "nOrderId": 605126, "Source": "SHOPIFY"},
+                {"pkOrderID": "guid-missing", "nOrderId": 999, "Source": "SHOPIFY"},
+            ])],
+            order_details=[order],
+        )
+        with patch.object(server, "call_linnworks", side_effect=dispatch):
+            result = server.find_unlinked_order_lines(
+                include_open=False, from_date="2026-01-01", to_date="2026-01-31",
+                only_problems=False,
+            )
+
+        assert result["complete"] is False
+
+    def test_missing_order_contributes_nothing_to_counts_or_orders_list(self):
+        """AC4 — a missing order must not appear in the orders list and must
+        not move any of the top-level line counts. Only the one order that
+        actually came back (with one unlinked line) should be reflected."""
+        order = _raw_order(PROCESSED_ORDER_GUID, 605126, "SHOPIFY", True, [UNLINKED_ITEM])
+        dispatch = _make_dispatch(
+            processed_pages=[_processed_orders_page([
+                {"pkOrderID": PROCESSED_ORDER_GUID, "nOrderId": 605126, "Source": "SHOPIFY"},
+                {"pkOrderID": "guid-missing", "nOrderId": 999, "Source": "SHOPIFY"},
+            ])],
+            order_details=[order],
+        )
+        with patch.object(server, "call_linnworks", side_effect=dispatch):
+            result = server.find_unlinked_order_lines(
+                include_open=False, from_date="2026-01-01", to_date="2026-01-31",
+                only_problems=False,
+            )
+
+        assert result["counts"] == {"linked": 0, "unlinked": 1, "unknown": 0, "not_expected": 0}
+        order_ids = {o["order_id"] for o in result["orders"]}
+        assert "guid-missing" not in order_ids
+        assert order_ids == {PROCESSED_ORDER_GUID}
+
+    def test_successful_scan_has_empty_missing_orders_bucket(self):
+        """AC5 — on a fully successful scan with no throttling and no dropped
+        orders, missing_orders is present and empty, complete is True, and
+        order_count_scanned matches the pre-fix value (every requested order
+        that actually came back)."""
+        order = _raw_order(
+            PROCESSED_ORDER_GUID, 605126, "SHOPIFY", True,
+            [LINKED_ITEM, UNLINKED_ITEM],
+        )
+        dispatch = _make_dispatch(
+            processed_pages=[_processed_orders_page(
+                [{"pkOrderID": PROCESSED_ORDER_GUID, "nOrderId": 605126,
+                  "ReferenceNum": "REF-605126", "Source": "SHOPIFY"}]
+            )],
+            order_details=[order],
+        )
+        with patch.object(server, "call_linnworks", side_effect=dispatch):
+            result = server.find_unlinked_order_lines(
+                include_open=False, from_date="2026-01-01", to_date="2026-01-31",
+                only_problems=False,
+            )
+
+        assert result["missing_orders"] == []
+        assert result["complete"] is True
+        assert result["order_count_scanned"] == 1
+
+    def test_rate_limited_and_missing_orders_stay_in_separate_buckets(self):
+        """AC6 — a throttled batch is reported under rate_limited_orders, not
+        under missing_orders, even when both conditions occur in the same
+        scan (one 50-order batch throttled, a second batch's one order
+        simply never comes back). The two buckets never overlap."""
+        guids = [f"guid-{i:03d}" for i in range(51)]
+        processed_rows = [
+            {"pkOrderID": g, "nOrderId": i, "ReferenceNum": f"REF-{i}", "Source": "SHOPIFY"}
+            for i, g in enumerate(guids)
+        ]
+        call_count = {"n": 0}
+
+        def fake_post(path, payload):
+            if path == "ProcessedOrders/SearchProcessedOrders":
+                return _processed_orders_page(processed_rows)
+            if path == "Orders/GetOrdersById":
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    raise server.RateLimitError("quota exceeded")
+                return []  # second batch: nothing comes back
+            raise AssertionError(f"unexpected call_linnworks path: {path}")
+
+        with patch.object(server, "call_linnworks", side_effect=fake_post):
+            result = server.find_unlinked_order_lines(
+                include_open=False, from_date="2026-01-01", to_date="2026-01-31",
+                only_problems=False,
+            )
+
+        assert len(result["rate_limited_orders"]) == 50
+        assert len(result["missing_orders"]) == 1
+        assert result["missing_orders"][0]["order_id"] == guids[50]
+        rate_limited_ids = {o["order_id"] for o in result["rate_limited_orders"]}
+        missing_ids = {o["order_id"] for o in result["missing_orders"]}
+        assert rate_limited_ids.isdisjoint(missing_ids)
+        assert result["complete"] is False
+
+    def test_order_count_scanned_unaffected_by_only_problems(self):
+        """AC7 — with only_problems=True and a mix of clean and problem
+        orders, order_count_scanned covers every order classified, not just
+        the ones echoed back in `orders`."""
+        clean_order = _raw_order("guid-clean", 1, "SHOPIFY", True, [LINKED_ITEM])
+        broken_order = _raw_order("guid-broken", 2, "SHOPIFY", True, [UNLINKED_ITEM])
+        dispatch = _make_dispatch(
+            processed_pages=[_processed_orders_page([
+                {"pkOrderID": "guid-clean", "nOrderId": 1, "Source": "SHOPIFY"},
+                {"pkOrderID": "guid-broken", "nOrderId": 2, "Source": "SHOPIFY"},
+            ])],
+            order_details=[clean_order, broken_order],
+        )
+        with patch.object(server, "call_linnworks", side_effect=dispatch):
+            result = server.find_unlinked_order_lines(
+                include_open=False, from_date="2026-01-01", to_date="2026-01-31",
+                only_problems=True,
+            )
+
+        assert result["only_problems"] is True
+        assert result["order_count_scanned"] == 2
+        # only_problems still trims which orders are echoed back.
+        assert len(result["orders"]) == 1
+
+    def test_missing_order_matching_is_case_insensitive(self):
+        """AC8 — a GUID returned in a different letter case than requested
+        must still be matched (so it is NOT reported missing), while a
+        genuinely missing GUID's own entry keeps the exact case it was
+        originally requested in."""
+        requested_matched = "ABCDEF00-1111-2222-3333-444455556666"
+        requested_missing = "FEDCBA00-9999-8888-7777-666655554444"
+        returned_matched_different_case = requested_matched.lower()
+        order = _raw_order(returned_matched_different_case, 700, "SHOPIFY", True, [LINKED_ITEM])
+
+        def fake_post(path, payload):
+            if path == "ProcessedOrders/SearchProcessedOrders":
+                return _processed_orders_page([
+                    {"pkOrderID": requested_matched, "nOrderId": 700,
+                     "ReferenceNum": "REF-700", "Source": "SHOPIFY"},
+                    {"pkOrderID": requested_missing, "nOrderId": 701,
+                     "ReferenceNum": "REF-701", "Source": "SHOPIFY"},
+                ])
+            if path == "Orders/GetOrdersById":
+                return [order]  # only the case-mismatched order comes back
+            raise AssertionError(f"unexpected call_linnworks path: {path}")
+
+        with patch.object(server, "call_linnworks", side_effect=fake_post):
+            result = server.find_unlinked_order_lines(
+                include_open=False, from_date="2026-01-01", to_date="2026-01-31",
+                only_problems=False,
+            )
+
+        # Case-insensitive match: the case-different GUID is NOT reported missing.
+        missing_ids = {m["order_id"] for m in result["missing_orders"]}
+        assert requested_matched not in missing_ids
+        assert returned_matched_different_case not in missing_ids
+        assert len(result["missing_orders"]) == 1
+
+        # The genuinely missing order is reported, in the exact case it was
+        # originally requested in.
+        assert result["missing_orders"][0]["order_id"] == requested_missing
+        assert result["order_count_scanned"] == 1
+        assert result["complete"] is False  # the genuinely missing order still counts
+
+    def test_duplicate_order_in_one_response_counted_once(self):
+        """AC9 — the same order returned twice in one GetOrdersById response
+        must be classified once: order_count_scanned, the per-line counts,
+        and the orders list all reflect it a single time."""
+        order = _raw_order(PROCESSED_ORDER_GUID, 605126, "SHOPIFY", True, [LINKED_ITEM])
+        dispatch = _make_dispatch(
+            processed_pages=[_processed_orders_page(
+                [{"pkOrderID": PROCESSED_ORDER_GUID, "nOrderId": 605126, "Source": "SHOPIFY"}]
+            )],
+            order_details=[order, order],  # duplicated row in the same response
+        )
+        with patch.object(server, "call_linnworks", side_effect=dispatch):
+            result = server.find_unlinked_order_lines(
+                include_open=False, from_date="2026-01-01", to_date="2026-01-31",
+                only_problems=False,
+            )
+
+        assert result["order_count_scanned"] == 1
+        assert result["counts"]["linked"] == 1
+        assert len(result["orders"]) == 1
+        assert result["missing_orders"] == []
+        assert result["complete"] is True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # AC10 — this build ships no write tool
 # ══════════════════════════════════════════════════════════════════════════════
 
