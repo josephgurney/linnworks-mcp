@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.51.1"
+__version__ = "1.52.0"
 
 import json
 import os
@@ -3086,6 +3086,278 @@ def cancel_order(
         "linnworks_response": result,
         **summary,
     }
+
+
+# Orders/RemoveOrderItem has been probed for existence only (issue #52, 9 Sep
+# 2026 — a deliberately invalid payload against the zero GUID returned the
+# same "reached real validation code" 400 this repo treats as evidence a
+# route exists). It has never been called with a payload that could touch a
+# real order. This warning is carried on every remove_order_item live-run
+# response until an owner-run live proof (see CLAUDE.md's
+# post_merge_verification) updates it.
+_REMOVE_ORDER_ITEM_UNPROVEN_WARNING = (
+    "⚠️ Orders/RemoveOrderItem is UNPROVEN on this tenant — it has only ever "
+    "been probed with a deliberately invalid payload (issue #52); this build "
+    "never fired it against a real order. A 2xx response here is NOT proof "
+    "the line was removed. Verify this order in the Linnworks UI, and "
+    "re-run find_unlinked_order_lines on this SAME order to confirm the "
+    "lines you did NOT touch still have a healthy channel-side reference — "
+    "a related order-item write has been observed to orphan surviving "
+    "lines (issue #52)."
+)
+
+
+@mcp.tool()
+def remove_order_item(
+    order_id: str,
+    row_id: str,
+    location_id: Optional[str] = None,
+    allow_empty_order: bool = False,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Remove a single line item from an OPEN (unprocessed) Linnworks order.
+
+    ⚠️ UNPROVEN ENDPOINT: Orders/RemoveOrderItem has only ever been probed
+    for existence with a deliberately invalid payload against a placeholder
+    GUID (issue #52) — this build has never fired it against a real order.
+    Every response from a live run (dry_run=False) carries an explicit
+    unproven warning telling you to verify the order in the Linnworks UI and
+    to re-run find_unlinked_order_lines on the SAME order afterwards, since a
+    related order-item write has been observed to orphan the channel
+    reference on lines you did NOT touch (issue #52). The first live call
+    against a real order is a deliberate, owner-run step — see CLAUDE.md's
+    post_merge_verification section for the checklist.
+
+    Reads the order fresh via _resolve_order_guid to locate the targeted line
+    by its row_id (the OrderItemRowId from get_order's items list) and to
+    confirm the order is still open — an already-processed (despatched) order
+    is refused, mirroring cancel_order. If the targeted line is a composite
+    parent, the dry-run manifest also lists its component children (SKU and
+    quantity each) under removed_line["composite_children"], since get_order
+    does not surface a separate row_id per composite child and removing the
+    parent line removes every child with it.
+
+    Removing the LAST remaining line on an order is blocked by default —
+    nothing in the Linnworks API prevents a resulting zero-line order, and
+    its behaviour downstream (dispatchable or not) is unknown. Pass
+    allow_empty_order=True to proceed anyway.
+
+    On a live run the payload sent to Orders/RemoveOrderItem is exactly
+    {"orderId", "rowid", "fulfilmentCenter"} — the fulfilment centre is taken
+    from the order's own FulfilmentLocationId, falling back to the Linnworks
+    Default location only when the order carries none. Passing location_id
+    overrides both. After the write, the order is read back FRESH (a new
+    call, never the pre-write object already in hand — and always by GUID,
+    even when order_id was originally supplied as a numeric order number) and
+    classified:
+      - "removed"       the row_id is genuinely absent from the fresh read
+      - "still_present" the row_id is still on the fresh read — Linnworks
+                         accepted the call but did not remove the line
+      - "unconfirmed"    the read-back itself failed or was rate-limited —
+                         NEVER defaulted to success, and never described as
+                         "line not found"
+    A RateLimitError raised by any call this tool makes (resolving the order,
+    the write itself, or the read-back) is reported as outcome
+    "rate_limited" — distinct from both "row not found" and a failed-removal
+    outcome, and never folded into either.
+
+    The live response also reports order_total_before and order_total_after
+    (Linnworks' own TotalsInfo.TotalCharge), since whether Linnworks
+    recalculates the order total after a line removal is unknown — a total
+    that did not change is visible here, not silently assumed correct.
+
+    IMPORTANT: dry_run defaults to True. This removes a line from a real
+    customer order and there is no known way to undo it via the API — always
+    review the manifest with the user before setting dry_run=False.
+
+    Args:
+        order_id: The order to modify. Accepts a GUID pkOrderID or a numeric
+            order number (e.g. "596475").
+        row_id: The OrderItemRowId of the line to remove — from get_order's
+            items list (the "row_id" field on each item).
+        location_id: Fulfilment centre GUID to send with the removal.
+            Defaults to the order's own fulfilment location, falling back to
+            the Default location only when the order carries none. Supplying
+            this overrides both.
+        allow_empty_order: Must be True to remove the last remaining line on
+            an order. Defaults to False so the tool never silently empties
+            an order.
+        dry_run: If True (default), shows exactly what would be removed
+            (including any composite children) without writing anything.
+            Set to False to execute.
+
+    Returns:
+        A dict. On any refusal (unresolvable order_id, unknown row_id,
+        processed order, last-line block) an "error" key is set and no write
+        call is made. Otherwise: dry_run, order_id, num_order_id,
+        customer_name, reference_num, external_reference, row_id,
+        removed_line (sku, title, quantity, price_per_unit, line_total, and
+        composite_children when applicable), remaining_line_count_before,
+        order_total_before, currency — plus, once a live write has been
+        attempted: outcome ("removed" / "still_present" / "unconfirmed" /
+        "rate_limited"), remaining_line_count, order_total_after,
+        linnworks_response, and unproven_warning.
+    """
+    order_id = order_id.strip()
+    row_id = row_id.strip()
+
+    try:
+        guid, raw = _resolve_order_guid(order_id)
+    except RateLimitError as exc:
+        return {
+            "outcome": "rate_limited",
+            "error": f"rate_limited resolving order: {exc}",
+            "order_id_input": order_id,
+        }
+    except RuntimeError as exc:
+        return {"error": str(exc), "order_id_input": order_id}
+
+    fmt = _format_order_detail(raw)
+
+    if fmt.get("processed"):
+        return {
+            "error": (
+                "This order is already processed (dispatched). "
+                "remove_order_item only operates on open orders."
+            ),
+            "order_id": fmt.get("order_id"),
+            "num_order_id": fmt.get("num_order_id"),
+        }
+
+    raw_items = list(raw.get("Items") or [])
+    target = next((i for i in raw_items if i.get("RowId") == row_id), None)
+
+    if target is None:
+        return {
+            "error": (
+                f"row_id {row_id!r} not found on order {fmt.get('order_id')!r}. "
+                "Use get_order() to list current line items and their row_id values."
+            ),
+            "order_id": fmt.get("order_id"),
+            "num_order_id": fmt.get("num_order_id"),
+            "row_id": row_id,
+        }
+
+    if len(raw_items) <= 1 and not allow_empty_order:
+        return {
+            "error": (
+                "This is the last remaining line on the order. Removing it "
+                "would leave a zero-line order, and its behaviour in "
+                "Linnworks (dispatchable or not) is unknown. Set "
+                "allow_empty_order=True to proceed anyway."
+            ),
+            "order_id": fmt.get("order_id"),
+            "num_order_id": fmt.get("num_order_id"),
+            "row_id": row_id,
+        }
+
+    removed_line = {
+        "sku": target.get("SKU"),
+        "title": target.get("Title"),
+        "quantity": target.get("Quantity"),
+        "price_per_unit": target.get("PricePerUnit"),
+        "line_total": target.get("CostIncTax"),
+    }
+    composite_children = [
+        {"sku": c.get("SKU"), "quantity": c.get("Quantity")}
+        for c in (target.get("CompositeSubItems") or [])
+    ]
+    if composite_children:
+        removed_line["composite_children"] = composite_children
+
+    totals_raw = raw.get("TotalsInfo") or {}
+
+    manifest = {
+        "order_id": fmt.get("order_id"),
+        "num_order_id": fmt.get("num_order_id"),
+        "customer_name": fmt.get("customer_name"),
+        "reference_num": fmt.get("reference_num"),
+        "external_reference": fmt.get("external_reference"),
+        "row_id": row_id,
+        "removed_line": removed_line,
+        "remaining_line_count_before": len(raw_items),
+        "order_total_before": totals_raw.get("TotalCharge"),
+        "currency": totals_raw.get("Currency"),
+    }
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "status": "would_remove",
+            "message": (
+                "Set dry_run=False to remove this line. Set "
+                "allow_empty_order=True if this is the order's last line."
+            ),
+            **manifest,
+        }
+
+    # ---- Live write ----
+    fulfilment_centre = (
+        location_id or raw.get("FulfilmentLocationId") or DEFAULT_LOCATION_ID
+    )
+    payload = {
+        "orderId": guid,
+        "rowid": row_id,
+        "fulfilmentCenter": fulfilment_centre,
+    }
+    try:
+        write_resp = call_linnworks("Orders/RemoveOrderItem", payload)
+    except RateLimitError as exc:
+        return {
+            "dry_run": False,
+            "outcome": "rate_limited",
+            "error": f"rate_limited on Orders/RemoveOrderItem: {exc}",
+            "order_total_after": None,
+            **manifest,
+            "unproven_warning": _REMOVE_ORDER_ITEM_UNPROVEN_WARNING,
+        }
+
+    # Fresh read-back — never the pre-write `raw`, and always by GUID.
+    try:
+        _, raw_after = _resolve_order_guid(guid)
+    except RateLimitError as exc:
+        return {
+            "dry_run": False,
+            "outcome": "unconfirmed",
+            "unconfirmed_reason": f"rate_limited on read-back: {exc}",
+            "linnworks_response": write_resp,
+            "order_total_after": None,
+            **manifest,
+            "unproven_warning": _REMOVE_ORDER_ITEM_UNPROVEN_WARNING,
+        }
+    except RuntimeError as exc:
+        return {
+            "dry_run": False,
+            "outcome": "unconfirmed",
+            "unconfirmed_reason": f"read-back failed: {exc}",
+            "linnworks_response": write_resp,
+            "order_total_after": None,
+            **manifest,
+            "unproven_warning": _REMOVE_ORDER_ITEM_UNPROVEN_WARNING,
+        }
+
+    items_after = list(raw_after.get("Items") or [])
+    still_present = any(i.get("RowId") == row_id for i in items_after)
+    totals_after = raw_after.get("TotalsInfo") or {}
+    outcome = "still_present" if still_present else "removed"
+
+    result = {
+        "dry_run": False,
+        "outcome": outcome,
+        "linnworks_response": write_resp,
+        **manifest,
+        "remaining_line_count": len(items_after),
+        "order_total_after": totals_after.get("TotalCharge"),
+        "unproven_warning": _REMOVE_ORDER_ITEM_UNPROVEN_WARNING,
+    }
+    if outcome == "still_present":
+        result["warning"] = (
+            "The row_id is still present on a fresh read-back — Linnworks "
+            "accepted the call but did NOT remove the line. Check the order "
+            "in the Linnworks UI before trying again."
+        )
+    return result
 
 
 @mcp.tool()

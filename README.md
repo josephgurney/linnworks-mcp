@@ -1,7 +1,7 @@
 # Linnworks MCP Server
 
-![Version](https://img.shields.io/badge/version-1.51.1-blue)
-![Tools](https://img.shields.io/badge/tools-87-blue)
+![Version](https://img.shields.io/badge/version-1.52.0-blue)
+![Tools](https://img.shields.io/badge/tools-88-blue)
 
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
 
@@ -24,7 +24,7 @@ Once installed, Claude gets access to these tools:
 | `get_order_notes` | Fetch all notes on an order |
 | `find_open_orders_for_sku` | Find all open orders containing a specific SKU — customer name, email, dispatch deadline |
 | `find_orders_by_reference` | Look up orders by channel reference number (Shopify, Amazon, eBay) |
-| `find_unlinked_order_lines` | Report lines that have lost their channel-side reference (ItemNumber/ItemSource/ChannelSKU) — linked / unlinked / unknown / not_expected, across open orders and/or a processed-order date range. Read-only report, not a fix — nothing in this repo can write to an order line yet |
+| `find_unlinked_order_lines` | Report lines that have lost their channel-side reference (ItemNumber/ItemSource/ChannelSKU) — linked / unlinked / unknown / not_expected, across open orders and/or a processed-order date range. Read-only report, not a fix — nothing in this repo can repair an orphaned channel reference yet |
 
 **Orders (write — all default to dry_run=True)**
 
@@ -36,6 +36,7 @@ Once installed, Claude gets access to these tools:
 | `delete_order_note` | Remove a specific note by ID |
 | `delete_order_notes_by_text` | Remove notes matching a text pattern |
 | `cancel_order` | Cancel an open (unprocessed) order |
+| `remove_order_item` | Delete a single line from an open order (Orders/RemoveOrderItem). ⚠️ Unproven endpoint — see the tool's docstring and CLAUDE.md. Refuses processed orders and last-line removal by default; live runs re-read the order fresh and classify the outcome as removed/still_present/unconfirmed |
 | `set_order_status` | Lock/unlock an order (hold it from dispatch) or mark it paid/unpaid — bulk. Note: locking releases the order's allocated stock, and park/unpark has no public API |
 | `refund_order` | Full refund on a processed order |
 | `refund_order_lines` | Partial refund of specific line items |
