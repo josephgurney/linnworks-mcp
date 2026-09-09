@@ -1,7 +1,7 @@
 # Linnworks MCP Server
 
-![Version](https://img.shields.io/badge/version-1.50.0-blue)
-![Tools](https://img.shields.io/badge/tools-86-blue)
+![Version](https://img.shields.io/badge/version-1.51.0-blue)
+![Tools](https://img.shields.io/badge/tools-87-blue)
 
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
 
@@ -24,6 +24,7 @@ Once installed, Claude gets access to these tools:
 | `get_order_notes` | Fetch all notes on an order |
 | `find_open_orders_for_sku` | Find all open orders containing a specific SKU — customer name, email, dispatch deadline |
 | `find_orders_by_reference` | Look up orders by channel reference number (Shopify, Amazon, eBay) |
+| `find_unlinked_order_lines` | Report lines that have lost their channel-side reference (ItemNumber/ItemSource/ChannelSKU) — linked / unlinked / unknown / not_expected, across open orders and/or a processed-order date range. Read-only report, not a fix — nothing in this repo can write to an order line yet |
 
 **Orders (write — all default to dry_run=True)**
 
@@ -272,7 +273,7 @@ What's the stock level for SKU ABC-123?
 
 A few read tools page through the whole catalogue or a whole date range internally, making hundreds of API calls per question:
 
-`get_top_skus` · `get_sales_by_supplier` · `get_category_report` · `get_revenue_summary` · `get_period_comparison` · `get_component_sales` · `find_composite_parents` (first call — then cached 15 min) · `list_inventory_items(all_pages=True)` · `get_categories(with_counts=True)` · `delete_empty_categories`
+`get_top_skus` · `get_sales_by_supplier` · `get_category_report` · `get_revenue_summary` · `get_period_comparison` · `get_component_sales` · `find_composite_parents` (first call — then cached 15 min) · `list_inventory_items(all_pages=True)` · `get_categories(with_counts=True)` · `delete_empty_categories` · `find_unlinked_order_lines` (when scanning a processed-order date range)
 
 Expect roughly 1–2 minutes each. **Ask for one at a time** — two of these running together hit the Linnworks rate limit and the second will time out.
 

@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.50.0"
+__version__ = "1.51.0"
 
 import json
 import os
@@ -734,6 +734,20 @@ def _format_order_detail(raw: dict) -> dict:
                 "price_per_unit": i.get("PricePerUnit"),
                 # cost_inc_tax is the total line cost including tax (all units)
                 "cost_inc_tax":   i.get("CostIncTax"),
+                # Channel-identity fields (issue #52 — line-link detection).
+                # Live-confirmed on OrderItem via both Orders/GetOrdersById and
+                # Orders/GetOrderDetailsByNumOrderId (which both feed this
+                # formatter): ItemNumber is the line id as the channel knows it
+                # (e.g. a Shopify variant id), ItemSource is the channel name
+                # the line was downloaded from, ChannelSKU is the channel's own
+                # SKU string for the line. All three come back as "" (present,
+                # blank) on a line that has lost its channel link, and as None
+                # only if the raw item never carried the key at all — verbatim,
+                # never invented. See CLAUDE.md's Orders/GetOrdersById row for
+                # the live linked/unlinked examples.
+                "channel_line_id":     i.get("ItemNumber"),
+                "channel_line_source": i.get("ItemSource"),
+                "channel_sku":         i.get("ChannelSKU"),
             }
             for i in items
         ],
@@ -1937,9 +1951,14 @@ def get_order(order_id: str) -> dict:
     to the correct endpoint based on the input format.
 
     Returns the order's status, received date, postal service, parked flag,
-    marker, source channel, and all item lines with SKUs and quantities.
-    Useful for answering questions like "show me order 596475 in full" or
-    "what items are in this order and what's the shipping method?".
+    marker, source channel, and all item lines with SKUs and quantities. Each
+    line also carries channel_line_id/channel_line_source/channel_sku — the
+    channel's own reference for that line (None only if the API never
+    returned the field at all). Use find_unlinked_order_lines to scan many
+    orders for lines missing this reference, rather than reading it here one
+    order at a time. Useful for answering questions like "show me order
+    596475 in full" or "what items are in this order and what's the shipping
+    method?".
 
     Args:
         order_id: Either a GUID pkOrderID (e.g. "a1b2c3d4-1234-...") or a
@@ -4438,6 +4457,15 @@ def _flatten_order_item(i: dict) -> dict:
     Child rows carry `Quantity` already resolved to the total child units for
     the whole line (e.g. 5 packs × 10 = 50) — do NOT multiply by the parent
     quantity. Children's `StockItemId` may instead arrive as `ItemId`.
+
+    `channel_line_id` (ItemNumber) and `channel_line_source` (ItemSource) are
+    the other two channel-identity fields alongside `channel_sku` (issue #52).
+    All three are read with `.get()`, so a key that is genuinely absent from
+    the raw item comes through as `None`, distinct from a key that is present
+    but blank (`""`) — a real, live-observed state on a line that has lost its
+    channel link. Callers that need to tell "field never returned" from "field
+    returned empty" (find_unlinked_order_lines does) rely on that distinction;
+    do not collapse it with `or ""`.
     """
     sub = i.get("CompositeSubItems") or []
     return {
@@ -4453,6 +4481,8 @@ def _flatten_order_item(i: dict) -> dict:
         "stock_item_id": i.get("StockItemId") or i.get("ItemId"),
         "bin_rack": i.get("BinRack"),
         "channel_sku": i.get("ChannelSKU"),
+        "channel_line_id": i.get("ItemNumber"),
+        "channel_line_source": i.get("ItemSource"),
         "composite_sub_items": [_flatten_order_item(s) for s in sub],
     }
 
@@ -4624,6 +4654,310 @@ def get_processed_order_items(
         "total_count": total_count,
         "count": len(orders),
         "orders": orders,
+    }
+
+
+# ---------- Channel line-link detection (issue #52) --------------------------
+#
+# Detects order lines that have lost the channel-side reference (ItemNumber /
+# ItemSource / ChannelSKU) a channel-downloaded line normally carries — the
+# condition described in issue #52 as "changing an item on an open order
+# orphans the Shopify line link". Read-only: this repo has confirmed that
+# Orders/UpdateOrderItem, Orders/AddOrderItem and Orders/RemoveOrderItem exist
+# (CLAUDE.md, confirmed-endpoints table) but has NOT confirmed that any of
+# them can set or restore ItemNumber/ItemSource on a live order, and has not
+# attempted to. Nothing here writes to an order, and nothing here implies a
+# fix is available — least of all for an order that has already despatched,
+# which cannot be repaired by any known Linnworks write capability regardless
+# of this tool's findings.
+#
+# Every order — open or already processed — is read the same way: via
+# Orders/GetOrdersById. OpenOrders/GetOrdersLowFidelity is used only to
+# discover which order GUIDs are currently open; its own Items rows do not
+# carry ItemNumber/ItemSource/ChannelSKU at all (confirmed live), so it cannot
+# answer link status on its own, and its composite children nest under a
+# different key (CompositeChild) that GetOrdersById never uses. Because every
+# order in this scan — open or processed — is hydrated through GetOrdersById,
+# composite children always arrive under `CompositeSubItems` (via
+# _flatten_order_item's `composite_sub_items`), never `CompositeChild`.
+
+# Order-level `Source` values seen on this tenant that do NOT represent a
+# channel download, and so are never expected to carry a per-line channel
+# reference. "DIRECT" is a manually created order (confirmed live: its lines'
+# ItemNumber/ItemSource both come back "", identical in shape to a genuinely
+# orphaned line on a channel order — which is exactly why order-level source,
+# not the line's own blank fields, is what decides this bucket).
+_NON_CHANNEL_ORDER_SOURCES = {"", "DIRECT"}
+
+
+def _is_channel_order_source(source: str | None) -> bool:
+    """True when an order's Source represents a real channel download."""
+    return bool(source) and source.strip().upper() not in _NON_CHANNEL_ORDER_SOURCES
+
+
+def _classify_order_line(
+    flat_item: dict,
+    is_channel_order: bool,
+    is_composite_child: bool = False,
+) -> list[dict]:
+    """
+    Classify one flattened order-item row (see _flatten_order_item) — and,
+    recursively, every composite child nested under it — as exactly one of:
+
+      linked        — a channel-order line with a real channel_line_source.
+      unlinked       — a channel-order, non-composite-child line whose
+                        channel_line_source came back blank ("").
+      unknown        — channel_line_id AND channel_line_source are both None,
+                        i.e. the raw item never carried either key at all.
+                        This is distinct from "unlinked": a genuinely orphaned
+                        line still has a channel_line_source key, just an
+                        empty one. Only an absent field means the API isn't
+                        telling us what we're asking it, and a line in that
+                        state must never silently count as linked OR unlinked.
+      not_expected   — a line that was never expected to carry its own
+                        channel reference: a composite child (the parent line
+                        carries the link, not the child), or any line on an
+                        order whose own Source is not a channel download
+                        (manually created / phone / DIRECT orders). Excluded
+                        from the unlinked count so that number means "lines
+                        that should be linked and are not" — a manually
+                        created order or an upsell composite component looking
+                        unlinked is not a fault.
+
+    Precedence matters: a composite child on a manual order is still
+    `composite_child`, not `manual_order` — either reason alone is sufficient
+    to explain why the line was never expected to carry a link, and the more
+    specific one (composite_child) is reported first.
+    """
+    channel_line_id = flat_item.get("channel_line_id")
+    channel_line_source = flat_item.get("channel_line_source")
+
+    if is_composite_child:
+        status, reason = "not_expected", "composite_child"
+    elif not is_channel_order:
+        status, reason = "not_expected", "manual_order"
+    elif channel_line_id is None and channel_line_source is None:
+        status, reason = "unknown", "fields_absent"
+    elif not (channel_line_source or "").strip():
+        status, reason = "unlinked", None
+    else:
+        status, reason = "linked", None
+
+    row = {
+        "sku": flat_item.get("sku"),
+        "title": flat_item.get("title"),
+        "channel_line_id": channel_line_id,
+        "channel_line_source": channel_line_source,
+        "channel_sku": flat_item.get("channel_sku"),
+        "is_composite_child": is_composite_child,
+        "status": status,
+        "reason": reason,
+    }
+
+    rows = [row]
+    for sub in flat_item.get("composite_sub_items") or []:
+        rows.extend(_classify_order_line(sub, is_channel_order, is_composite_child=True))
+    return rows
+
+
+@mcp.tool()
+def find_unlinked_order_lines(
+    include_open: bool = True,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    date_field: str = "processed",
+    location_id: str = DEFAULT_LOCATION_ID,
+    only_problems: bool = True,
+) -> dict:
+    """
+    Scan orders and classify every line as linked, unlinked, unknown, or
+    not_expected, based on whether it still carries the channel-identity
+    fields (ItemNumber / ItemSource / ChannelSKU) a channel-downloaded line
+    normally has (issue #52).
+
+    This is a REPORT, not a fix. Nothing in this tool writes to an order, and
+    finding an unlinked line here does not mean a repair is available —
+    especially not for an order that has already despatched: this repo has
+    confirmed that Orders/UpdateOrderItem exists (it takes a full OrderItem
+    object, including ItemNumber/ItemSource) but has deliberately never fired
+    a request against it that could change a real order, so whether it can
+    actually set or restore those fields is unconfirmed either way. See
+    CLAUDE.md's confirmed-endpoints table for exactly what was and wasn't
+    tested. This tool also does not assert how Linnworks internally matches a
+    despatch back to its storefront line — only that these fields are what
+    the order-detail endpoints return for a line, and that a line missing
+    them looks structurally identical to the ones the reporter flagged.
+
+    Scans open (currently unprocessed) orders, a processed-order date range,
+    or both — set at least one of `include_open=True` or a `from_date`/
+    `to_date` pair. Every order, whichever list it came from, is read the
+    same way (Orders/GetOrdersById), so composite children are always walked
+    under the same nesting key regardless of whether the order is open or
+    already processed.
+
+    A line is classified `not_expected` — and excluded from the `unlinked`
+    count — when it was never expected to carry its own channel reference:
+    a composite child, or any line on an order whose own Source is not a
+    channel download (e.g. a manually created "DIRECT" order). Without this
+    bucket, `unlinked` would be swamped by lines that were never broken.
+
+    A line is classified `unknown` — also excluded from `unlinked` — only
+    when the raw order data never carried the identity fields at all (as
+    opposed to carrying them blank). A scan should never report "0 unlinked"
+    on the strength of fields it never actually got to look at.
+
+    A rate-limited order batch is excluded from every count and reported
+    separately under `rate_limited_orders`, with `complete` set to False —
+    never folded into `unknown` or silently dropped, so a throttled run can
+    never read as a clean "0 unlinked found".
+
+    Args:
+        include_open: Include currently open (unprocessed) orders. Default True.
+        from_date: Start of a processed-order date range, ISO format
+            (e.g. "2026-05-01"). Required together with to_date to include
+            processed orders in the scan.
+        to_date: End of the processed-order date range, ISO format.
+        date_field: Which processed-order date to filter on when a date range
+            is given — "received", "processed" (default), "payment", or
+            "cancelled".
+        location_id: Location to scan for open orders. Defaults to "Default".
+        only_problems: When True (default), the `orders` list only includes
+            orders that contain at least one `unlinked` or `unknown` line —
+            the top-level `counts` still cover every line scanned either way.
+            Set False to get a full per-order, per-line dump of the entire
+            scan.
+
+    Returns:
+        A dict with:
+          - include_open, from_date, to_date, date_field, only_problems: the
+            query parameters used
+          - order_count_scanned: orders successfully read (excludes
+            rate-limited ones)
+          - counts: {linked, unlinked, unknown, not_expected} totals across
+            every line in every successfully-read order
+          - orders: per-order rows (order_id, num_order_id, reference_num,
+            source, processed, lines), each line row carrying sku, title,
+            channel_line_id, channel_line_source, channel_sku,
+            is_composite_child, status, reason
+          - rate_limited_orders: orders whose detail fetch was throttled and
+            so were never classified — retry these
+          - complete: False when anything was rate-limited
+    """
+    if not include_open and not (from_date and to_date):
+        raise ValueError(
+            "Nothing to scan: set include_open=True and/or provide both "
+            "from_date and to_date for a processed-order date range."
+        )
+
+    # order GUID -> light metadata used only as a fallback if GetOrdersById's
+    # own detail is ever missing a field (it never has been, live) — the
+    # authoritative per-order Source/Processed/reference always comes from
+    # the GetOrdersById detail fetched below, not from this list.
+    order_meta: dict[str, dict] = {}
+
+    if include_open:
+        resp = call_linnworks(
+            "OpenOrders/GetOrdersLowFidelity", {"request": {"LocationId": location_id}}
+        )
+        for o in resp.get("Orders") or []:
+            guid = o.get("pkOrderID")
+            if guid:
+                order_meta[guid] = {
+                    "processed": False,
+                    "reference_num": o.get("ReferenceNum"),
+                    "num_order_id": o.get("OrderId"),
+                }
+
+    if from_date and to_date:
+        page = 1
+        total_pages: int | None = None
+        while total_pages is None or page <= total_pages:
+            resp = call_linnworks(
+                "ProcessedOrders/SearchProcessedOrders",
+                {
+                    "request": {
+                        "DateField": date_field,
+                        "FromDate": f"{from_date}T00:00:00",
+                        "ToDate": f"{to_date}T23:59:59",
+                        "PageNumber": page,
+                        "ResultsPerPage": 500,
+                    }
+                },
+            )
+            wrapper = resp.get("ProcessedOrders") or {}
+            raw_orders = wrapper.get("Data") or []
+            if total_pages is None:
+                total_pages = wrapper.get("TotalPages", 1)
+            if not raw_orders:
+                break
+            for o in raw_orders:
+                guid = o.get("pkOrderID")
+                if guid:
+                    order_meta[guid] = {
+                        "processed": True,
+                        "reference_num": o.get("ReferenceNum"),
+                        "num_order_id": o.get("nOrderId"),
+                    }
+            page += 1
+
+    guids = list(order_meta.keys())
+    counts = {"linked": 0, "unlinked": 0, "unknown": 0, "not_expected": 0}
+    order_rows: list[dict] = []
+    rate_limited_orders: list[dict] = []
+
+    batch_size = 50
+    for i in range(0, len(guids), batch_size):
+        batch = guids[i : i + batch_size]
+        try:
+            detail_orders = call_linnworks("Orders/GetOrdersById", {"pkOrderIds": batch})
+        except RateLimitError:
+            for g in batch:
+                rate_limited_orders.append({"order_id": g, **order_meta.get(g, {})})
+            continue
+
+        if not isinstance(detail_orders, list):
+            detail_orders = detail_orders.get("Orders") or []
+
+        for order in detail_orders:
+            guid = order.get("OrderId")
+            general = order.get("GeneralInfo") or {}
+            source = general.get("Source")
+            is_channel = _is_channel_order_source(source)
+
+            lines: list[dict] = []
+            for raw_item in order.get("Items") or []:
+                flat = _flatten_order_item(raw_item)
+                lines.extend(_classify_order_line(flat, is_channel))
+
+            for line in lines:
+                counts[line["status"]] += 1
+
+            order_rows.append({
+                "order_id": guid,
+                "num_order_id": order.get("NumOrderId"),
+                "reference_num": general.get("ReferenceNum"),
+                "source": source,
+                "processed": bool(order.get("Processed")),
+                "lines": lines,
+            })
+
+    if only_problems:
+        order_rows = [
+            o for o in order_rows
+            if any(l["status"] in ("unlinked", "unknown") for l in o["lines"])
+        ]
+
+    return {
+        "include_open": include_open,
+        "from_date": from_date,
+        "to_date": to_date,
+        "date_field": date_field,
+        "only_problems": only_problems,
+        "order_count_scanned": len(guids) - len(rate_limited_orders),
+        "counts": counts,
+        "orders": order_rows,
+        "rate_limited_orders": rate_limited_orders,
+        "complete": not rate_limited_orders,
     }
 
 
