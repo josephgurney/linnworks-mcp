@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.49.0"
+__version__ = "1.50.0"
 
 import json
 import os
@@ -12736,6 +12736,7 @@ def refresh_channel_listing(
     channel: str = "Shopify",
     action: str | None = None,
     check_staleness: bool = True,
+    check_listing_exists: bool = True,
     confirmed_count: int | None = None,
     dry_run: bool = True,
 ) -> dict:
@@ -12889,6 +12890,22 @@ def refresh_channel_listing(
             it doesn't misfire on exactly the channel-specific content this
             covers. Set False to skip the extra reads — the plan then says
             nothing about whether the snapshot is fresh.
+        check_listing_exists: If True (default, SHOPIFY only), verify that each
+            template's stored ActiveListingId is still a product that EXISTS on
+            the channel — one cheap Shopify `nodes(ids:)` call per 100 templates,
+            and it needs the same Shopify Admin credentials as
+            `repair_channel_listing_images` (without them the check is reported
+            as not run, never as passed). This is a DIFFERENT question from
+            staleness: staleness asks whether the snapshot's content drifted,
+            this asks whether the listing it points at is still there at all. A
+            template left pointing at a deleted listing (a duplicate cleanup on
+            the channel does exactly this — issue #52) is invisible to the
+            channel-SKU table, which can be healthy and re-pointed at the
+            surviving product at the same time. Such rows are moved to
+            `unresolved` with blocked_reason "dangling_listing" and EXCLUDED
+            from the push, because Linnworks batches listing ids into one
+            `nodes(ids:)` call and throws on the null slot — so pushing one
+            dangling template fails every healthy template batched with it.
         confirmed_count: For batches > 25 SKUs, pass len(skus) after reviewing
             the plan to confirm the write.
         dry_run: If True (default), returns the plan without pushing anything.
@@ -13236,6 +13253,72 @@ def refresh_channel_listing(
             plan.append(row)
             plan_by_template[t.get("Id")] = row
 
+    # ── Pre-flight: is the stored ActiveListingId still a real listing? ──────
+    # (issue #52) The staleness check above asks whether the snapshot's CONTENT
+    # has drifted. It cannot ask the prior question — whether the listing the
+    # snapshot points AT still exists. A template whose listing was deleted on
+    # the channel is not stale, it is DANGLING, and pushing it does not merely
+    # no-op: Linnworks batches listing ids into one Shopify `nodes(ids:)` call
+    # and throws on the null slot, failing every healthy template in the same
+    # batch (see _glt_listing_existence for the live case).
+    #
+    # A dangling row is moved out of `plan` into `unresolved`: it genuinely
+    # cannot be revised, and leaving it in would let a confirmed push re-trigger
+    # the very failure this detects.
+    listing_check = {"checked": False, "reason": None, "by_row": {}}
+    dangling_rows: list[dict] = []
+    if check_listing_exists and plan:
+        listing_check = _glt_listing_existence(plan, sub_source, channel_source)
+        if listing_check["checked"]:
+            still_planned = []
+            for row in plan:
+                gid = _shopify_product_gid(row.get("active_listing_id"))
+                if not gid:
+                    row["listing_exists"] = None
+                    row["listing_check"] = "no_listing_id"
+                    still_planned.append(row)
+                    continue
+                probe = listing_check["by_row"].get(gid, {})
+                exists = probe.get("exists")
+                row["listing_exists"] = exists
+                if exists is True:
+                    row["listing_check"] = "exists"
+                    still_planned.append(row)
+                elif exists is None:
+                    row["listing_check"] = "unknown"
+                    still_planned.append(row)
+                else:
+                    row["listing_check"] = "gone"
+                    dangling_rows.append(row)
+                    unresolved.append({
+                        "sku": row["sku"],
+                        "stock_item_id": row["stock_item_id"],
+                        "title": row.get("title"),
+                        "template_id": row["template_id"],
+                        "active_listing_id": row.get("active_listing_id"),
+                        "blocked_reason": "dangling_listing",
+                        "error": (
+                            f"DANGLING TEMPLATE — the template's stored "
+                            f"ActiveListingId ({row.get('active_listing_id')}) is not a "
+                            f"product that exists on Shopify '{sub_source}' any more. "
+                            "It was almost certainly deleted on the channel (a "
+                            "duplicate cleanup does exactly this) while the template "
+                            "kept pointing at it. The channel-SKU mapping can look "
+                            "perfectly healthy at the same time, so this is invisible "
+                            "to get_channel_listings. Pushing it CANNOT work and will "
+                            "fail every other template pushed alongside it with "
+                            "\"Error reading JObject from JsonReader ... Path "
+                            "'data.nodes[N]'\". Fix: rebuild or remove this template in "
+                            "the Linnworks GLT UI (open the listing so the template "
+                            "re-points at the surviving product), then re-run."
+                        ),
+                    })
+            plan = still_planned
+        else:
+            for row in plan:
+                row["listing_exists"] = None
+                row["listing_check"] = (listing_check["reason"] or "unchecked").split(" — ")[0]
+
     stale_rows       = [r for r in plan if r.get("staleness", {}).get("stale_fields")]
     unchecked_rows   = [r for r in plan if "staleness" in r and not r["staleness"].get("checked")]
     no_diff_rows     = [r for r in plan
@@ -13256,6 +13339,26 @@ def refresh_channel_listing(
         "rate_limited":          rate_limited,
         "complete":              not rate_limited,
     }
+    if check_listing_exists:
+        base_out["listing_existence_checked"] = bool(listing_check["checked"])
+        base_out["dangling_listing_count"] = len(dangling_rows)
+        if not listing_check["checked"]:
+            base_out["listing_existence_note"] = (
+                f"Listing-existence NOT verified ({listing_check['reason']}). A template "
+                "whose stored ActiveListingId points at a listing that has been deleted on "
+                "the channel is INVISIBLE to both the channel-SKU table and the staleness "
+                "check, and pushing it fails every other template in the same batch "
+                "(issue #52)."
+            )
+        elif dangling_rows:
+            base_out["dangling_listings"] = [
+                {"sku": r["sku"], "template_id": r["template_id"],
+                 "active_listing_id": r.get("active_listing_id")}
+                for r in dangling_rows
+            ]
+    else:
+        base_out["listing_existence_checked"] = False
+
     if check_staleness:
         base_out["staleness_checked"] = True
         base_out["stale_plan_count"] = len(stale_rows)
@@ -13307,6 +13410,19 @@ def refresh_channel_listing(
             "DATA back, not the detail page) before trusting a bulk run on this channel."
         )
 
+    dangling_note = ""
+    if dangling_rows:
+        names = ", ".join(f"{r['sku']} (tpl {r['template_id']})" for r in dangling_rows[:5])
+        more = "" if len(dangling_rows) <= 5 else f" (+{len(dangling_rows) - 5} more)"
+        dangling_note = (
+            f"⛔ {len(dangling_rows)} DANGLING template(s) EXCLUDED from the push — their "
+            f"stored ActiveListingId no longer exists on the channel: {names}{more}. These "
+            "cannot be revised, and pushing one fails every healthy template batched with it "
+            "(issue #52). Rebuild or remove them in the Linnworks GLT UI. "
+        )
+    elif check_listing_exists and not listing_check["checked"]:
+        dangling_note = f"⚠️ {base_out.get('listing_existence_note', '')} "
+
     if dry_run:
         return {
             "dry_run": True,
@@ -13314,7 +13430,7 @@ def refresh_channel_listing(
             "message": (
                 f"Dry run — nothing pushed. {len(plan)} {ch['channel_type']} listing(s) on "
                 f"'{sub_source}' would be revised; {len(unresolved)} SKU(s) could not be revised "
-                "(see unresolved). "
+                "(see unresolved). " + dangling_note
                 + _refresh_staleness_message(check_staleness, stale_rows, no_diff_rows,
                                              unchecked_rows) +
                 "Review the plan, then set dry_run=False to push the revisions. A live run changes "
@@ -13329,7 +13445,7 @@ def refresh_channel_listing(
             "results": [],
             "message": (
                 f"Nothing to revise — no SKU resolved to an existing, revisable {ch['channel_type']} "
-                "template."
+                "template. " + dangling_note
             ),
         }
 
@@ -13389,7 +13505,7 @@ def refresh_channel_listing(
         "results": results,
         "message": (
             f"{pushed}/{len(plan)} {ch['channel_type']} listing(s) on '{sub_source}' revised and "
-            "pushed. "
+            "pushed. " + dangling_note
             + _refresh_staleness_message(check_staleness, stale_rows, no_diff_rows,
                                          unchecked_rows, live=True) +
             readback_note +
@@ -15894,6 +16010,137 @@ def _media_filename_stem(url: str | None) -> str | None:
     name = url.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
     return name.rsplit(".", 1)[0] if "." in name else name
 
+
+_SHOPIFY_PROBE_NODES = """
+query LwProbeListings($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    __typename
+    id
+    ... on Product { title status }
+  }
+}
+"""
+
+
+def _shopify_listings_exist(store: dict, product_gids: list[str]) -> dict[str, dict]:
+    """Which of these Shopify product GIDs still exist? — the null-SAFE read.
+
+    THIS IS THE EXACT CALL LINNWORKS GETS WRONG (issue #52). Shopify's
+    `nodes(ids:)` returns a POSITIONAL array and puts **null** in the slot of any
+    id that no longer resolves — a deleted object, or one the token cannot see.
+    That is the documented contract, not an error: the response is HTTP 200 with
+    no `errors` key at all.
+
+    Linnworks' own Shopify connector reads each slot straight into a JObject, so
+    a single null throws
+
+        Error reading JObject from JsonReader. Current JsonReader item is not an
+        object: Null. Path 'data.nodes[1]'
+
+    and takes the WHOLE batch down with it — including the healthy listings
+    sharing that call. So this helper is written deliberately the way that one is
+    not: strictly index-aligned, and a null slot is DATA ("this listing is gone"),
+    never an exception.
+
+    Returns {gid: {"exists": True|False|None, "title": .., "status": ..}}.
+    `exists=None` means "could not tell" (unrecognised response shape) and must
+    never be collapsed into False — the house rule from issue #37: an unknown
+    must not read as a verdict. Chunked at 100 ids, well inside Shopify's cost
+    budget for this tiny selection set.
+    """
+    out: dict[str, dict] = {}
+    uniq = [g for g in dict.fromkeys(product_gids) if g]
+    for i in range(0, len(uniq), 100):
+        chunk = uniq[i:i + 100]
+        data = _shopify_graphql(store, _SHOPIFY_PROBE_NODES, {"ids": chunk})
+        nodes = data.get("nodes")
+        if not isinstance(nodes, list) or len(nodes) != len(chunk):
+            for gid in chunk:
+                out[gid] = {"exists": None, "title": None, "status": None}
+            continue
+        for gid, node in zip(chunk, nodes):
+            if isinstance(node, dict):
+                out[gid] = {"exists": True, "title": node.get("title"),
+                            "status": node.get("status")}
+            else:
+                out[gid] = {"exists": False, "title": None, "status": None}
+    return out
+
+
+def _glt_listing_existence(rows: list[dict], sub_source: str,
+                           channel_source: str) -> dict:
+    """Pre-flight: does each plan row's STORED ActiveListingId still exist?
+
+    THE GAP THIS CLOSES (issue #52, live-diagnosed 9 Sep 2026)
+    ---------------------------------------------------------
+    A GLT template stores the channel listing id it last pushed to, and — like
+    every other field on that snapshot (#27/#40) — nothing rebuilds it. When the
+    listing is deleted on the channel the template keeps pointing at the corpse,
+    and the reference goes dangling.
+
+    Live case: SWH Shopify had a DUPLICATE product for the Echo Sonar 3 Wheel
+    (the #39 pattern). The duplicate `9277472506102` was deleted in Shopify;
+    template 38827 still stored it as ActiveListingId, while the CHANNEL-SKU rows
+    for the same item had already been re-pointed at the surviving product
+    `9276972695798`. So the two Linnworks surfaces disagreed, and — this is the
+    part that matters — **the channel-SKU table looked perfectly healthy**. Any
+    check built on mappings alone is structurally blind to this.
+
+    Why it is not a one-listing problem: the GLT batches templates' listing ids
+    into ONE `nodes(ids:)` call, and Linnworks throws on the null slot rather
+    than reading it (see `_shopify_listings_exist`). One dangling template
+    therefore fails every OTHER template pushed alongside it. That is how a
+    100%-healthy listing (Echo Sonar 4 Wheel, template 38812 — product ACTIVE,
+    12/12 variants and 8/8 media resolving) came to sit at "Errors while
+    updating": it was collateral damage, not the fault.
+
+    SHOPIFY ONLY. Amazon/TikTok listing ids are channel SKUs / ASIN-shaped
+    (v1.32.0) with no equivalent cheap existence probe available from the
+    credentials this server holds, so those rows are reported "unsupported"
+    rather than guessed at.
+
+    Never raises. Every failure mode degrades to exists=None with a named
+    reason, because a listing that cannot be checked must not be reported as
+    gone (which would block a perfectly good push) — nor as present.
+    """
+    result = {"checked": False, "reason": None, "by_row": {}}
+
+    if channel_source != GLT_SHOPIFY_CHANNEL_NAME:
+        result["reason"] = (
+            f"unsupported_channel — the listing-existence probe is Shopify-only; "
+            f"{channel_source} listing ids have no cheap existence check here"
+        )
+        return result
+
+    store = _shopify_store_for(sub_source)
+    if store is None:
+        result["reason"] = (
+            "not_configured — no Shopify Admin credentials for this store, so a "
+            "dangling ActiveListingId cannot be detected. See "
+            "repair_channel_listing_images for the SHOPIFY_STORES / "
+            "SHOPIFY_SHOP_DOMAIN setup."
+        )
+        return result
+
+    gids: list[str] = []
+    for r in rows:
+        gid = _shopify_product_gid(r.get("active_listing_id"))
+        if gid:
+            gids.append(gid)
+
+    if not gids:
+        result["checked"] = True
+        return result
+
+    try:
+        found = _shopify_listings_exist(store, gids)
+    except RuntimeError as e:
+        result["reason"] = f"check_failed — {e}"
+        return result
+
+    result["checked"] = True
+    result["by_row"] = found
+    return result
 
 _SHOPIFY_READ_PRODUCT = """
 query LwRepairReadProduct($id: ID!) {
