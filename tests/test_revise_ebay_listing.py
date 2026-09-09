@@ -1034,7 +1034,7 @@ def test_ac9_tenant_traps_recorded_in_the_endpoint_tables():
 def test_ac10_tool_signature_threshold_default_and_outcome_vocabulary_unchanged():
     import asyncio
     tool_names = [t.name for t in asyncio.run(server.mcp.list_tools())]
-    assert len(tool_names) == 86  # 85 at the time this test was written (issue #47) + delete_extended_properties (#50)
+    assert len(tool_names) == 87  # 85 at the time this test was written (issue #47) + delete_extended_properties (#50) + find_unlinked_order_lines (#52)
     assert "revise_ebay_listing_description" in tool_names
     assert server.WRITE_THRESHOLDS["revise_ebay_listing_description"] == 10
 
