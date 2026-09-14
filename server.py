@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.52.1"
+__version__ = "1.52.2"
 
 import json
 import os
@@ -8253,7 +8253,8 @@ def _resolve_category(entry: dict, cache: dict) -> tuple[str, str] | None:
     return rec.get("CategoryId"), rec.get("CategoryName")
 
 
-def _read_back_category(sku: str, requested: tuple[str, str] | None) -> dict:
+def _read_back_category(sku: str, requested: tuple[str, str] | None,
+                        category_cache: dict | None = None) -> dict:
     """
     Fresh Inventory/GetInventoryItem after a write, reporting the category
     Linnworks NOW holds for the item — never the pre-write object.
@@ -8268,6 +8269,14 @@ def _read_back_category(sku: str, requested: tuple[str, str] | None) -> dict:
       - readback: "ok", "rate_limited", or "failed: <error>".
       - warning: present only when the requested category did not land.
 
+    GetInventoryItem returns the stored CategoryId but a NULL CategoryName
+    (live, 14 Sep 2026 — on a fresh create and on an update alike). When it
+    does, category_name is filled from `category_cache["categories"]`, the
+    Inventory/GetCategories list _resolve_category already fetched for this
+    batch. No extra call is made: if nothing in the batch named a category the
+    list was never fetched and category_name stays None. category_verified is
+    computed on the GUID either way and is the field to trust.
+
     A RateLimitError on the read-back is reported as such, never as a
     mismatch — a quota failure is not evidence either way (issue #34/#37).
     """
@@ -8280,9 +8289,16 @@ def _read_back_category(sku: str, requested: tuple[str, str] | None) -> dict:
         return {"category_id": None, "category_name": None,
                 "category_verified": None, "readback": f"failed: {exc}"}
 
+    got_id   = fresh.get("CategoryId")
+    got_name = fresh.get("CategoryName")
+    if not got_name and got_id and category_cache:
+        names_by_id = {(c.get("CategoryId") or "").lower(): c.get("CategoryName")
+                       for c in (category_cache.get("categories") or [])}
+        got_name = names_by_id.get(got_id.lower())
+
     out = {
-        "category_id":   fresh.get("CategoryId"),
-        "category_name": fresh.get("CategoryName"),
+        "category_id":   got_id,
+        "category_name": got_name,
         "readback":      "ok",
     }
     if requested is None:
@@ -8290,13 +8306,13 @@ def _read_back_category(sku: str, requested: tuple[str, str] | None) -> dict:
         return out
 
     want_id, want_name = requested
-    landed = (fresh.get("CategoryId") or "").lower() == (want_id or "").lower()
+    landed = (got_id or "").lower() == (want_id or "").lower()
     out["category_verified"] = landed
     if not landed:
         out["warning"] = (
             f"Category did not land: asked for '{want_name}' ({want_id}) but "
-            f"Linnworks read back '{fresh.get('CategoryName')}' "
-            f"({fresh.get('CategoryId')}). The item write itself was accepted."
+            f"Linnworks read back '{got_name}' ({got_id}). "
+            f"The item write itself was accepted."
         )
     return out
 
@@ -8360,6 +8376,10 @@ def create_or_update_inventory_item(
     if the read-back was rate-limited). A False is counted in the top-level
     `category_mismatches` and carries a `warning` — a 2xx alone never proves
     the category landed (that is how the 14 Sep 2026 silent no-op happened).
+    GetInventoryItem returns a null CategoryName, so `category_name` is filled
+    from the GetCategories list fetched to resolve the batch; if nothing in the
+    batch named a category it stays null (no extra call). `category_verified`
+    is computed on the GUID and is the field to trust.
 
     Returns:
         A dict with:
@@ -8550,7 +8570,7 @@ def create_or_update_inventory_item(
                 }
 
             # ── Read-back: what does Linnworks hold NOW? ──────────────────
-            result.update(_read_back_category(sku, cat))
+            result.update(_read_back_category(sku, cat, category_cache))
             if result.get("category_verified") is False:
                 category_mismatches += 1
             results.append(result)

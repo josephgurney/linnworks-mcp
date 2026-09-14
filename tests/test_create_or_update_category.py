@@ -57,12 +57,19 @@ class FakeLinnworks:
     `honour_category=False` reproduces the live defect from the server side —
     every write lands in Default regardless of payload — so the read-back's
     mismatch detection is exercised against real tool behaviour.
+
+    `null_category_name=True` reproduces the live GetInventoryItem quirk
+    (verified 14 Sep 2026): the endpoint returns the stored CategoryId but a
+    NULL CategoryName, on the probe and on the read-back alike, whatever was
+    written.
     """
 
-    def __init__(self, items=None, honour_category=True, readback_error=None):
+    def __init__(self, items=None, honour_category=True, readback_error=None,
+                 null_category_name=False):
         self.items = {i["ItemNumber"]: dict(i) for i in (items or [])}
         self.honour_category = honour_category
         self.readback_error = readback_error
+        self.null_category_name = null_category_name
         self.writes = []            # (path, payload)
         self.get_categories_calls = 0
         self.get_item_calls = []    # skus in order
@@ -76,7 +83,10 @@ class FakeLinnworks:
                                            for _, p in self.writes):
                 raise self.readback_error
             if sku in self.items:
-                return dict(self.items[sku])
+                item = dict(self.items[sku])
+                if self.null_category_name:
+                    item["CategoryName"] = None
+                return item
             raise RuntimeError("HTTP 400 — no such SKU")
         if path in ("Inventory/AddInventoryItem", "Inventory/UpdateInventoryItem"):
             self.writes.append((path, payload))
@@ -198,6 +208,108 @@ def test_read_back_rate_limit_is_not_reported_as_a_mismatch():
     assert row["category_verified"] is None
     assert row["readback"] == "rate_limited"
     assert out["category_mismatches"] == 0
+
+
+# --- read-back: GetInventoryItem returns a NULL CategoryName (live quirk) --------
+
+def test_read_back_fills_null_category_name_from_the_batch_category_list():
+    """Live (14 Sep 2026): GetInventoryItem returns CategoryId but a null
+    CategoryName, so v1.52.1 reported `category_name: null` even when the
+    category landed. The name is already known — GetCategories was fetched to
+    resolve the request — so fill it from there. No extra API call."""
+    fake = FakeLinnworks(items=[_existing_item()], null_category_name=True)
+    out = _run([{"sku": "VEN-EXISTING", "category_name": "Venom Completes"},
+                {"sku": "VEN-NEW-1", "title": "New", "category_name": "Skateboard Decks"}],
+               fake, dry_run=False)
+
+    by_sku = {r["sku"]: r for r in out["results"]}
+    assert by_sku["VEN-EXISTING"]["category_id"] == VENOM_ID
+    assert by_sku["VEN-EXISTING"]["category_name"] == "Venom Completes"
+    assert by_sku["VEN-EXISTING"]["category_verified"] is True
+    assert by_sku["VEN-NEW-1"]["category_id"] == DECKS_ID
+    assert by_sku["VEN-NEW-1"]["category_name"] == "Skateboard Decks"
+    assert by_sku["VEN-NEW-1"]["category_verified"] is True
+    assert out["category_mismatches"] == 0
+    assert fake.get_categories_calls == 1                # the resolve fetch, nothing more
+
+
+def test_read_back_fills_the_name_for_an_item_that_named_no_category_when_the_batch_did():
+    """The list was fetched for a sibling item; an item that asked for nothing
+    still gets its stored category named from it — for free."""
+    fake = FakeLinnworks(items=[_existing_item()], null_category_name=True)
+    out = _run([{"sku": "VEN-NEW-1", "title": "New", "category_name": "Venom Completes"},
+                {"sku": "VEN-EXISTING", "title": "Renamed"}],
+               fake, dry_run=False)
+
+    by_sku = {r["sku"]: r for r in out["results"]}
+    assert by_sku["VEN-EXISTING"]["category_id"] == DEFAULT_ID
+    assert by_sku["VEN-EXISTING"]["category_name"] == "Default"
+    assert by_sku["VEN-EXISTING"]["category_verified"] is None   # nothing was requested
+    assert fake.get_categories_calls == 1
+
+
+def test_read_back_leaves_the_name_null_when_nothing_in_the_batch_named_a_category():
+    """Deliberate: no category requested → GetCategories is never called (a
+    tested invariant since v1.52.1), so there is nothing to fill from and the
+    field stays null rather than spending a rate-limited call on a cosmetic."""
+    fake = FakeLinnworks(items=[_existing_item()], null_category_name=True)
+    out = _run([{"sku": "VEN-EXISTING", "title": "Renamed"}], fake, dry_run=False)
+
+    row = out["results"][0]
+    assert row["category_id"] == DEFAULT_ID
+    assert row["category_name"] is None
+    assert row["category_verified"] is None
+    assert row["readback"] == "ok"
+    assert fake.get_categories_calls == 0
+
+
+def test_read_back_mismatch_warning_names_the_category_it_actually_landed_in():
+    """With a null CategoryName the v1.52.1 warning read "read back 'None'".
+    The GUID is known and the list is in hand — name it."""
+    fake = FakeLinnworks(items=[_existing_item()], honour_category=False,
+                         null_category_name=True)
+    out = _run([{"sku": "VEN-EXISTING", "category_name": "Venom Completes"}],
+               fake, dry_run=False)
+
+    row = out["results"][0]
+    assert row["category_verified"] is False
+    assert row["category_id"] == DEFAULT_ID
+    assert row["category_name"] == "Default"
+    assert "Venom Completes" in row["warning"] and "'Default'" in row["warning"]
+    assert "'None'" not in row["warning"]
+    assert out["category_mismatches"] == 1
+
+
+def test_read_back_keeps_a_name_linnworks_does_return():
+    """If the endpoint ever starts returning CategoryName, that wins — the
+    list is only a fallback for a null."""
+    fake = FakeLinnworks(items=[_existing_item()])          # returns the written name
+    out = _run([{"sku": "VEN-EXISTING", "category_name": "Venom Completes"}],
+               fake, dry_run=False)
+
+    assert out["results"][0]["category_name"] == "Venom Completes"
+    assert fake.get_categories_calls == 1
+
+
+def test_read_back_null_name_with_a_guid_not_in_the_list_stays_null_and_is_still_a_mismatch():
+    """Verification is on the GUID, never the name: an unknown GUID with no
+    name to fill is reported as-is and still counts as not landed."""
+    class StrayCategory(FakeLinnworks):
+        def call_linnworks(self, path, payload):
+            out = super().call_linnworks(path, payload)
+            if path == "Inventory/GetInventoryItem":
+                out["CategoryId"] = "deadbeef-0000-0000-0000-000000000000"
+            return out
+
+    fake = StrayCategory(items=[_existing_item()], null_category_name=True)
+    out = _run([{"sku": "VEN-EXISTING", "category_name": "Venom Completes"}],
+               fake, dry_run=False)
+
+    row = out["results"][0]
+    assert row["category_id"] == "deadbeef-0000-0000-0000-000000000000"
+    assert row["category_name"] is None
+    assert row["category_verified"] is False
+    assert out["category_mismatches"] == 1
 
 
 # --- resolution rules -----------------------------------------------------------
