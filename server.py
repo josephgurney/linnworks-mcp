@@ -13315,9 +13315,11 @@ def list_to_shopify(
     ⚠️  A live run (dry_run=False) creates REAL Shopify listings — customer-facing
     and not trivially undone. Always run dry_run=True first and read the plan.
     The read/selection path (configurator catalogue, SKU + extended-property
-    resolution) is live-confirmed; the write path (CreateTemplates /
-    ProcessTemplates) is built to the OpenAPI spec but NOT yet live-exercised in
-    this tenant — start with a single SKU.
+    resolution) is live-confirmed, and the write path (CreateTemplates /
+    ProcessTemplates) was live-run on 6 Aug 2026 — a bulk category run that
+    created 265 real listings (issue #38). Creates are ASYNCHRONOUS: templates
+    sit at Status "Creating" and drain over several minutes, so an accepted call
+    means queued, not listed. Start small.
 
     For batches larger than 25 SKUs this tool stages: it returns the plan and asks
     you to confirm with confirmed_count=<N> before executing.
