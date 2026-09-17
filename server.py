@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.52.0"
+__version__ = "1.52.2"
 
 import json
 import os
@@ -8605,6 +8605,134 @@ def _resolve_sku_to_id(sku: str, cache: dict | None = None) -> str:
     return stock_item_id
 
 
+def _resolve_category(entry: dict, cache: dict) -> tuple[str, str] | None:
+    """
+    Resolve an item entry's category_name / category_id to the
+    (CategoryId, CategoryName) pair Linnworks actually keys on.
+
+    Linnworks stores an item's category by CategoryId (GUID). CategoryName is
+    display-only: AddInventoryItem ignores a name sent without the GUID and
+    UpdateInventoryItem keeps whatever GUID is in the payload regardless of
+    the name beside it — confirmed live 14 Sep 2026, when seven new SKUs
+    written with category_name="Venom Completes" all landed in "Default" and a
+    follow-up upsert changed nothing. So a name must be turned into its GUID
+    here, BEFORE the write, against Inventory/GetCategories.
+
+    Matching is case-insensitive on both the name and the GUID; the canonical
+    stored name is returned rather than the caller's casing. The category list
+    is fetched once per tool call and kept in `cache`.
+
+    Returns None when the entry names no category (the caller leaves the
+    existing category alone, or lets Linnworks default a new item). Raises
+    ValueError when the name or id matches no existing category, or when both
+    are given and point at different categories. RateLimitError and any other
+    API error from the fetch propagate unchanged — a quota failure must never
+    be reported as "category not found" (issue #34).
+    """
+    name = (entry.get("category_name") or "").strip()
+    cid  = (entry.get("category_id") or "").strip()
+    if not name and not cid:
+        return None
+
+    if "categories" not in cache:
+        cache["categories"] = _fetch_categories()
+    cats = cache["categories"]
+
+    by_name = {(c.get("CategoryName") or "").strip().lower(): c for c in cats}
+    by_id   = {(c.get("CategoryId") or "").lower(): c for c in cats}
+    known   = ", ".join(sorted(c.get("CategoryName") or "" for c in cats))
+
+    rec_by_id   = by_id.get(cid.lower()) if cid else None
+    rec_by_name = by_name.get(name.lower()) if name else None
+
+    if cid and rec_by_id is None:
+        raise ValueError(
+            f"category_id '{cid}' does not match any Linnworks category. "
+            f"Use get_categories to list valid ids. Known names: {known}."
+        )
+    if name and rec_by_name is None:
+        raise ValueError(
+            f"category_name '{name}' does not match any Linnworks category "
+            f"(matched case-insensitively). Use get_categories to list them. "
+            f"Known names: {known}."
+        )
+    if (rec_by_id and rec_by_name
+            and (rec_by_id.get("CategoryId") or "").lower()
+                != (rec_by_name.get("CategoryId") or "").lower()):
+        raise ValueError(
+            f"category_id '{cid}' is '{rec_by_id.get('CategoryName')}' but "
+            f"category_name '{name}' is '{rec_by_name.get('CategoryName')}' "
+            f"({rec_by_name.get('CategoryId')}) — pass one, or make them agree."
+        )
+
+    rec = rec_by_id or rec_by_name
+    return rec.get("CategoryId"), rec.get("CategoryName")
+
+
+def _read_back_category(sku: str, requested: tuple[str, str] | None,
+                        category_cache: dict | None = None) -> dict:
+    """
+    Fresh Inventory/GetInventoryItem after a write, reporting the category
+    Linnworks NOW holds for the item — never the pre-write object.
+
+    A 2xx on Add/UpdateInventoryItem does not prove the category landed (that
+    is exactly how the 14 Sep 2026 no-op stayed silent), so every live write
+    reads back. Returns category_id / category_name as stored, plus:
+
+      - category_verified: True/False when a category was requested (does the
+        stored CategoryId match, case-insensitively); None when nothing was
+        requested or the read-back itself could not be completed.
+      - readback: "ok", "rate_limited", or "failed: <error>".
+      - warning: present only when the requested category did not land.
+
+    GetInventoryItem returns the stored CategoryId but a NULL CategoryName
+    (live, 14 Sep 2026 — on a fresh create and on an update alike). When it
+    does, category_name is filled from `category_cache["categories"]`, the
+    Inventory/GetCategories list _resolve_category already fetched for this
+    batch. No extra call is made: if nothing in the batch named a category the
+    list was never fetched and category_name stays None. category_verified is
+    computed on the GUID either way and is the field to trust.
+
+    A RateLimitError on the read-back is reported as such, never as a
+    mismatch — a quota failure is not evidence either way (issue #34/#37).
+    """
+    try:
+        fresh = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+    except RateLimitError:
+        return {"category_id": None, "category_name": None,
+                "category_verified": None, "readback": "rate_limited"}
+    except Exception as exc:
+        return {"category_id": None, "category_name": None,
+                "category_verified": None, "readback": f"failed: {exc}"}
+
+    got_id   = fresh.get("CategoryId")
+    got_name = fresh.get("CategoryName")
+    if not got_name and got_id and category_cache:
+        names_by_id = {(c.get("CategoryId") or "").lower(): c.get("CategoryName")
+                       for c in (category_cache.get("categories") or [])}
+        got_name = names_by_id.get(got_id.lower())
+
+    out = {
+        "category_id":   got_id,
+        "category_name": got_name,
+        "readback":      "ok",
+    }
+    if requested is None:
+        out["category_verified"] = None
+        return out
+
+    want_id, want_name = requested
+    landed = (got_id or "").lower() == (want_id or "").lower()
+    out["category_verified"] = landed
+    if not landed:
+        out["warning"] = (
+            f"Category did not land: asked for '{want_name}' ({want_id}) but "
+            f"Linnworks read back '{got_name}' ({got_id}). "
+            f"The item write itself was accepted."
+        )
+    return out
+
+
 # ---------- Inventory write tools ----------
 
 
@@ -8635,7 +8763,14 @@ def create_or_update_inventory_item(
             - retail_price (float): RetailPrice
             - purchase_price (float): PurchasePrice
             - tax_rate (float):     TaxRate (e.g. 20.0 for 20%)
-            - category_name (str):  CategoryName (Linnworks auto-resolves to ID)
+            - category_name (str):  Category by name — resolved to its CategoryId
+                                    via Inventory/GetCategories (case-insensitive;
+                                    must already exist, see get_categories).
+                                    Linnworks keys the category on the GUID and
+                                    ignores a bare name, so both are sent.
+            - category_id (str):    CategoryId GUID — alternative to category_name
+                                    (validated against GetCategories; if both are
+                                    given they must agree).
             - weight (float):       Weight in kg
             - height (float):       Height in cm
             - width (float):        Width in cm
@@ -8647,15 +8782,37 @@ def create_or_update_inventory_item(
         dry_run: If True (default), returns the manifest without writing.
             Set to False to execute.
 
+    An unknown category_name / category_id is a per-item error: it appears as
+    `category_error` in the manifest and, on a live run, that item is skipped
+    (action "error") without any write — the rest of the batch still proceeds.
+
+    Every live write is followed by a fresh GetInventoryItem read-back. Each
+    result row reports the `category_id` / `category_name` Linnworks now holds
+    and, when a category was requested, `category_verified` (True/False; None
+    if the read-back was rate-limited). A False is counted in the top-level
+    `category_mismatches` and carries a `warning` — a 2xx alone never proves
+    the category landed (that is how the 14 Sep 2026 silent no-op happened).
+    GetInventoryItem returns a null CategoryName, so `category_name` is filled
+    from the GetCategories list fetched to resolve the batch; if nothing in the
+    batch named a category it stays null (no extra call). `category_verified`
+    is computed on the GUID and is the field to trust.
+
     Returns:
         A dict with:
           - dry_run:      whether this was a dry run
           - item_count:   number of items in the batch
-          - manifest:     per-item preview (always present)
-          - results:      per-item outcome (live run only)
+          - manifest:     per-item preview (always present) — includes the
+                          resolved category_id, or category_error
+          - category_errors: items whose category could not be resolved
+          - results:      per-item outcome (live run only), each with the
+                          read-back category_id / category_name /
+                          category_verified / readback
           - created:      count of newly created items (live run only)
           - updated:      count of updated items (live run only)
           - errors:       count of failed items (live run only)
+          - category_mismatches: items whose requested category did not land
+                          on read-back (live run only); a top-level `warning`
+                          accompanies any non-zero count
     """
     # ── Injection check on all free-text fields ───────────────────────────────
     for entry in items:
@@ -8663,36 +8820,62 @@ def create_or_update_inventory_item(
         _check_injection("barcode",   entry.get("barcode", ""))
         _check_injection("metadata",  entry.get("metadata", ""))
 
+    # ── Resolve categories up front (one GetCategories per batch) ─────────────
+    # Linnworks keys the category on CategoryId and ignores a bare name (see
+    # _resolve_category). Resolving before the guard / dry-run means a typo
+    # shows up in the manifest, not as a silent no-op after a live write.
+    # Each slot is (CategoryId, CategoryName), None (no category asked for),
+    # or the ValueError explaining why it could not be resolved.
+    category_cache: dict = {}
+    resolved_categories: list = []
+    for entry in items:
+        try:
+            resolved_categories.append(_resolve_category(entry, category_cache))
+        except ValueError as exc:
+            resolved_categories.append(exc)
+
     # ── Build manifest preview ────────────────────────────────────────────────
-    manifest = [
-        {
+    manifest = []
+    for entry, cat in zip(items, resolved_categories):
+        resolved = isinstance(cat, tuple)
+        row = {
             "sku":            entry.get("sku"),
             "title":          entry.get("title"),
             "barcode":        entry.get("barcode"),
             "retail_price":   entry.get("retail_price"),
             "purchase_price": entry.get("purchase_price"),
             "tax_rate":       entry.get("tax_rate"),
-            "category_name":  entry.get("category_name"),
+            "category_name":  cat[1] if resolved else entry.get("category_name"),
+            "category_id":    cat[0] if resolved else None,
             "weight":         entry.get("weight"),
             "height":         entry.get("height"),
             "width":          entry.get("width"),
             "depth":          entry.get("depth"),
             "metadata":       entry.get("metadata"),
         }
-        for entry in items
-    ]
+        if isinstance(cat, ValueError):
+            row["category_error"] = str(cat)
+        manifest.append(row)
+    category_errors = sum(1 for c in resolved_categories if isinstance(c, ValueError))
 
     # ── Write guard ───────────────────────────────────────────────────────────
     guard = _write_guard("create_or_update_inventory_item", items, confirmed_count, dry_run)
     if guard is not None:
-        return {**guard, "manifest": manifest}
+        return {**guard, "manifest": manifest, "category_errors": category_errors}
 
     if dry_run:
+        message = "Dry run — no changes written. Set dry_run=False to execute."
+        if category_errors:
+            message += (
+                f" {category_errors} item(s) name a category that does not exist "
+                f"(see category_error) — they would be skipped on a live run."
+            )
         return {
             "dry_run": True,
             "item_count": len(items),
             "manifest": manifest,
-            "message": "Dry run — no changes written. Set dry_run=False to execute.",
+            "category_errors": category_errors,
+            "message": message,
         }
 
     # ── Live execution ─────────────────────────────────────────────────────────
@@ -8701,11 +8884,18 @@ def create_or_update_inventory_item(
     created = 0
     updated = 0
     errors  = 0
+    category_mismatches = 0
 
-    for entry in items:
+    for entry, cat in zip(items, resolved_categories):
         sku = (entry.get("sku") or "").strip()
         if not sku:
             results.append({"sku": "", "action": "error", "error": "Missing 'sku' field."})
+            errors += 1
+            continue
+        if isinstance(cat, ValueError):
+            # Unresolvable category — refuse this item rather than write it
+            # into Default and call that success.
+            results.append({"sku": sku, "action": "error", "error": str(cat)})
             errors += 1
             continue
 
@@ -8730,8 +8920,10 @@ def create_or_update_inventory_item(
                     "RetailPrice":            entry.get("retail_price")   if entry.get("retail_price") is not None else existing.get("RetailPrice"),
                     "PurchasePrice":          entry.get("purchase_price") if entry.get("purchase_price") is not None else existing.get("PurchasePrice"),
                     "TaxRate":                entry.get("tax_rate")       if entry.get("tax_rate") is not None else existing.get("TaxRate"),
-                    "CategoryName":           entry.get("category_name")  or existing.get("CategoryName", ""),
-                    "CategoryId":             existing.get("CategoryId", ""),
+                    # Category is keyed on the GUID — both fields must move
+                    # together, or the old CategoryId silently wins.
+                    "CategoryName":           cat[1] if cat else existing.get("CategoryName", ""),
+                    "CategoryId":             cat[0] if cat else existing.get("CategoryId", ""),
                     "Weight":                 entry.get("weight")         if entry.get("weight") is not None else existing.get("Weight"),
                     "Height":                 entry.get("height")         if entry.get("height") is not None else existing.get("Height"),
                     "Width":                  entry.get("width")          if entry.get("width") is not None else existing.get("Width"),
@@ -8751,10 +8943,10 @@ def create_or_update_inventory_item(
                 }
                 call_linnworks("Inventory/UpdateInventoryItem", {"inventoryItem": item_payload})
                 updated += 1
-                results.append({
+                result = {
                     "sku": sku, "action": "updated", "stock_item_id": stock_item_id,
                     "title": item_payload["ItemTitle"],
-                })
+                }
 
             else:
                 # Create path — only the fields we have.
@@ -8772,33 +8964,54 @@ def create_or_update_inventory_item(
                     "RetailPrice":   entry.get("retail_price", 0.0),
                     "PurchasePrice": entry.get("purchase_price", 0.0),
                     "TaxRate":       entry.get("tax_rate", 0.0),
-                    "CategoryName":  entry.get("category_name", ""),
+                    # No category asked for → keep the live-tested (15 Jun 2026)
+                    # shape: bare empty CategoryName, no CategoryId; Linnworks
+                    # assigns Default. With a category, send BOTH — a name
+                    # without its GUID is ignored (confirmed 14 Sep 2026).
+                    "CategoryName":  "",
                     "Weight":        entry.get("weight", 0.0),
                     "Height":        entry.get("height", 0.0),
                     "Width":         entry.get("width", 0.0),
                     "Depth":         entry.get("depth", 0.0),
                     "MetaData":      entry.get("metadata", ""),
                 }
+                if cat:
+                    item_payload["CategoryId"], item_payload["CategoryName"] = cat
                 resp = call_linnworks("Inventory/AddInventoryItem", {"inventoryItem": item_payload})
                 new_id = (resp.get("fkStockItemId") if isinstance(resp, dict) else None) or new_guid
                 created += 1
-                results.append({
+                result = {
                     "sku": sku, "action": "created", "stock_item_id": new_id,
                     "title": item_payload["ItemTitle"],
-                })
+                }
+
+            # ── Read-back: what does Linnworks hold NOW? ──────────────────
+            result.update(_read_back_category(sku, cat, category_cache))
+            if result.get("category_verified") is False:
+                category_mismatches += 1
+            results.append(result)
 
         except Exception as exc:
             errors += 1
             results.append({"sku": sku, "action": "error", "error": str(exc)})
 
-    return {
-        "dry_run":    False,
-        "item_count": len(items),
-        "created":    created,
-        "updated":    updated,
-        "errors":     errors,
-        "results":    results,
+    out = {
+        "dry_run":             False,
+        "item_count":          len(items),
+        "created":             created,
+        "updated":             updated,
+        "errors":              errors,
+        "category_mismatches": category_mismatches,
+        "results":             results,
     }
+    if category_mismatches:
+        out["warning"] = (
+            f"{category_mismatches} item(s) were written but the requested category "
+            f"did not land on read-back (see per-item warning / category_id). "
+            f"Linnworks accepted the write; check the item in get_categories / "
+            f"search_inventory_items before relying on it."
+        )
+    return out
 
 
 @mcp.tool()
