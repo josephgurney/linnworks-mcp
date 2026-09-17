@@ -3360,6 +3360,422 @@ def remove_order_item(
     return result
 
 
+# Orders/UpdateOrderItem has been probed for existence only (issue #52, 9 Sep
+# 2026 — a deliberately invalid payload against the zero GUID returned the
+# same "reached real validation code" 400 this repo treats as evidence a
+# route exists). It has never been called with a payload that could touch a
+# real order. This warning is carried on every relink_order_line live-run
+# response until an owner-run live proof (see CLAUDE.md's
+# post_merge_verification) updates it.
+_RELINK_ORDER_LINE_UNPROVEN_WARNING = (
+    "⚠️ Orders/UpdateOrderItem is UNPROVEN on this tenant — it has only ever "
+    "been probed for existence with a deliberately invalid payload against "
+    "the zero GUID (issue #52); this build has never fired it against a "
+    "real order. A 2xx response here is NOT proof the channel link was "
+    "restored — Linnworks accepting a push has, on other channels (Amazon, "
+    "eBay), meant nothing reached the storefront. Re-run "
+    "find_unlinked_order_lines on this SAME order afterwards to confirm the "
+    "line now reads as linked."
+)
+
+
+_RELINK_MISSING = object()
+
+
+def _build_relink_order_item(raw_item: dict, channel_line_id: str, channel_line_source: str) -> dict:
+    """
+    Build the OrderItem payload for Orders/UpdateOrderItem: the raw item
+    round-tripped verbatim, with ONLY ItemNumber and ItemSource overridden.
+
+    Every other key — discount, tax-inclusive cost, bin rack, weight,
+    barcode, market/service flags, anything this repo's two flattened item
+    shapes don't even carry — must survive untouched. Linnworks updates in
+    this codebase have repeatedly been found to null any field left out of
+    a full-object update, and this endpoint takes a whole OrderItem object.
+    """
+    payload = dict(raw_item)
+    payload["ItemNumber"] = channel_line_id
+    payload["ItemSource"] = channel_line_source
+    return payload
+
+
+def _relink_payload_unexpected_diff(original: dict, payload: dict) -> dict:
+    """
+    Compare a constructed OrderItem payload against the raw item it was
+    built from. Returns {key: {"before": ..., "after": ...}} for every key
+    OTHER than ItemNumber/ItemSource that is missing, added, or changed
+    between the two. An empty dict means the payload is safe to send —
+    anything else means abort before ever calling Orders/UpdateOrderItem.
+    """
+    allowed = {"ItemNumber", "ItemSource"}
+    diffs: dict = {}
+    for key in set(original) | set(payload):
+        if key in allowed:
+            continue
+        before = original.get(key, _RELINK_MISSING)
+        after = payload.get(key, _RELINK_MISSING)
+        if before != after:
+            diffs[key] = {
+                "before": None if before is _RELINK_MISSING else before,
+                "after": None if after is _RELINK_MISSING else after,
+            }
+    return diffs
+
+
+@mcp.tool()
+def relink_order_line(
+    order_id: str,
+    row_id: str,
+    channel_line_id: Optional[str] = None,
+    channel_line_source: Optional[str] = None,
+    allow_relink_of_linked_line: bool = False,
+    location_id: Optional[str] = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Restore a single order line's channel identity (ItemNumber/ItemSource)
+    via Orders/UpdateOrderItem — the repair half of the pair started by
+    find_unlinked_order_lines (issue #52), which only detects an orphaned
+    line and ships no fix.
+
+    ⚠️ UNPROVEN ENDPOINT: Orders/UpdateOrderItem has only ever been probed
+    for existence with a deliberately invalid payload against a placeholder
+    GUID (issue #52) — this build has never fired it against a real order.
+    Every response from a live run (dry_run=False) carries an explicit
+    unproven warning telling you that a 2xx here is NOT proof the channel
+    link was restored, and to re-run find_unlinked_order_lines on the SAME
+    order afterwards. The first live call against a real order is a
+    deliberate, owner-run step — see CLAUDE.md's post_merge_verification
+    section for the checklist.
+
+    Reads the order fresh via _resolve_order_guid to confirm it is still
+    open (an already-processed/despatched order is refused — a despatched
+    order cannot be repaired this way) and to locate the targeted line by
+    its row_id from the order's RAW Items array — never from either of this
+    repo's flattened item shapes, both of which drop most of the raw line
+    (discount, tax-inclusive cost, bin racks, weight, barcode, market/
+    service flags). An unknown row_id is refused, naming the row_id and
+    pointing at get_order.
+
+    channel_line_id is the replacement storefront line id and is REQUIRED —
+    it is never derived, defaulted, or guessed by this tool. A blank or
+    omitted value is refused: a guessed or mistyped id would point despatch
+    at the wrong storefront line, converting a visible failure into a
+    silent mis-fulfilment, which is worse than leaving the line blank.
+
+    channel_line_source defaults to the order's own Source value (e.g.
+    "Shopify") when not supplied — this default is shown in the manifest
+    explicitly labelled as derived, distinct from a caller-supplied value,
+    which is also shown and labelled as such. Passing channel_line_source
+    always overrides the default.
+
+    A line whose CURRENT channel_line_source is already non-blank looks
+    linked, not orphaned — find_unlinked_order_lines classifies purely on
+    that field being non-blank, so restoring only ItemSource on an already-
+    linked line would make the detector report a healthy line that never
+    actually got its correct ItemNumber. This tool therefore refuses to
+    touch an already-linked line by default; pass
+    allow_relink_of_linked_line=True to override.
+
+    The OrderItem sent to Orders/UpdateOrderItem is the target line's raw
+    item object, round-tripped verbatim, with ONLY ItemNumber and ItemSource
+    changed — see _build_relink_order_item. Before any write, the
+    constructed payload is compared back against the raw item it was built
+    from (_relink_payload_unexpected_diff); if any key other than
+    ItemNumber/ItemSource is missing, added, or changed, the write is
+    aborted with no call made — an identity-only edit that also drifts a
+    cost or quantity value would silently reprice a live order.
+
+    On a live run the payload sent is exactly {"orderId", "orderItem",
+    "fulfilmentCenter", "source", "subSource"} — fulfilmentCenter follows
+    the same FulfilmentLocationId-falling-back-to-Default pattern as
+    remove_order_item/cancel_order, and source/subSource are the order's
+    own Source/SubSource. After the write, the order is read back FRESH (a
+    new call, never the pre-write object already in hand — and always by
+    GUID, even when order_id was originally supplied as a numeric order
+    number) and classified:
+      - "relinked"      the fresh read shows BOTH ItemNumber and ItemSource
+                         now matching the intended values
+      - "not_persisted" Linnworks accepted the call (2xx) but the fresh
+                         read shows the identity fields did not take
+      - "unconfirmed"    the read-back itself failed, or could not locate
+                         the line at all — NEVER defaulted to success, and
+                         never described as "line not found"
+      - "rate_limited"   a RateLimitError was raised while resolving the
+                         order, while writing, or while reading back —
+                         distinct from "not_persisted" and "unconfirmed"
+
+    The same read-back also compares every OTHER field on the line against
+    its pre-write value and reports any that changed under the distinct key
+    "unexpected_field_changes" — money and quantity ride on the same
+    OrderItem object as the identity fields, so a drifted price or quantity
+    must be visible here, never swallowed by a clean-looking outcome.
+
+    IMPORTANT: dry_run defaults to True. This writes to a real customer
+    order via an endpoint that has never been fired live — always review
+    the manifest with the user before setting dry_run=False.
+
+    Args:
+        order_id: The order to modify. Accepts a GUID pkOrderID or a numeric
+            order number (e.g. "596475").
+        row_id: The OrderItemRowId of the line to repair — from get_order's
+            items list (the "row_id" field on each item).
+        channel_line_id: The correct storefront line id to write as
+            ItemNumber. REQUIRED — never derived, defaulted, or guessed.
+            Omitted or blank is refused.
+        channel_line_source: The channel name to write as ItemSource.
+            Defaults to the order's own Source value when omitted; passing
+            this overrides the default. Shown in the manifest either way,
+            labelled as derived or supplied.
+        allow_relink_of_linked_line: Must be True to write to a line whose
+            current channel_line_source is already non-blank. Defaults to
+            False so the tool never touches a line that already looks
+            linked.
+        location_id: Fulfilment centre GUID to send with the update.
+            Defaults to the order's own fulfilment location, falling back
+            to the Default location only when the order carries none.
+            Supplying this overrides both.
+        dry_run: If True (default), shows exactly what would be written
+            (current vs intended identity values) without writing anything.
+            Set to False to execute.
+
+    Returns:
+        A dict. On any refusal (unresolvable order_id, unknown row_id,
+        processed order, missing channel_line_id, already-linked line
+        without override) an "error" key is set and no write call is made.
+        Otherwise: order_id, num_order_id, customer_name, reference_num,
+        external_reference, row_id, line (sku, title, quantity),
+        channel_line_id_before/after, channel_line_source_before/after,
+        channel_line_source_origin ("derived_from_order_source" or
+        "supplied") — plus, once a live write has been attempted: outcome
+        ("relinked" / "not_persisted" / "unconfirmed" / "rate_limited"),
+        linnworks_response, unexpected_field_changes, and unproven_warning.
+    """
+    order_id = order_id.strip()
+    row_id = row_id.strip()
+
+    try:
+        guid, raw = _resolve_order_guid(order_id)
+    except RateLimitError as exc:
+        return {
+            "outcome": "rate_limited",
+            "error": f"rate_limited resolving order: {exc}",
+            "order_id_input": order_id,
+        }
+    except RuntimeError as exc:
+        return {"error": str(exc), "order_id_input": order_id}
+
+    fmt = _format_order_detail(raw)
+
+    if fmt.get("processed"):
+        return {
+            "error": (
+                "This order is already processed (dispatched). A despatched "
+                "order cannot be repaired this way."
+            ),
+            "order_id": fmt.get("order_id"),
+            "num_order_id": fmt.get("num_order_id"),
+        }
+
+    raw_items = list(raw.get("Items") or [])
+    target = next((i for i in raw_items if i.get("RowId") == row_id), None)
+
+    if target is None:
+        return {
+            "error": (
+                f"row_id {row_id!r} not found on order {fmt.get('order_id')!r}. "
+                "Use get_order() to list current line items and their row_id values."
+            ),
+            "order_id": fmt.get("order_id"),
+            "num_order_id": fmt.get("num_order_id"),
+            "row_id": row_id,
+        }
+
+    channel_line_id = (channel_line_id or "").strip()
+    if not channel_line_id:
+        return {
+            "error": (
+                "channel_line_id is required and must not be blank. It is "
+                "never derived, defaulted, or guessed by this tool — you "
+                "must supply the correct storefront line id yourself. A "
+                "guessed or mistyped id points despatch at the wrong "
+                "storefront line, which is worse than leaving it blank."
+            ),
+            "reason": "channel_line_id_required",
+            "order_id": fmt.get("order_id"),
+            "num_order_id": fmt.get("num_order_id"),
+            "row_id": row_id,
+        }
+
+    current_source = target.get("ItemSource")
+    source_supplied = bool(channel_line_source and channel_line_source.strip())
+    if source_supplied:
+        effective_source = channel_line_source.strip()
+        source_origin = "supplied"
+    else:
+        effective_source = fmt.get("source") or ""
+        source_origin = "derived_from_order_source"
+
+    if (current_source or "").strip() and not allow_relink_of_linked_line:
+        return {
+            "error": (
+                f"This line's current channel_line_source is already "
+                f"{current_source!r} (non-blank) — it does not look "
+                "orphaned. relink_order_line refuses to write to an "
+                "already-linked line by default, because "
+                "find_unlinked_order_lines classifies purely on this field "
+                "being non-blank and a source-only write would report a "
+                "healthy line that never got the correct id. Set "
+                "allow_relink_of_linked_line=True to override."
+            ),
+            "reason": "already_linked",
+            "order_id": fmt.get("order_id"),
+            "num_order_id": fmt.get("num_order_id"),
+            "row_id": row_id,
+            "channel_line_source_current": current_source,
+        }
+
+    manifest = {
+        "order_id": fmt.get("order_id"),
+        "num_order_id": fmt.get("num_order_id"),
+        "customer_name": fmt.get("customer_name"),
+        "reference_num": fmt.get("reference_num"),
+        "external_reference": fmt.get("external_reference"),
+        "row_id": row_id,
+        "line": {
+            "sku": target.get("SKU"),
+            "title": target.get("Title"),
+            "quantity": target.get("Quantity"),
+        },
+        "channel_line_id_before": target.get("ItemNumber"),
+        "channel_line_id_after": channel_line_id,
+        "channel_line_source_before": current_source,
+        "channel_line_source_after": effective_source,
+        "channel_line_source_origin": source_origin,
+    }
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "status": "would_relink",
+            "message": "Set dry_run=False to write these values to Orders/UpdateOrderItem.",
+            **manifest,
+        }
+
+    # ---- Live write ----
+
+    def _live(result: dict) -> dict:
+        return {**result, "unproven_warning": _RELINK_ORDER_LINE_UNPROVEN_WARNING}
+
+    payload_item = _build_relink_order_item(target, channel_line_id, effective_source)
+    unexpected_diff = _relink_payload_unexpected_diff(target, payload_item)
+    if unexpected_diff:
+        return _live({
+            "dry_run": False,
+            "error": (
+                "Internal safety check failed: the constructed OrderItem "
+                "payload differs from the line as read, on a key other "
+                "than ItemNumber/ItemSource. Refusing to write — this "
+                f"should never happen. Affected keys: {sorted(unexpected_diff.keys())}."
+            ),
+            "unexpected_diff": unexpected_diff,
+            **manifest,
+        })
+
+    fulfilment_centre = (
+        location_id or raw.get("FulfilmentLocationId") or DEFAULT_LOCATION_ID
+    )
+    payload = {
+        "orderId": guid,
+        "orderItem": payload_item,
+        "fulfilmentCenter": fulfilment_centre,
+        "source": fmt.get("source"),
+        "subSource": fmt.get("sub_source"),
+    }
+
+    try:
+        write_resp = call_linnworks("Orders/UpdateOrderItem", payload)
+    except RateLimitError as exc:
+        return _live({
+            "dry_run": False,
+            "outcome": "rate_limited",
+            "error": f"rate_limited on Orders/UpdateOrderItem: {exc}",
+            **manifest,
+        })
+
+    # Fresh read-back — never the pre-write `raw`, and always by GUID.
+    try:
+        _, raw_after = _resolve_order_guid(guid)
+    except RateLimitError as exc:
+        return _live({
+            "dry_run": False,
+            "outcome": "rate_limited",
+            "error": f"rate_limited on read-back: {exc}",
+            "linnworks_response": write_resp,
+            **manifest,
+        })
+    except RuntimeError as exc:
+        return _live({
+            "dry_run": False,
+            "outcome": "unconfirmed",
+            "unconfirmed_reason": f"read-back failed: {exc}",
+            "linnworks_response": write_resp,
+            **manifest,
+        })
+
+    items_after = list(raw_after.get("Items") or [])
+    item_after = next((i for i in items_after if i.get("RowId") == row_id), None)
+
+    if item_after is None:
+        return _live({
+            "dry_run": False,
+            "outcome": "unconfirmed",
+            "unconfirmed_reason": (
+                "The line could not be located on the fresh read-back "
+                "after the write; this is not proof of success or failure."
+            ),
+            "linnworks_response": write_resp,
+            **manifest,
+        })
+
+    id_after = item_after.get("ItemNumber")
+    source_after = item_after.get("ItemSource")
+    persisted = (id_after == channel_line_id) and (
+        (source_after or "").strip() == (effective_source or "").strip()
+    )
+    outcome = "relinked" if persisted else "not_persisted"
+
+    # Every OTHER field on the line, compared against its pre-write value.
+    unexpected_field_changes = {}
+    for key in set(target) | set(item_after):
+        if key in ("ItemNumber", "ItemSource"):
+            continue
+        before = target.get(key, _RELINK_MISSING)
+        after = item_after.get(key, _RELINK_MISSING)
+        if before != after:
+            unexpected_field_changes[key] = {
+                "before": None if before is _RELINK_MISSING else before,
+                "after": None if after is _RELINK_MISSING else after,
+            }
+
+    result = _live({
+        "dry_run": False,
+        "outcome": outcome,
+        "linnworks_response": write_resp,
+        "channel_line_id_after_write": id_after,
+        "channel_line_source_after_write": source_after,
+        "unexpected_field_changes": unexpected_field_changes,
+        **manifest,
+    })
+    if outcome == "not_persisted":
+        result["warning"] = (
+            "Linnworks accepted the call but the fresh read-back shows the "
+            "identity fields did not take the intended values. Check the "
+            "order in the Linnworks UI before trying again."
+        )
+    return result
+
+
 @mcp.tool()
 def set_order_status(
     order_ids: list[str],
