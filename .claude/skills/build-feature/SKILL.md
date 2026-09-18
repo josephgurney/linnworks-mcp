@@ -109,11 +109,20 @@ Work in `server.py` following the loaded conventions. Rules that are always true
 
 - Stage ONLY the files the feature touched (`git add <files>` — never `git add -A`).
 - Commit message in house style: `Add <capability> (closes #N)` — the `closes #N`
-  auto-closes the issue on push to main.
-- **Local**: push to `main`.
-- **Cloud**: push a branch `feature/issue-N-<slug>` and open a PR titled the same
-  as the commit; body = summary + "⚠️ pytest-only build: live verification against
-  the tenant still required on the local machine before merge."
+  auto-closes the issue when the PR merges.
+- **⚠️ ALWAYS open a pull request. NEVER push directly to `main`, in any
+  environment.** `main` is protected and requires the `tests` status check.
+  Admin rights make a direct push *succeed* (GitHub reports `Bypassed rule
+  violations`), which is exactly why this has to be a rule rather than a
+  guardrail — the protection exists so nothing reaches the default branch
+  without CI having passed on it, and pushing directly inverts that: a red
+  build means main is already broken instead of a merge being blocked.
+  This holds for one-line fixes, docs-only changes, and follow-up fixes to
+  something merged minutes earlier.
+- Push a branch — `agent/issue-N-<slug>` matches the existing history — and open
+  a PR titled the same as the commit. Wait for CI, then merge.
+- **Cloud**: same, plus "⚠️ pytest-only build: live verification against the
+  tenant still required on the local machine before merge." in the PR body.
 
 ## Step 9 — Close the loop
 
