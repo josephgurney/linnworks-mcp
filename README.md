@@ -1,7 +1,7 @@
 # Linnworks MCP Server
 
-![Version](https://img.shields.io/badge/version-1.53.0-blue)
-![Tools](https://img.shields.io/badge/tools-89-blue)
+![Version](https://img.shields.io/badge/version-1.54.0-blue)
+![Tools](https://img.shields.io/badge/tools-93-blue)
 
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
 
@@ -81,6 +81,15 @@ Once installed, Claude gets access to these tools:
 | `archive_inventory_items` | Archive items by SKU — hides them from the active catalogue, reversible |
 | `unarchive_inventory_items` | Restore archived items — takes StockItemId GUIDs, since archived SKUs can't be resolved by SKU |
 | `delete_inventory_item` | Permanently delete items by SKU — irreversible, staged |
+
+**Picking (read)**
+
+| Tool | What it does |
+|---|---|
+| `get_pick_waves` | List pickwaves (Picking/GetAllPickingWaveHeaders). Point-in-time snapshot. Omitting `state` does NOT mean "all states" despite the API's own docs — pass an explicit state to see historical (Abandoned/Shipped) waves |
+| `get_pick_wave_users` | Warehouse users (pickers) with their current pickwave summary. On this tenant, `state` didn't discriminate between any of the six non-terminal states during live testing (always the same idle-picker roster) — treat that as unverified rather than proven either way |
+| `get_item_bins` | Bin/binrack locations for a SKU. Distinguishes bins found, no bin configured (clean empty result), bin tracking unavailable (this tenant has no WMS-managed locations at all), lookup failed, and rate limited — never collapses one into another |
+| `check_orders_pickable` | Feasibility check only (Picking/CheckAllocatableToPickwave) — proven side-effect free during the build that added it: no new wave, no order state change, no stock level change, byte-identical on repeat calls. Accepts GUID or numeric order ids; an id that can't be resolved is reported per-order, not raised |
 
 **Categories (writes default to dry_run=True)**
 
