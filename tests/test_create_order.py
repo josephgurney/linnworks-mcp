@@ -484,6 +484,57 @@ def test_read_back_surfaces_whether_lines_linked():
     assert r["read_back"]["lines_linked"][0]["channel_line_source"] == "DIRECT"
 
 
+def test_read_back_reports_the_sku_not_null():
+    """_format_order_detail's item keys are MIXED CASE ("SKU"). Reading a
+    lowercase "sku" reported every line as null on the first live run."""
+    _, r = _capture_payload()
+    assert r["read_back"]["lines_linked"][0]["sku"] == SKU_A
+    assert r["read_back"]["lines_linked"][0]["sku"] is not None
+
+
+def test_postal_service_reassignment_is_reported_as_a_note_not_a_warning():
+    """The rules engine assigning shipping is EXPECTED on this tenant
+    (owner-confirmed) — requested '1st Class Letter', got 'EVRi Standard 24Hr'.
+    Reported so the caller knows, but not as a warning: flagging expected
+    behaviour as a problem is noise that erodes real warnings."""
+    _, r = _capture_payload(postal_service="1st Class Letter")
+    assert r["read_back"]["postal_service_reassigned"] is True
+    assert r["read_back"]["postal_service_requested"] == "1st Class Letter"
+    assert any("reassigned by the Linnworks rules engine" in n for n in r["notes"])
+    assert not any("reassigned" in w for w in r.get("warnings", []))
+
+
+def test_no_reassignment_note_when_the_service_survives():
+    _, r = _capture_payload(postal_service="Royal Mail 24 Parcel")
+    assert r["read_back"]["postal_service_reassigned"] is False
+    assert not r.get("notes")
+
+
+def test_dispatch_by_defaults_to_tomorrow_not_now():
+    """DispatchBy is required server-side; defaulting it to now would make every
+    manual order instantly overdue in get_open_orders(overdue_only=True)."""
+    from datetime import datetime, timezone
+    captured, _ = _capture_payload()
+    sent = datetime.fromisoformat(captured["payload"]["orders"][0]["DispatchBy"])
+    assert (sent - datetime.now(timezone.utc)).total_seconds() > 3600
+
+
+def test_explicit_dispatch_by_is_passed_through():
+    captured, _ = _capture_payload(dispatch_by="2026-12-25")
+    assert captured["payload"]["orders"][0]["DispatchBy"].startswith("2026-12-25")
+
+
+def test_bad_dispatch_by_is_refused_before_any_write():
+    r = _run(dispatch_by="next tuesday")
+    assert r["status"] == "error"
+    assert "dispatch_by" in r["error"]
+
+
+def test_dispatch_by_is_always_sent_because_linnworks_requires_it():
+    captured, _ = _capture_payload()
+    assert captured["payload"]["orders"][0]["DispatchBy"]
+
+
 def test_resend_fires_change_status_with_code_4():
     captured, r = _capture_payload(payment_status="resend")
     assert captured["status_calls"][0]["status"] == 4

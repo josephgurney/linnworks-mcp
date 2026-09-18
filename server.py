@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.55.0"
+__version__ = "1.55.1"
 
 import json
 import os
@@ -18,7 +18,7 @@ import sys
 import time
 import uuid
 import difflib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
 import re
@@ -3001,6 +3001,7 @@ def _get_refund_options(order_guid: str) -> dict:
 def cancel_order(
     order_id: str,
     note: Optional[str] = None,
+    refund: float = 0.0,
     dry_run: bool = True,
 ) -> dict:
     """
@@ -3022,6 +3023,12 @@ def cancel_order(
         order_id: The order to cancel. Accepts a GUID pkOrderID or a numeric
             order number (e.g. "596475").
         note: Optional note to attach to the cancellation.
+        refund: Refund quantity to attach to the cancellation. Defaults to 0.0
+            (cancel without an attached refund). ⚠️ This field is sent on EVERY
+            call because Linnworks REQUIRES it, even though the public schema
+            marks it optional — omitting it returns a bare HTTP 400 "The request
+            is invalid." that names nothing. Live-confirmed 18 Sep 2026; before
+            that this tool never sent it and so could not have worked.
         dry_run: If True (default), shows what would be cancelled without
             actually cancelling. Set to False to execute.
 
@@ -3075,9 +3082,16 @@ def cancel_order(
     fulfilment_location_id = (
         raw.get("FulfilmentLocationId") or DEFAULT_LOCATION_ID
     )
+    # `refund` is REQUIRED despite Orders_CancelOrderRequest documenting it as
+    # optional: omitting it returns HTTP 400 "The request is invalid." — the
+    # generic model-validation error, which names nothing. Live-confirmed
+    # 18 Sep 2026 by probing variants; adding refund was the only change that
+    # made an otherwise byte-identical payload succeed. This tool had never
+    # sent it, so cancel_order could not have worked before that date.
     payload = {
         "orderId": guid,
         "fulfilmentCenter": fulfilment_location_id,
+        "refund": float(refund),
         "note": note or "",
     }
     result = call_linnworks("Orders/CancelOrder", payload)
@@ -3918,6 +3932,7 @@ def create_order(
     payment_method: str = "",
     postage_cost: float = 0.0,
     prices_include_tax: bool = True,
+    dispatch_by: str = "",
     currency: str = "GBP",
     note: str = "",
     location_id: str = DEFAULT_LOCATION_ID,
@@ -3991,6 +4006,13 @@ def create_order(
             tenant, and this codebase has already been burned by a tax
             inclusivity assumption once (PO line Cost, issue #15). Check the
             totals on the first order you create.
+        dispatch_by: When the order must be dispatched by, ISO format
+            (e.g. "2026-09-19" or "2026-09-19T14:00:00"). ⚠️ REQUIRED BY
+            LINNWORKS even though the spec documents it as an ordinary optional
+            field — an empty value returns HTTP 400 "has an empty DispatchBy"
+            (live-confirmed 18 Sep 2026). Defaults to 1 day from now. Note it
+            drives the overdue flag: setting it to the current time makes the
+            order INSTANTLY overdue in get_open_orders(overdue_only=True).
         note: Internal note added to the order, saving a second call.
         location_id: Fulfilment location. Defaults to Default.
         confirmed_count: Echo back the number of LINES when staging triggers
@@ -4028,6 +4050,22 @@ def create_order(
         ("currency", currency),
     ):
         _check_injection(field, value or "")
+
+    # DispatchBy is mandatory server-side (HTTP 400 "has an empty DispatchBy"),
+    # despite the spec listing it as an ordinary optional field.
+    if dispatch_by.strip():
+        try:
+            dispatch_by_iso = datetime.fromisoformat(dispatch_by.strip()).isoformat()
+        except ValueError:
+            return {
+                "status": "error",
+                "error": (
+                    f"dispatch_by '{dispatch_by}' is not a valid ISO date/time. "
+                    'Use e.g. "2026-09-19" or "2026-09-19T14:00:00".'
+                ),
+            }
+    else:
+        dispatch_by_iso = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
 
     item_list, err = _parse_json_arg(items, "items", list)
     if err:
@@ -4275,6 +4313,7 @@ def create_order(
         "postal_service": postal_service or "(Linnworks rules decide)",
         "payment_method": payment_method or "(Linnworks default)",
         "currency": currency,
+        "dispatch_by": dispatch_by_iso,
         "location_id": location_id,
         "prices_include_tax": prices_include_tax,
         "tax_note": (
@@ -4316,6 +4355,7 @@ def create_order(
         "ChannelBuyerName": delivery.get("FullName", ""),
         "Currency": currency,
         "ReceivedDate": datetime.now(timezone.utc).isoformat(),
+        "DispatchBy": dispatch_by_iso,
         "PaymentStatus": linn_payment_status,
         "OrderState": "None",
         "PostalServiceCost": round(float(postage_cost or 0.0), 2),
@@ -4449,9 +4489,14 @@ def create_order(
             "postal_service_name": detail.get("postal_service_name"),
             "totals": detail.get("totals"),
             "line_count": len(detail.get("items") or []),
+            # NB _format_order_detail's item rows are MIXED CASE: "SKU" and
+            # "StockItemId" are capitalised while channel_* are not. Reading
+            # i.get("sku") here reported every line as null on the first live
+            # run (18 Sep 2026) even though the lines had linked correctly.
             "lines_linked": [
                 {
-                    "sku": i.get("sku"),
+                    "sku": i.get("SKU"),
+                    "stock_item_id": i.get("StockItemId"),
                     "channel_line_id": i.get("channel_line_id"),
                     "channel_line_source": i.get("channel_line_source"),
                 }
@@ -4459,6 +4504,30 @@ def create_order(
             ],
         }
         result["num_order_id"] = detail.get("num_order_id")
+
+        # Linnworks re-assigns the postal service via its own shipping rules:
+        # "1st Class Letter" was requested and "EVRi Standard 24Hr" came back on
+        # the first live run (18 Sep 2026). Assumption #9 — the write lands, but
+        # not with your value — so report it rather than letting the manifest's
+        # promise stand unchallenged.
+        actual_service = detail.get("postal_service_name")
+        if postal_service.strip() and actual_service and actual_service != postal_service:
+            # NOT a fault on this tenant — the Linnworks rules engine assigns
+            # the shipping service on incoming orders by design (owner-confirmed
+            # 18 Sep 2026, after "1st Class Letter" came back as "EVRi Standard
+            # 24Hr"). Reported as information, not a warning: a caller should
+            # know the requested value did not stick, but flagging expected
+            # behaviour as a problem is noise that erodes real warnings.
+            result.setdefault("notes", []).append(
+                f"Postal service reassigned by the Linnworks rules engine: requested "
+                f"'{postal_service}', the order carries '{actual_service}'. This is "
+                f"expected — the rules engine assigns shipping on incoming orders — so "
+                f"treat the requested service as a preference, not a guarantee."
+            )
+        result["read_back"]["postal_service_requested"] = postal_service or None
+        result["read_back"]["postal_service_reassigned"] = bool(
+            postal_service.strip() and actual_service and actual_service != postal_service
+        )
 
         actual_parked = detail.get("is_parked")
         if actual_parked is True and predicted_state != "PARKED":

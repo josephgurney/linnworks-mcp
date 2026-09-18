@@ -199,6 +199,50 @@ class TestCancelOrder:
         assert cancel_payload.get("orderId") == GUID
         assert cancel_payload.get("note") == "test cancel"
 
+    def test_refund_field_is_always_sent_because_linnworks_requires_it(self):
+        """Orders/CancelOrder REQUIRES `refund` even though the public schema
+        marks it optional. Omitting it returns a bare HTTP 400 "The request is
+        invalid." naming nothing — live-confirmed 18 Sep 2026, when adding this
+        single field was the only change that made an otherwise byte-identical
+        payload succeed. Before that, cancel_order could not have worked."""
+        import server
+
+        cancel_payload = {}
+
+        def side_effect(path, payload, **kwargs):
+            if "GetOrdersById" in path:
+                return [OPEN_ORDER]
+            if "CancelOrder" in path:
+                cancel_payload.update(payload)
+                return "OK"
+            raise AssertionError(f"Unexpected path: {path}")
+
+        with patch("server.call_linnworks", side_effect=side_effect):
+            server.cancel_order(GUID, note="test cancel", dry_run=False)
+
+        assert "refund" in cancel_payload, (
+            "cancel_order must send `refund` — Linnworks rejects the call without it"
+        )
+        assert cancel_payload["refund"] == 0.0
+
+    def test_refund_amount_is_passed_through_when_supplied(self):
+        import server
+
+        cancel_payload = {}
+
+        def side_effect(path, payload, **kwargs):
+            if "GetOrdersById" in path:
+                return [OPEN_ORDER]
+            if "CancelOrder" in path:
+                cancel_payload.update(payload)
+                return "OK"
+            raise AssertionError(f"Unexpected path: {path}")
+
+        with patch("server.call_linnworks", side_effect=side_effect):
+            server.cancel_order(GUID, refund=12.50, dry_run=False)
+
+        assert cancel_payload["refund"] == 12.50
+
     def test_fulfilment_location_passed_to_cancel(self):
         """The FulfilmentLocationId from the order must be forwarded to CancelOrder."""
         import server
