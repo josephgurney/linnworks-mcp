@@ -644,3 +644,99 @@ def test_version_is_at_least_1_9_0():
     import server
     major, minor, patch = (int(x) for x in server.__version__.split("."))
     assert (major, minor, patch) >= (1, 9, 0), f"Expected >= 1.9.0, got {server.__version__}"
+
+
+# ── Refund eligibility gate (v1.55.4) ────────────────────────────────────────
+
+class TestRefundEligibilityGate:
+    """The gate used to check only CannotRefundReason, which is "None" on BOTH
+    a refundable channel order and a DIRECT order Linnworks says it cannot
+    refund through a channel. Live-probed 18 Sep 2026:
+
+        DIRECT   CanRefund=False  CanRefundInternally=True   reason="None"
+        SHOPIFY  CanRefund=True   CanRefundInternally=True   reason="None"
+    """
+
+    def test_channel_push_refused_when_can_refund_is_false(self):
+        import server
+        err = server._check_refund_eligibility(
+            {"CanRefund": False, "CanRefundInternally": True, "CannotRefundReason": "None"},
+            push_to_channel=True,
+        )
+        assert err is not None
+        assert "CanRefund=False" in err
+        assert "push_to_channel=False" in err, "must name the workaround that actually works"
+
+    def test_internal_refund_allowed_when_can_refund_is_false(self):
+        """Proven live: a refund with push_to_channel=False succeeded on an
+        order reading CanRefund=False. Refusing on that flag alone would break
+        the case that demonstrably works."""
+        import server
+        assert server._check_refund_eligibility(
+            {"CanRefund": False, "CanRefundInternally": True, "CannotRefundReason": "None"},
+            push_to_channel=False,
+        ) is None
+
+    def test_channel_push_allowed_on_a_refundable_channel_order(self):
+        import server
+        assert server._check_refund_eligibility(
+            {"CanRefund": True, "CanRefundInternally": True, "CannotRefundReason": "None"},
+            push_to_channel=True,
+        ) is None
+
+    def test_internal_refund_refused_when_cannot_refund_internally(self):
+        import server
+        err = server._check_refund_eligibility(
+            {"CanRefund": True, "CanRefundInternally": False, "CannotRefundReason": "None"},
+            push_to_channel=False,
+        )
+        assert err is not None
+        assert "CanRefundInternally=False" in err
+
+    def test_explicit_cannot_refund_reason_still_refuses_first(self):
+        import server
+        err = server._check_refund_eligibility(
+            {"CanRefund": True, "CanRefundInternally": True,
+             "CannotRefundReason": "OrderIsFullyRefundedInLinnworks"},
+            push_to_channel=True,
+        )
+        assert "OrderIsFullyRefundedInLinnworks" in err
+
+    def test_gate_refuses_before_any_create_refund_call(self):
+        """A refused refund must make no write — verified live, the refusal
+        left zero refund headers on the order."""
+        import server
+        paths = []
+
+        def side_effect(path, payload, **kwargs):
+            paths.append(path)
+            if "GetOrdersById" in path:
+                return [_make_raw_order(processed=True)]
+            if "GetRefundOptions" in path:
+                return {"RefundOptions": {"CanRefund": False, "CanRefundInternally": True,
+                                          "CannotRefundReason": "None"}}
+            raise AssertionError(f"Unexpected write: {path}")
+
+        with patch("server.call_linnworks", side_effect=side_effect):
+            r = server.refund_order(GUID, push_to_channel=True, dry_run=False)
+
+        assert r.get("error")
+        assert not any("CreateRefund" in p for p in paths)
+        assert not any("ActionRefund" in p for p in paths)
+
+    def test_refusal_reports_both_flags_so_the_caller_can_see_why(self):
+        import server
+
+        def side_effect(path, payload, **kwargs):
+            if "GetOrdersById" in path:
+                return [_make_raw_order(processed=True)]
+            if "GetRefundOptions" in path:
+                return {"RefundOptions": {"CanRefund": False, "CanRefundInternally": True,
+                                          "CannotRefundReason": "None"}}
+            raise AssertionError(path)
+
+        with patch("server.call_linnworks", side_effect=side_effect):
+            r = server.refund_order(GUID, push_to_channel=True, dry_run=False)
+
+        assert r["can_refund"] is False
+        assert r["can_refund_internally"] is True
