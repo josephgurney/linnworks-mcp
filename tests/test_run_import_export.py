@@ -349,3 +349,120 @@ def test_version_is_at_least_1_10_0():
     assert (major, minor, patch) >= (1, 10, 0), (
         f"Expected >= 1.10.0, got {server.__version__}"
     )
+"""
+QA tests for run_import / run_export (issue: proving the last two spec-based tools).
+
+All tests use unittest.mock — no live Linnworks API calls.
+
+run_export is LIVE-PROVEN (18 Sep 2026, export 36 "supplier test": Started
+jumped from 2018-05-15 to 2026-09-18 within 15s of firing).
+
+run_import is NOT proven and was deliberately not fired: every one of the 126
+configured imports on this tenant writes to real catalogue data, and 9 are
+outright deletion types (DeleteImages, DeletePrimaryImages,
+DeleteSuppliersFromItems, RenameSKU, DeleteComposition). See CLAUDE.md.
+"""
+import sys
+import os
+from unittest.mock import patch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import server
+
+
+def _register(started="2018-05-15T11:09:08Z", queued=False, executing=False):
+    return {
+        "Register": {
+            "FriendlyName": "supplier test",
+            "Type": "InventorySupplier",
+            "Enabled": True,
+            "Executing": executing,
+            "IsQueued": queued,
+            "Started": started,
+        }
+    }
+
+
+class TestRunExportVerification:
+    """The immediate read-back after an async trigger proves nothing — live-proven
+    on export 36, which reported now_queued=False and then ran 15s later."""
+
+    def test_started_before_is_captured_from_the_pre_fire_read(self):
+        with patch.object(server, "call_linnworks_get", return_value=_register()), \
+             patch.object(server, "call_linnworks_void") as void:
+            r = server.run_export(36, dry_run=False)
+        assert r["started_before"] == "2018-05-15T11:09:08Z"
+        void.assert_called_once()
+
+    def test_not_queued_readback_is_not_reported_as_failure(self):
+        """False here means 'not picked up in the last few milliseconds', not
+        'it failed' — the distinction that matters on an async trigger."""
+        with patch.object(server, "call_linnworks_get", return_value=_register(queued=False)), \
+             patch.object(server, "call_linnworks_void"):
+            r = server.run_export(36, dry_run=False)
+        msg = r["message"]
+        assert "EXPECTED" in msg and "not a failure" in msg
+        assert "Acceptance is not execution" in msg
+
+    def test_how_to_verify_names_the_started_timestamp_not_the_status_flag(self):
+        with patch.object(server, "call_linnworks_get", return_value=_register()), \
+             patch.object(server, "call_linnworks_void"):
+            r = server.run_export(36, dry_run=False)
+        assert "started" in r["how_to_verify"]
+        assert "2018-05-15T11:09:08Z" in r["how_to_verify"]
+
+    def test_how_to_verify_warns_last_export_status_is_a_constant(self):
+        """last_export_status is False on ALL 70 exports on this tenant,
+        including production ones that ran correctly today. Reading it as
+        success/failure is the NextSuggestedAction trap again (v1.43.0)."""
+        with patch.object(server, "call_linnworks_get", return_value=_register()), \
+             patch.object(server, "call_linnworks_void"):
+            r = server.run_export(36, dry_run=False)
+        assert "last_export_status" in r["how_to_verify"]
+        assert "constant" in r["how_to_verify"]
+
+    def test_dry_run_fires_nothing(self):
+        with patch.object(server, "call_linnworks_get", return_value=_register()), \
+             patch.object(server, "call_linnworks_void") as void:
+            r = server.run_export(36, dry_run=True)
+        assert r["dry_run"] is True
+        void.assert_not_called()
+
+    def test_already_executing_export_is_not_double_queued(self):
+        with patch.object(server, "call_linnworks_get", return_value=_register(executing=True)), \
+             patch.object(server, "call_linnworks_void") as void:
+            r = server.run_export(36, dry_run=False)
+        assert r["queued"] is False
+        void.assert_not_called()
+
+
+class TestRunImportVerification:
+    """Same endpoint family, same async shape — plus an explicit warning that an
+    import WRITES to the catalogue. run_import itself is NOT live-proven."""
+
+    def test_started_before_is_captured(self):
+        with patch.object(server, "call_linnworks_get", return_value=_register()), \
+             patch.object(server, "call_linnworks_void"):
+            r = server.run_import(353, dry_run=False)
+        assert r["started_before"] == "2018-05-15T11:09:08Z"
+
+    def test_message_warns_that_an_import_writes_to_the_catalogue(self):
+        with patch.object(server, "call_linnworks_get", return_value=_register()), \
+             patch.object(server, "call_linnworks_void"):
+            r = server.run_import(353, dry_run=False)
+        assert "WRITES to your catalogue" in r["message"]
+
+    def test_how_to_verify_warns_import_status_is_unreliable(self):
+        """import_status returns null even for erroring imports — a
+        long-standing tenant quirk already documented in CLAUDE.md."""
+        with patch.object(server, "call_linnworks_get", return_value=_register()), \
+             patch.object(server, "call_linnworks_void"):
+            r = server.run_import(353, dry_run=False)
+        assert "import_status" in r["how_to_verify"]
+
+    def test_dry_run_fires_nothing(self):
+        with patch.object(server, "call_linnworks_get", return_value=_register()), \
+             patch.object(server, "call_linnworks_void") as void:
+            server.run_import(353, dry_run=True)
+        void.assert_not_called()

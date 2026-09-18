@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.55.4"
+__version__ = "1.55.5"
 
 import json
 import os
@@ -9994,6 +9994,10 @@ def run_import(import_id: int, dry_run: bool = True) -> dict:
         }
 
     # ── Live: queue the import ────────────────────────────────────────────────
+    # Capture the PREVIOUS run timestamp before firing — the only reliable
+    # proof the job ran (see the read-back note below).
+    started_before = (register or {}).get("Started")
+
     call_linnworks_void("ImportExport/RunNowImport", {"importId": import_id})
 
     # Read back to confirm state
@@ -10008,15 +10012,31 @@ def run_import(import_id: int, dry_run: bool = True) -> dict:
         "queued":        now_queued or now_executing,
         "now_executing": now_executing,
         "now_queued":    now_queued,
+        # ⚠️ The immediate read-back is almost always TOO EARLY to mean anything.
+        # Proven on the export side 18 Sep 2026 (same endpoint family): the
+        # response read now_queued=False/now_executing=False and the job ran 15
+        # seconds later. False here is NOT failure. Same shape as the async GLT
+        # creates (#38). The proof is `started_before` advancing.
+        "started_before": started_before,
+        "how_to_verify": (
+            "Call get_import_list() again in ~15-30s and compare this import's "
+            f"`started` against started_before ({started_before}). A NEW `started` "
+            "timestamp is the proof it ran. Do NOT rely on `import_status` — it is "
+            "null even for erroring imports (long-standing tenant quirk)."
+        ),
         "message": (
-            f"Import '{friendly_name}' queued successfully — "
-            f"Linnworks will execute it momentarily."
-            if (now_queued or now_executing)
-            else (
-                f"Import '{friendly_name}' triggered (RunNowImport accepted). "
-                f"Read-back shows not yet queued — Linnworks may have picked it "
-                f"up instantly or there may be a brief delay before state updates."
+            f"Import '{friendly_name}' triggered (RunNowImport accepted, HTTP 204). "
+            + (
+                "Read-back already shows it queued/executing."
+                if (now_queued or now_executing)
+                else (
+                    "Read-back shows not queued yet — this is EXPECTED and is not a "
+                    "failure; the job is usually picked up within seconds."
+                )
             )
+            + " Acceptance is not execution: verify via the `started` timestamp, "
+              "per how_to_verify. ⚠️ An import WRITES to your catalogue — confirm "
+              "what it changed."
         ),
     }
 
@@ -10105,6 +10125,10 @@ def run_export(export_id: int, dry_run: bool = True) -> dict:
         }
 
     # ── Live: queue the export ─────────────────────────────────────────────────
+    # Capture the PREVIOUS run timestamp before firing. This is the only
+    # reliable proof the job actually ran — see the read-back note below.
+    started_before = (register or {}).get("Started")
+
     call_linnworks_void("ImportExport/RunNowExport", {"exportId": export_id})
 
     readback    = call_linnworks_get("ImportExport/GetExport", params={"id": export_id})
@@ -10118,15 +10142,35 @@ def run_export(export_id: int, dry_run: bool = True) -> dict:
         "queued":        now_queued or now_executing,
         "now_executing": now_executing,
         "now_queued":    now_queued,
+        # ⚠️ The immediate read-back is almost always TOO EARLY to mean anything.
+        # Live-proven 18 Sep 2026 on export 36: the response came back
+        # now_queued=False / now_executing=False, and the export nonetheless ran
+        # 15 seconds later (Started jumped from 2018-05-15 to 2026-09-18, a 5
+        # second run). So False here is NOT failure — it is "hasn't been picked
+        # up in the last few milliseconds". Same shape as the async GLT creates
+        # (#38): an immediate read-back after an asynchronous trigger proves
+        # nothing. The proof is `started_before` advancing.
+        "started_before": started_before,
+        "how_to_verify": (
+            "Call get_export_list() again in ~15-30s and compare this export's "
+            f"`started` against started_before ({started_before}). A NEW `started` "
+            "timestamp is the proof it ran. Do NOT read `last_export_status` as "
+            "success: it is False on ALL 70 exports on this tenant, including "
+            "production ones that ran correctly on schedule today — it is a "
+            "constant, not a result."
+        ),
         "message": (
-            f"Export '{friendly_name}' queued successfully — "
-            f"Linnworks will execute it momentarily."
-            if (now_queued or now_executing)
-            else (
-                f"Export '{friendly_name}' triggered (RunNowExport accepted). "
-                f"Read-back shows not yet queued — Linnworks may have picked it "
-                f"up instantly or there may be a brief delay before state updates."
+            f"Export '{friendly_name}' triggered (RunNowExport accepted, HTTP 204). "
+            + (
+                f"Read-back already shows it queued/executing."
+                if (now_queued or now_executing)
+                else (
+                    "Read-back shows not queued yet — this is EXPECTED and is not a "
+                    "failure; the job is usually picked up within seconds."
+                )
             )
+            + " Acceptance is not execution: verify via the `started` timestamp, "
+              "per how_to_verify."
         ),
     }
 
