@@ -5743,11 +5743,13 @@ def find_unlinked_order_lines(
 #     be told apart from "the filter is ignored for non-terminal states" —
 #     both tools' docstrings say so plainly rather than asserting either way.
 #
-#   - `detailLevel` ("All" vs "OnlyPickWave") produced NO observable difference
-#     on GetAllPickingWaveHeaders — identical wave counts (238/238, 3281/3281)
-#     and identical fields per row at both levels. It is therefore a
-#     detail-loading option, not a result-set filter (AC5) — on this endpoint,
-#     in this tenant, it currently has no observable effect at all. Exposed
+#   - `detailLevel` ("All" vs "OnlyPickWave") did NOT change the result set on
+#     GetAllPickingWaveHeaders — identical wave counts (238/238, 3281/3281)
+#     and the same fields per row at both levels. It is therefore a
+#     detail-loading option, not a result-set filter (AC5). It is not wholly
+#     inert, though: the ROW ORDER differed between the two levels (first row
+#     id 5 vs 711 on the same query), so the two responses are not
+#     byte-identical and neither level guarantees a stable ordering. Exposed
 #     anyway because it is a real, documented, harmless parameter.
 #
 #   - GetAllPickingWaves / GetPickingWave (the "detailed", order-level variant)
@@ -5964,11 +5966,12 @@ def get_pick_waves(
 
     `state` genuinely filters the result set (live-confirmed: state=Abandoned
     -> 238 waves, state=Shipped -> 3,281 waves, on the same tenant). `detail_level`
-    ("All" vs "OnlyPickWave") produced no observable difference on this
-    endpoint during live testing — identical wave counts and identical fields
-    at both levels. It is exposed because it is a real, documented API
-    parameter, but treat it as currently inert here rather than a way to get
-    more or less detail.
+    ("All" vs "OnlyPickWave") did not change the result set on this endpoint
+    during live testing — identical wave counts and the same fields at both
+    levels — so it is not a way to get more or less detail here. It is not
+    wholly inert: the row ORDER differed between the two levels, so the two
+    responses are not byte-identical and neither level guarantees a stable
+    ordering. It is exposed because it is a real, documented API parameter.
 
     Linnworks exposes no endpoint for adding an order to an existing pickwave
     — confirmed by inspecting the live Picking API spec during this build.
@@ -5994,8 +5997,9 @@ def get_pick_waves(
         location_id: Filter to one Linnworks location GUID. Defaults to
             DEFAULT_LOCATION_ID only when no other filter is supplied at all
             (the API 400s on a completely empty request).
-        detail_level: "All" or "OnlyPickWave". Currently has no observed
-            effect on this endpoint — see above.
+        detail_level: "All" or "OnlyPickWave". Does not change which waves
+            come back or what fields each carries on this endpoint; only the
+            row order differed between levels — see above.
 
     Returns:
         A dict with:
@@ -6085,7 +6089,8 @@ def get_pick_wave_users(
             DEFAULT_LOCATION_ID only when no other filter is supplied.
         detail_level: "All" or "OnlyPickWave". Not independently verified on
             this endpoint (see get_pick_waves for the finding on its sibling
-            endpoint, which showed no observable effect).
+            endpoint, where it did not change the result set but did change
+            the row order).
 
     Returns:
         A dict with:
