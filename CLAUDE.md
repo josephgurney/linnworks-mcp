@@ -891,12 +891,23 @@ back to `--list-tools` only and defer live testing to Claude Desktop.
 - Add any newly confirmed endpoints to the confirmed endpoints table
 - Add any newly discovered broken endpoints to the broken endpoints table
 
-### Step 7 — Commit and push
+### Step 7 — Commit and open a PR
+
+**⚠️ NEVER push directly to `main`.** It is protected and requires the `tests`
+check; admin rights let a direct push through anyway (GitHub reports `Bypassed
+rule violations`), so this is a rule, not something the branch config enforces
+for you. Every change goes via a PR, including docs-only ones.
+
 ```bash
+git checkout -b agent/issue-N-<slug>
 git add server.py CLAUDE.md
 git commit -m "Add <tool_name> tool (closes #N)"
-git push origin main
+git push -u origin agent/issue-N-<slug>
+gh pr create --repo josephgurney/linnworks-mcp --base main \
+  --title "Add <tool_name> tool (closes #N)" --body "<summary>"
 ```
+
+Wait for CI to pass, then merge. `closes #N` auto-closes the issue on merge.
 
 ### Step 8 — Comment on the issue
 ```bash
