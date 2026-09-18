@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.53.0"
+__version__ = "1.54.0"
 
 import json
 import os
@@ -5701,6 +5701,716 @@ def find_unlinked_order_lines(
         "rate_limited_orders": rate_limited_orders,
         "missing_orders": missing_orders,
         "complete": not rate_limited_orders and not missing_orders,
+    }
+
+
+# ---------- Picking (issue #64) ----------------------------------------------
+#
+# Four READ-ONLY tools over the /api/Picking/ endpoint family, which this repo
+# has never called before this build. The write half (generate a wave, remove
+# orders from one, update/abandon it) is issue #67, deliberately held — see
+# CLAUDE.md's Conflicts note. Nothing in this section writes to Linnworks:
+# no dry_run parameter, no WRITE_THRESHOLDS entry, no call_linnworks_void.
+#
+# Everything below was live-probed against the real tenant during this build
+# (see CLAUDE.md's confirmed-endpoints table for the exact request shapes and
+# raw findings). The headline findings, because they shape almost every
+# decision in this section:
+#
+#   - The Picking GET endpoints (GetAllPickingWaveHeaders,
+#     GetPickwaveUsersWithSummary) 400 with "'request' parameter is missing."
+#     when called with NO query parameters at all, even though every one of
+#     `state`/`locationId`/`detailLevel` is individually documented as
+#     optional. At least one must be present, so these tools default
+#     `locationId` to DEFAULT_LOCATION_ID when the caller supplies nothing.
+#
+#   - Omitting `state` does NOT mean "all states" despite the spec's own
+#     description ("if not supplied then all states"). Live: locationId=Default
+#     with no state returned 0 waves, while the SAME location with
+#     state=Shipped returned 3,281. There were no active (non-terminal) waves
+#     anywhere in the tenant during this build, so it remains unconfirmed
+#     whether an omitted state would surface an in-progress wave — but it
+#     provably does not surface the historical (Abandoned/Shipped) ones. Always
+#     pass an explicit state to see historical waves.
+#
+#   - `state` genuinely filters GetAllPickingWaveHeaders (AC4): state=Abandoned
+#     -> 238, state=Shipped -> 3281, six other states (no current activity in
+#     the tenant) -> 0 each. On GetPickwaveUsersWithSummary the picture is
+#     murkier: all six non-terminal state values returned the IDENTICAL 15-row
+#     idle-picker roster (PickingWaveId 0 on every row), while Abandoned/Shipped
+#     returned genuinely different historical counts (247 / 3287). Because no
+#     wave was actually in a non-terminal state during this build, this cannot
+#     be told apart from "the filter is ignored for non-terminal states" —
+#     both tools' docstrings say so plainly rather than asserting either way.
+#
+#   - `detailLevel` ("All" vs "OnlyPickWave") did NOT change the result set on
+#     GetAllPickingWaveHeaders — identical wave counts (238/238, 3281/3281)
+#     and the same fields per row at both levels. It is therefore a
+#     detail-loading option, not a result-set filter (AC5). It is not wholly
+#     inert, though: the ROW ORDER differed between the two levels (first row
+#     id 5 vs 711 on the same query), so the two responses are not
+#     byte-identical and neither level guarantees a stable ordering. Exposed
+#     anyway because it is a real, documented, harmless parameter.
+#
+#   - GetAllPickingWaves / GetPickingWave (the "detailed", order-level variant)
+#     returned ZERO wave rows for every state tried, including a wave created
+#     hours before this build ran (id 3520) and a wave fetched directly by id
+#     (id 5) that GetAllPickingWaveHeaders confirms exists. Full per-order pick
+#     detail appears not to be retrievable via this API once a wave has
+#     shipped, at least on this tenant — so get_pick_waves wraps
+#     GetAllPickingWaveHeaders (which reliably returns real data, including
+#     OrderCount, enough to satisfy the post-merge "compare order count and
+#     state label" check) rather than the richer-sounding but empty endpoint.
+#
+#   - Every location on this tenant reads IsWarehouseManaged: False (confirmed
+#     via Inventory/GetStockLocations), and GetItemBinracks refuses a real item
+#     at every location tried with HTTP 400 "Alternate locations aren't
+#     available for non batched items or items in a non WMS location." This
+#     answers the brief's open question directly: this warehouse does not
+#     populate bin/binrack locations in Linnworks. get_item_bins reports this
+#     as its own distinct outcome, never as "no bins configured" (AC11).
+#
+#   - check_orders_pickable (CheckAllocatableToPickwave) was proven side-effect
+#     free (AC8): two consecutive identical calls returned byte-identical
+#     results; wave counts (Unallocated, Shipped) were identical before and
+#     after; the involved orders' Processed/Status/IsParked fields were
+#     unchanged; and Stock/GetStockLevel_Batch for one of the order's SKUs
+#     returned a byte-identical row before and after. See CLAUDE.md for the
+#     full transcript.
+#
+#   - No endpoint in the live Picking API spec adds an order to an EXISTING
+#     pickwave (AC13). UpdatePickingWaveHeader's request schema carries only
+#     PickingWaveId/UserId/State/StartTime/EndTime — no Orders field.
+#     GeneratePickingWave's request schema carries Orders/Pickwaves but no
+#     PickingWaveId to target an existing wave — it can only create new ones.
+#     The only routes that touch wave membership at all are
+#     DeleteOrdersFromPickingWaves (removal) and GeneratePickingWave (create/
+#     regenerate) — both are write endpoints held for #67.
+
+# Raw `State` values from the live Picking API (GetAllPickingWaveHeaders,
+# GetPickwaveUsersWithSummary) that have actually been observed on a REAL wave
+# during this build, each cross-checked against a genuine PickingWaveId/
+# CreatedDate row — not merely present in the API's documented enum. The
+# documented enum also lists Unallocated, Allocated, InProgress, Paused,
+# Complete and Packing (confirmed live as valid FILTER values — they just
+# never matched a real wave here, because nothing was actively being picked
+# during this build), but none of those has been seen on a genuine wave row,
+# so none is mapped here. A human confirming one of those states against the
+# Linnworks UI screen (per CLAUDE.md's post-merge verification steps) is what
+# would extend this dict — never a guess from the enum name alone. This is
+# deliberately module-level, not nested in a tool, so #67's write tools import
+# it rather than minting a second, possibly-divergent state map (the mistake
+# this repo already made once with _ORDER_STATUS_LABELS vs
+# _PAYMENT_STATUS_LABELS, and does not want to repeat a third time).
+_PICK_WAVE_STATE_LABELS: dict[str, str] = {
+    "Abandoned": "Abandoned",
+    "Shipped": "Shipped",
+}
+
+# The exact live error text (lowercased, substring-matched) Linnworks returns
+# from GetItemBinracks when bin/binrack tracking is not available for the
+# requested item/location combination — confirmed live on this tenant, where
+# every location reads IsWarehouseManaged: False. Distinct from a genuinely
+# empty PickableBins/NonPickableBins/AlternateLocations result (a clean 200
+# with nothing in it), which means "this item has no bin configured" rather
+# than "bin tracking isn't switched on here at all" (AC11).
+_BIN_TRACKING_UNAVAILABLE_MARKERS = (
+    "non wms location",
+    "non batched items",
+)
+
+
+def _pick_wave_state_label(raw_state: str | None) -> str:
+    """
+    Human label for a raw pickwave State value — ONLY for a value confirmed
+    live against a real wave (_PICK_WAVE_STATE_LABELS). Anything else,
+    including a value that is valid per the API's own documented enum but has
+    simply never been seen on a real wave here, renders as an explicit
+    "unknown" marker carrying the raw value verbatim — never a guessed name,
+    and never null (AC6).
+    """
+    if raw_state in _PICK_WAVE_STATE_LABELS:
+        return _PICK_WAVE_STATE_LABELS[raw_state]
+    return f"unknown (unconfirmed raw state: {raw_state!r})"
+
+
+def _format_pick_wave(row: dict) -> dict:
+    """
+    Normalise one PickingWave / PickingWaveDetailed row (GetAllPickingWaveHeaders,
+    GetPickwaveUsersWithSummary — both return this same shape) into a
+    consistent dict. Module-level so #67's write tools can reuse it rather
+    than writing a second formatter.
+
+    Deliberately carries NO summed weight or volume figure (AC12) — this
+    endpoint's payload has no such field to begin with (ItemCount is a count
+    of line items, not a weight), and even if one existed, composite parents
+    carry zero weight by design (their components are what actually gets
+    picked), so summing anything wave-level into a trolley-capacity number
+    would silently under-report for any wave containing a bundle.
+
+    This is a point-in-time snapshot (AC13): orders leave waves and wave
+    state advances while pickers work, so the counts and state here are only
+    guaranteed accurate at the moment of the call.
+    """
+    raw_state = row.get("State")
+    return {
+        "picking_wave_id": row.get("PickingWaveId"),
+        "state": raw_state,
+        "state_label": _pick_wave_state_label(raw_state),
+        "state_confirmed": raw_state in _PICK_WAVE_STATE_LABELS,
+        "location_id": row.get("LocationId"),
+        "user_id": row.get("UserId"),
+        "email_address": row.get("EmailAddress"),
+        "created_date": row.get("CreatedDate"),
+        "start_time": row.get("StartTime"),
+        "end_time": row.get("EndTime"),
+        "order_count": row.get("OrderCount"),
+        "item_count": row.get("ItemCount"),
+        "items_picked": row.get("ItemsPicked"),
+        "orders_picked": row.get("OrdersPicked"),
+        "accumulated_in_progress_seconds": row.get("AccumulatedInProgressSeconds"),
+        "group_type": row.get("GroupType"),
+        # PickingWave (headers) calls this SortType; PickingWaveDetailed calls
+        # the same concept SortingType — both spellings are live-confirmed in
+        # the spec, so both are checked.
+        "sort_type": row.get("SortType") or row.get("SortingType"),
+    }
+
+
+def _format_bin_row(row: dict) -> dict:
+    """
+    Normalise one BinRackStockItem row (GetItemBinracks' PickableBins /
+    NonPickableBins / AlternateLocations) into a consistent dict.
+    Module-level so #67's write tools (UpdatePickingWaveItemWithNewBinrack
+    needs to know which binracks are valid targets) can reuse it.
+
+    `current_full_percentage` is the BIN's own volumetric fill level, not the
+    item's weight or the item's contribution to a wave total — it is passed
+    through verbatim (which AC12 permits) and is never summed by this file
+    into anything resembling a trolley capacity figure.
+    """
+    return {
+        "bin_rack": row.get("BinRack"),
+        "bin_rack_id": row.get("BinRackId"),
+        "bin_rack_type_name": row.get("BinrackTypeName"),
+        "quantity": row.get("Quantity"),
+        "in_transit": row.get("InTransit"),
+        "picked_quantity": row.get("PickedQuantity"),
+        "current_full_percentage": row.get("CurrentFullPercentage"),
+        "batch_status": row.get("BatchStatus"),
+        "batch_number": row.get("BatchNumber"),
+        "expires_on": row.get("ExpiresOn"),
+        "sell_by": row.get("SellBy"),
+        "priority_sequence": row.get("PrioritySequence"),
+        "location_id": row.get("LocationId"),
+        "stock_item_id": row.get("StockItemId"),
+    }
+
+
+def _pick_wave_query_params(
+    state: str | None, location_id: str | None, detail_level: str | None
+) -> dict:
+    """
+    Build the query params for GetAllPickingWaveHeaders / GetPickwaveUsersWithSummary.
+
+    Both endpoints 400 with "'request' parameter is missing." when called
+    with zero query parameters, even though state/locationId/detailLevel are
+    each individually documented as optional (live-confirmed on both
+    endpoints during this build). If the caller supplied nothing at all,
+    default locationId to DEFAULT_LOCATION_ID purely to satisfy that
+    requirement — this does not change the "omitted state != all states"
+    finding above, it only avoids the 400.
+    """
+    params: dict = {}
+    if state:
+        params["state"] = state
+    if location_id:
+        params["locationId"] = location_id
+    if detail_level:
+        params["detailLevel"] = detail_level
+    if not params:
+        params["locationId"] = DEFAULT_LOCATION_ID
+    return params
+
+
+_PICK_WAVE_STATE_FILTER_NOTE = (
+    "Omitting `state` does NOT mean 'all states', despite what the Linnworks "
+    "API documents. Live-confirmed: with no state filter, a location with "
+    "3,281 Shipped waves and 238 Abandoned waves returns 0 rows. Pass an "
+    "explicit state ('Unallocated', 'Allocated', 'InProgress', 'Paused', "
+    "'Complete', 'Abandoned', 'Packing', or 'Shipped') to see historical "
+    "(Abandoned/Shipped) waves."
+)
+
+
+@mcp.tool()
+def get_pick_waves(
+    state: str | None = None,
+    location_id: str | None = None,
+    detail_level: str | None = None,
+) -> dict:
+    """
+    List Linnworks pickwaves (Picking/GetAllPickingWaveHeaders).
+
+    Read-only. This is a point-in-time snapshot — orders leave waves and wave
+    state advances while pickers work, so a wave's order count and state are
+    only guaranteed accurate at the moment of this call, and this tool cannot
+    add an order to an existing wave (no such endpoint exists — see below).
+
+    ⚠️  Omitting `state` does NOT return "all states" despite what the
+    Linnworks API itself documents. Live-confirmed during this build: the
+    same location returns 0 rows with no state filter, and 3,281 rows with
+    state="Shipped". Always pass an explicit state to see historical
+    (Abandoned / Shipped) waves; there is no way to get "everything,
+    including history" in one call.
+
+    `state` genuinely filters the result set (live-confirmed: state=Abandoned
+    -> 238 waves, state=Shipped -> 3,281 waves, on the same tenant). `detail_level`
+    ("All" vs "OnlyPickWave") did not change the result set on this endpoint
+    during live testing — identical wave counts and the same fields at both
+    levels — so it is not a way to get more or less detail here. It is not
+    wholly inert: the row ORDER differed between the two levels, so the two
+    responses are not byte-identical and neither level guarantees a stable
+    ordering. It is exposed because it is a real, documented API parameter.
+
+    Linnworks exposes no endpoint for adding an order to an existing pickwave
+    — confirmed by inspecting the live Picking API spec during this build.
+    UpdatePickingWaveHeader can only change UserId/State/StartTime/EndTime on
+    a wave that already exists; GeneratePickingWave has no field to target an
+    existing wave, so it only ever creates new ones. The only routes that
+    touch wave membership at all are removing orders
+    (DeleteOrdersFromPickingWaves) or regenerating the wave — both are write
+    endpoints held for issue #67, not available here.
+
+    This tool never computes or returns a summed weight or volume for a wave.
+    The underlying payload carries no such field, and even if it did,
+    composite parents carry zero weight by design (their components are what
+    is actually picked), so a wave containing a bundle would silently read as
+    lighter than it really is — exactly the wrong direction for planning a
+    trolley's capacity.
+
+    Args:
+        state: Filter to one pickwave state — "Unallocated", "Allocated",
+            "InProgress", "Paused", "Complete", "Abandoned", "Packing", or
+            "Shipped". Omit to use whatever the API's own (documented but
+            live-disproven) default is — see the warning above.
+        location_id: Filter to one Linnworks location GUID. Defaults to
+            DEFAULT_LOCATION_ID only when no other filter is supplied at all
+            (the API 400s on a completely empty request).
+        detail_level: "All" or "OnlyPickWave". Does not change which waves
+            come back or what fields each carries on this endpoint; only the
+            row order differed between levels — see above.
+
+    Returns:
+        A dict with:
+          - state_filter, location_id_filter, detail_level_filter: the
+            filters actually sent
+          - state_filter_note: the "omitted state != all states" warning,
+            always present
+          - count: number of waves returned
+          - waves: list of formatted wave rows (see _format_pick_wave) —
+            each carries `state` (raw, verbatim) and `state_label` (only
+            populated for a state value confirmed live against a real wave;
+            otherwise an explicit "unknown (unconfirmed raw state: ...)"
+            marker — never a guessed name, never null)
+          - rate_limited: True if the call was throttled after Linnworks'
+            full retry ladder (never reported as "0 waves found")
+          - error: present only when rate_limited is True
+          - complete: False only when rate_limited is True
+    """
+    params = _pick_wave_query_params(state, location_id, detail_level)
+
+    try:
+        resp = call_linnworks_get("Picking/GetAllPickingWaveHeaders", params=params)
+    except RateLimitError as exc:
+        return {
+            "state_filter": state,
+            "location_id_filter": location_id,
+            "detail_level_filter": detail_level,
+            "state_filter_note": _PICK_WAVE_STATE_FILTER_NOTE,
+            "count": 0,
+            "waves": [],
+            "rate_limited": True,
+            "error": str(exc),
+            "complete": False,
+        }
+
+    rows = resp.get("PickwaveHeaders") or [] if isinstance(resp, dict) else []
+    waves = [_format_pick_wave(r) for r in rows]
+
+    return {
+        "state_filter": state,
+        "location_id_filter": location_id,
+        "detail_level_filter": detail_level,
+        "state_filter_note": _PICK_WAVE_STATE_FILTER_NOTE,
+        "count": len(waves),
+        "waves": waves,
+        "rate_limited": False,
+        "complete": True,
+    }
+
+
+@mcp.tool()
+def get_pick_wave_users(
+    state: str | None = None,
+    location_id: str | None = None,
+    detail_level: str | None = None,
+) -> dict:
+    """
+    List Linnworks warehouse users (pickers) with their current pickwave
+    summary (Picking/GetPickwaveUsersWithSummary).
+
+    Read-only. Same point-in-time snapshot caveat as get_pick_waves: this
+    reflects wave assignment at the moment of the call, and there is no
+    endpoint to add an order to an existing wave (see get_pick_waves'
+    docstring for the full finding).
+
+    ⚠️  `state` behaves DIFFERENTLY here than on get_pick_waves, and this is
+    live-confirmed but genuinely ambiguous. Every one of the six non-terminal
+    state values ("Unallocated", "Allocated", "InProgress", "Paused",
+    "Complete", "Packing") returned the IDENTICAL 15-row result — one row per
+    registered picker, each showing PickingWaveId 0 and State "Unallocated"
+    regardless of which state was requested. state="Abandoned" and
+    state="Shipped" DID return genuinely different historical counts (247 vs
+    3,287 on this tenant), so the filter is not simply ignored outright.
+    Because no wave was actually in a non-terminal state anywhere in the
+    tenant during this build, it cannot be told apart from "the filter has no
+    effect for non-terminal states" — treat any non-terminal `state` value
+    passed here as unverified until a real wave is checked against it.
+
+    Like get_pick_waves, `state` omitted does not mean "all states" (see that
+    tool's docstring), and no summed weight/volume figure is ever computed or
+    returned here.
+
+    Args:
+        state: Same enum as get_pick_waves. See the warning above about
+            non-terminal values on this specific endpoint.
+        location_id: Filter to one Linnworks location GUID. Defaults to
+            DEFAULT_LOCATION_ID only when no other filter is supplied.
+        detail_level: "All" or "OnlyPickWave". Not independently verified on
+            this endpoint (see get_pick_waves for the finding on its sibling
+            endpoint, where it did not change the result set but did change
+            the row order).
+
+    Returns:
+        A dict with:
+          - state_filter, location_id_filter, detail_level_filter
+          - state_filter_note: the "omitted state != all states" warning
+          - non_terminal_state_warning: the ambiguity warning above, always
+            present, so a caller can't miss it by only reading the docstring
+          - count: number of rows returned
+          - users: list of formatted rows (see _format_pick_wave) — one row
+            per picker (idle or currently on a wave) for non-terminal states,
+            or one row per historical wave for Abandoned/Shipped
+          - rate_limited: True if the call was throttled after Linnworks'
+            full retry ladder
+          - error: present only when rate_limited is True
+          - complete: False only when rate_limited is True
+    """
+    params = _pick_wave_query_params(state, location_id, detail_level)
+
+    non_terminal_note = (
+        "Live-confirmed: every non-terminal state value (Unallocated, "
+        "Allocated, InProgress, Paused, Complete, Packing) returned the "
+        "identical 15-row idle-picker roster on this tenant, because nothing "
+        "was actively being picked during this build. Whether `state` "
+        "actually discriminates among non-terminal values with a real wave "
+        "present is unverified."
+    )
+
+    try:
+        resp = call_linnworks_get("Picking/GetPickwaveUsersWithSummary", params=params)
+    except RateLimitError as exc:
+        return {
+            "state_filter": state,
+            "location_id_filter": location_id,
+            "detail_level_filter": detail_level,
+            "state_filter_note": _PICK_WAVE_STATE_FILTER_NOTE,
+            "non_terminal_state_warning": non_terminal_note,
+            "count": 0,
+            "users": [],
+            "rate_limited": True,
+            "error": str(exc),
+            "complete": False,
+        }
+
+    rows = resp.get("PickingWaves") or [] if isinstance(resp, dict) else []
+    users = [_format_pick_wave(r) for r in rows]
+
+    return {
+        "state_filter": state,
+        "location_id_filter": location_id,
+        "detail_level_filter": detail_level,
+        "state_filter_note": _PICK_WAVE_STATE_FILTER_NOTE,
+        "non_terminal_state_warning": non_terminal_note,
+        "count": len(users),
+        "users": users,
+        "rate_limited": False,
+        "complete": True,
+    }
+
+
+def _is_bin_tracking_unavailable_error(exc: RuntimeError) -> bool:
+    """True when a GetItemBinracks failure is the live-confirmed 'bin
+    tracking isn't switched on for this item/location' error, rather than
+    some other, genuinely unexpected failure."""
+    text = str(exc).lower()
+    return any(marker in text for marker in _BIN_TRACKING_UNAVAILABLE_MARKERS)
+
+
+@mcp.tool()
+def get_item_bins(
+    skus: list[str],
+    location_id: str = DEFAULT_LOCATION_ID,
+    include_non_pick_locations: bool = False,
+) -> dict:
+    """
+    Look up bin/binrack locations for one or more SKUs (Picking/GetItemBinracks).
+
+    Read-only, one Linnworks call per SKU (no bulk endpoint exists for this).
+
+    Distinguishes FOUR outcomes per SKU, never collapsing one into another
+    (AC11 — "this item has no bin configured" must never read the same as
+    "the lookup failed or was throttled"):
+
+      bins_found              — real bin data returned; see `bins`.
+      no_bins_configured      — the call succeeded (HTTP 200) but every one
+                                 of PickableBins/NonPickableBins/
+                                 AlternateLocations came back empty. This
+                                 genuinely means "no bin recorded for this
+                                 item here", confirmed by a clean response,
+                                 not by an absence of data.
+      bin_tracking_unavailable — Linnworks refused the lookup with the
+                                 live-confirmed error "Alternate locations
+                                 aren't available for non batched items or
+                                 items in a non WMS location." This tenant's
+                                 locations all read IsWarehouseManaged: False
+                                 (confirmed via get_locations during this
+                                 build), so expect this outcome on every real
+                                 item at every location here — it answers
+                                 "does this warehouse populate bins?" with a
+                                 clear no, distinct from "this one item has no
+                                 bin".
+      lookup_failed            — any other error. Reported with the raw
+                                 message; never silently folded into
+                                 no_bins_configured.
+
+    Plus, separately: sku_not_found (the SKU itself doesn't resolve) and
+    rate_limited (the call was throttled after Linnworks' full retry ladder)
+    — both are their own outcomes too, and an unresolvable SKU never sinks
+    the rest of the batch.
+
+    No summed weight/volume figure is ever computed here. `current_full_percentage`
+    on a bin row is the BIN's own volumetric fill level, passed through
+    verbatim — never the item's weight, and never summed across bins.
+
+    Args:
+        skus: SKUs to look up. Each is resolved and queried independently.
+        location_id: Linnworks location GUID to check. Defaults to "Default".
+        include_non_pick_locations: If True, also ask Linnworks to include
+            binracks that cannot currently be selected to pick from.
+
+    Returns:
+        A dict with:
+          - location_id, include_non_pick_locations: the filters used
+          - count: number of SKUs requested
+          - results: per-SKU rows, each with sku, stock_item_id (None if
+            unresolved), outcome (one of the values above), bins (list of
+            _format_bin_row dicts — PickableBins + NonPickableBins +
+            AlternateLocations merged, each tagged with a `bin_category`
+            field; empty unless outcome is "bins_found"), and reason (the
+            raw error text, present for bin_tracking_unavailable and
+            lookup_failed only)
+          - complete: False if any SKU hit rate_limited
+    """
+    cache: dict = {}
+    results: list[dict] = []
+    any_rate_limited = False
+
+    for sku in skus:
+        row: dict = {"sku": sku, "stock_item_id": None, "bins": []}
+        try:
+            stock_item_id = _resolve_sku_to_id(sku, cache)
+        except RateLimitError as exc:
+            row["outcome"] = "rate_limited"
+            row["reason"] = str(exc)
+            any_rate_limited = True
+            results.append(row)
+            continue
+        except ValueError as exc:
+            row["outcome"] = "sku_not_found"
+            row["reason"] = str(exc)
+            results.append(row)
+            continue
+
+        row["stock_item_id"] = stock_item_id
+
+        params = {
+            "stockItemId": stock_item_id,
+            "stockLocationId": location_id,
+            "includeNonPickLocations": include_non_pick_locations,
+        }
+        try:
+            resp = call_linnworks_get("Picking/GetItemBinracks", params=params)
+        except RateLimitError as exc:
+            row["outcome"] = "rate_limited"
+            row["reason"] = str(exc)
+            any_rate_limited = True
+            results.append(row)
+            continue
+        except RuntimeError as exc:
+            if _is_bin_tracking_unavailable_error(exc):
+                row["outcome"] = "bin_tracking_unavailable"
+            else:
+                row["outcome"] = "lookup_failed"
+            row["reason"] = str(exc)
+            results.append(row)
+            continue
+
+        pickable = [dict(_format_bin_row(b), bin_category="pickable") for b in (resp.get("PickableBins") or [])]
+        non_pickable = [dict(_format_bin_row(b), bin_category="non_pickable") for b in (resp.get("NonPickableBins") or [])]
+        alternate = [dict(_format_bin_row(b), bin_category="alternate_location") for b in (resp.get("AlternateLocations") or [])]
+        bins = pickable + non_pickable + alternate
+
+        row["bins"] = bins
+        row["outcome"] = "bins_found" if bins else "no_bins_configured"
+        results.append(row)
+
+    return {
+        "location_id": location_id,
+        "include_non_pick_locations": include_non_pick_locations,
+        "count": len(skus),
+        "results": results,
+        "complete": not any_rate_limited,
+    }
+
+
+@mcp.tool()
+def check_orders_pickable(order_ids: list[str]) -> dict:
+    """
+    Check whether orders are allocatable to a pickwave, without creating or
+    changing anything (Picking/CheckAllocatableToPickwave).
+
+    Read-only — proven side-effect free during this build (AC8): two
+    consecutive identical calls returned byte-identical results; the
+    tenant's Unallocated/Shipped wave counts (via get_pick_waves) were
+    identical before and after; the checked orders' Processed/Status/
+    IsParked fields were unchanged; and a stock level read
+    (Stock/GetStockLevel_Batch) for one of the checked orders' SKUs was
+    byte-identical before and after. See CLAUDE.md's confirmed-endpoints
+    table for the full transcript. This is a genuine check, not a hidden
+    write — no dry_run parameter is offered because there is nothing to
+    stage.
+
+    Accepts both GUID and numeric order ids (same convention as every other
+    order tool here — _resolve_order_guid). An id that cannot be resolved is
+    reported as its own row in `resolve_errors` rather than raising and
+    sinking the whole batch (AC9); the remaining, resolvable ids are still
+    checked together in one call.
+
+    Linnworks itself also reports a per-order "doesn't exist" error inside a
+    successful response for a numeric id it doesn't recognise (live-confirmed:
+    `HasErrors: true`, `Errors: [{"Error": "Order doesn't exist", ...}]`) —
+    that is surfaced too, on `has_errors`/`errors`, separately from this
+    tool's own `resolve_errors` bucket (which only covers ids this tool could
+    not resolve at all before ever calling Linnworks).
+
+    Args:
+        order_ids: GUIDs or numeric order numbers, in any mix.
+
+    Returns:
+        A dict with:
+          - count: number of order_ids requested
+          - results: per-order rows for every id that resolved, each with
+            order_id (as supplied), num_order_id, order_guid, pickable
+            (True when Linnworks reports no errors for this order),
+            has_errors, errors (Linnworks' own per-order error list, verbatim),
+            and items (the per-line SKU/binrack/quantity detail Linnworks
+            returns, passed through verbatim — no total is computed from it)
+          - resolve_errors: ids that could not be resolved to a real order at
+            all (bad GUID, unknown numeric id) — order_id and reason
+          - rate_limited: ids whose resolution or check was throttled after
+            Linnworks' full retry ladder — order_id and reason
+          - complete: False if resolve_errors or rate_limited is non-empty
+    """
+    resolved: list[tuple[str, int, str]] = []  # (input_order_id, num_order_id, order_guid)
+    resolve_errors: list[dict] = []
+    rate_limited: list[dict] = []
+
+    for order_id in order_ids:
+        try:
+            order_guid, raw = _resolve_order_guid(order_id)
+        except RateLimitError as exc:
+            rate_limited.append({"order_id": order_id, "reason": str(exc)})
+            continue
+        except RuntimeError as exc:
+            resolve_errors.append({"order_id": order_id, "reason": str(exc)})
+            continue
+
+        num_order_id = raw.get("NumOrderId")
+        if num_order_id is None:
+            resolve_errors.append({
+                "order_id": order_id,
+                "reason": f"Order '{order_id}' resolved but carries no NumOrderId.",
+            })
+            continue
+
+        resolved.append((order_id, num_order_id, order_guid))
+
+    results: list[dict] = []
+
+    if resolved:
+        num_ids = [r[1] for r in resolved]
+        try:
+            resp = call_linnworks(
+                "Picking/CheckAllocatableToPickwave", {"request": {"OrderIds": num_ids}}
+            )
+        except RateLimitError as exc:
+            for order_id, num_order_id, order_guid in resolved:
+                rate_limited.append({
+                    "order_id": order_id, "num_order_id": num_order_id, "reason": str(exc),
+                })
+            resp = {"Results": []}
+
+        by_num_id = {r.get("OrderId"): r for r in (resp.get("Results") or [])}
+        already_rate_limited_ids = {r["num_order_id"] for r in rate_limited if "num_order_id" in r}
+
+        for order_id, num_order_id, order_guid in resolved:
+            check = by_num_id.get(num_order_id)
+            if check is None:
+                if num_order_id in already_rate_limited_ids:
+                    # Already logged by the RateLimitError branch above.
+                    continue
+                # Requested but never came back — never silently dropped
+                # (the same principle as find_unlinked_order_lines'
+                # missing_orders bucket). Not observed live during this
+                # build; kept as a safety net rather than assumed away.
+                resolve_errors.append({
+                    "order_id": order_id,
+                    "reason": (
+                        f"Order {num_order_id} was requested from "
+                        "Picking/CheckAllocatableToPickwave but did not come "
+                        "back in its response."
+                    ),
+                })
+                continue
+            errors = check.get("Errors") or []
+            results.append({
+                "order_id": order_id,
+                "num_order_id": num_order_id,
+                "order_guid": order_guid,
+                "pickable": not check.get("HasErrors"),
+                "has_errors": bool(check.get("HasErrors")),
+                "errors": errors,
+                "items": check.get("OrderDetails") or [],
+            })
+
+    return {
+        "count": len(order_ids),
+        "results": results,
+        "resolve_errors": resolve_errors,
+        "rate_limited": rate_limited,
+        "complete": not resolve_errors and not rate_limited,
     }
 
 
