@@ -1,7 +1,7 @@
 # Linnworks MCP Server
 
-![Version](https://img.shields.io/badge/version-1.54.0-blue)
-![Tools](https://img.shields.io/badge/tools-93-blue)
+![Version](https://img.shields.io/badge/version-1.55.0-blue)
+![Tools](https://img.shields.io/badge/tools-94-blue)
 
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
 
@@ -38,6 +38,7 @@ Once installed, Claude gets access to these tools:
 | `cancel_order` | Cancel an open (unprocessed) order |
 | `remove_order_item` | Delete a single line from an open order (Orders/RemoveOrderItem). ⚠️ Unproven endpoint — see the tool's docstring and CLAUDE.md. Refuses processed orders and last-line removal by default; live runs re-read the order fresh and classify the outcome as removed/still_present/unconfirmed |
 | `relink_order_line` | Restore an orphaned line's channel identity (Orders/UpdateOrderItem) — the repair half of `find_unlinked_order_lines`. ⚠️ Unproven endpoint — see the tool's docstring and CLAUDE.md. `channel_line_id` is required and never guessed; refuses an already-linked line, a processed order, or an unknown row_id by default; the OrderItem payload is the raw line round-tripped verbatim except the two identity fields, checked for drift before every write; live runs re-read the order fresh and classify the outcome as relinked/not_persisted/unconfirmed/rate_limited |
+| `create_order` | Create a manual customer order (Orders/CreateOrders) — phone/trade entry and CS replacements/resends. ⚠️ Unproven endpoint, never fired on this tenant — see the tool's docstring and CLAUDE.md. `payment_status` paid/unpaid/resend, where unpaid is force-parked by Linnworks and resend is two writes; `source` defaults to DIRECT and warns if you pick a real channel; refuses unknown SKUs, unknown postal/payment methods and duplicate references before writing; live runs report `unconfirmed`, never success |
 | `set_order_status` | Lock/unlock an order (hold it from dispatch) or mark it paid/unpaid — bulk. Note: locking releases the order's allocated stock, and park/unpark has no public API |
 | `refund_order` | Full refund on a processed order |
 | `refund_order_lines` | Partial refund of specific line items |
@@ -309,6 +310,7 @@ All write tools default to `dry_run=True` — they will describe what they would
 | `add_inventory_item_images` | 100 items |
 | `set_inventory_item_image_order` | 25 items |
 | `set_order_status` | 25 orders |
+| `create_order` | 10 lines |
 | `archive_inventory_items` | 25 items |
 | `unarchive_inventory_items` | 25 items |
 | `list_to_shopify` | 25 listings |
