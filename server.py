@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.55.2"
+__version__ = "1.55.3"
 
 import json
 import os
@@ -2904,8 +2904,14 @@ def find_orders_by_reference(
           - match_count:  number of orders found
           - orders:       list of matching order dicts, each with:
               order_id, num_order_id, reference_num, external_reference,
-              source, sub_source, status, processed, received_date,
-              customer_name, customer_email
+              source, sub_source, status, processed, is_parked,
+              received_date, customer_name, customer_email
+
+    Note on is_parked vs processed: a CANCELLED order keeps its parked flag
+    and its payment status (live-confirmed 18 Sep 2026 — a cancelled parked
+    order reads processed=True alongside is_parked=True, status=0). So
+    `processed` is the only reliable "is this order finished" signal; treat
+    is_parked as "is it held out of the dispatch queue", nothing more.
     """
     # Strip leading # so users can paste "#11177274" directly
     reference = reference.strip().lstrip("#").strip()
@@ -2975,6 +2981,12 @@ def find_orders_by_reference(
                 "sub_source":         fmt["sub_source"],
                 "status":             fmt["status"],
                 "processed":          fmt["processed"],
+                # is_parked was missing from this projection until v1.55.3 even
+                # though _format_order_detail has always produced it — so a
+                # parked order read back as parked: None here while get_order
+                # correctly said True (found during the #68 proof, v1.55.2).
+                # Free: the detail call above already fetched it.
+                "is_parked":          fmt["is_parked"],
                 "received_date":      fmt["received_date"],
                 "customer_name":      fmt["customer_name"],
                 "customer_email":     fmt["customer_email"],

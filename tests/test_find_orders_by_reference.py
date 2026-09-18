@@ -54,18 +54,18 @@ SEARCH_RESPONSE_DUPLICATE_GUIDS = {
 # Minimal order detail returned by GetOrdersById
 def _make_order_detail(guid, num_id=596475, ref="11177274", ext_ref="11177274",
                        source="Shopify", processed=False, customer="Jane Smith",
-                       email="jane@example.com"):
+                       email="jane@example.com", is_parked=False, status=1):
     return {
         "OrderId": guid,
         "NumOrderId": num_id,
         "Processed": processed,
         "GeneralInfo": {
-            "Status": 1,
+            "Status": status,
             "ReferenceNum": ref,
             "ExternalReference": ext_ref,
             "Source": source,
             "SubSource": source,
-            "IsParked": False,
+            "IsParked": is_parked,
             "Marker": 0,
             "ReceivedDate": "2026-05-01T09:00:00",
         },
@@ -345,3 +345,89 @@ def test_version_is_at_least_1_8_0():
     import server
     major, minor, patch = (int(x) for x in server.__version__.split("."))
     assert (major, minor, patch) >= (1, 8, 0), f"Expected >= 1.8.0, got {server.__version__}"
+
+
+# ── is_parked in the projection (v1.55.3) ────────────────────────────────────
+
+class TestParkedStateIsReturned:
+    """is_parked was missing from find_orders_by_reference's projection even
+    though _format_order_detail always produced it — so a genuinely parked
+    order read back as parked: None while get_order said True. Found during
+    the issue #68 proof run (v1.55.2)."""
+
+    def test_parked_order_reports_is_parked_true(self):
+        import server
+        guid = "aaaaaaaa-0000-0000-0000-000000000001"
+
+        def side_effect(path, payload, **kwargs):
+            if "SearchOrders" in path:
+                return {"OpenOrders": [{"ViewId": 1, "OrderIds": [guid]}], "ProcessedOrders": []}
+            if "GetOrdersById" in path:
+                return [_make_order_detail(guid, is_parked=True, status=0)]
+            raise AssertionError(path)
+
+        with patch("server.call_linnworks", side_effect=side_effect):
+            r = server.find_orders_by_reference("11177274")
+
+        assert r["orders"][0]["is_parked"] is True
+
+    def test_unparked_order_reports_is_parked_false_not_none(self):
+        """False and None mean different things: False is "confirmed not
+        parked", None would be "the field never came back"."""
+        import server
+        guid = "aaaaaaaa-0000-0000-0000-000000000002"
+
+        def side_effect(path, payload, **kwargs):
+            if "SearchOrders" in path:
+                return {"OpenOrders": [{"ViewId": 1, "OrderIds": [guid]}], "ProcessedOrders": []}
+            if "GetOrdersById" in path:
+                return [_make_order_detail(guid, is_parked=False)]
+            raise AssertionError(path)
+
+        with patch("server.call_linnworks", side_effect=side_effect):
+            r = server.find_orders_by_reference("11177274")
+
+        assert r["orders"][0]["is_parked"] is False
+        assert r["orders"][0]["is_parked"] is not None
+
+    def test_parked_state_costs_no_extra_api_call(self):
+        """The detail call already fetched it — adding it to the projection
+        must not introduce a second read."""
+        import server
+        guid = "aaaaaaaa-0000-0000-0000-000000000003"
+        calls = []
+
+        def side_effect(path, payload, **kwargs):
+            calls.append(path)
+            if "SearchOrders" in path:
+                return {"OpenOrders": [{"ViewId": 1, "OrderIds": [guid]}], "ProcessedOrders": []}
+            if "GetOrdersById" in path:
+                return [_make_order_detail(guid, is_parked=True)]
+            raise AssertionError(path)
+
+        with patch("server.call_linnworks", side_effect=side_effect):
+            server.find_orders_by_reference("11177274")
+
+        assert len(calls) == 2, f"expected exactly SearchOrders + GetOrdersById, got {calls}"
+
+    def test_cancelled_parked_order_reports_both_processed_and_parked(self):
+        """A cancelled order KEEPS its parked flag and payment status
+        (live-confirmed on order 611398). `processed` is the only reliable
+        "is it finished" signal — is_parked must not be read as "still live"."""
+        import server
+        guid = "aaaaaaaa-0000-0000-0000-000000000004"
+
+        def side_effect(path, payload, **kwargs):
+            if "SearchOrders" in path:
+                return {"OpenOrders": [], "ProcessedOrders": [guid]}
+            if "GetOrdersById" in path:
+                return [_make_order_detail(guid, processed=True, is_parked=True, status=0)]
+            raise AssertionError(path)
+
+        with patch("server.call_linnworks", side_effect=side_effect):
+            r = server.find_orders_by_reference("11177274", include_processed=True)
+
+        row = r["orders"][0]
+        assert row["processed"] is True
+        assert row["is_parked"] is True
+        assert row["status"] == 0
