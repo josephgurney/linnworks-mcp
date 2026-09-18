@@ -10,13 +10,14 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.54.0"
+__version__ = "1.55.0"
 
 import json
 import os
 import sys
 import time
 import uuid
+import difflib
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
@@ -508,6 +509,7 @@ WRITE_THRESHOLDS: dict[str, int] = {
     "archive_inventory_items":        25,   # hides items from channels; reversible via unarchive
     "unarchive_inventory_items":      25,   # restores items to active; reversible via archive
     "set_order_status":               25,   # lock/unlock/paid/unpaid — reversible order-state changes
+    "create_order":                   10,   # CREATES a real, pickable, dispatchable customer order
     "default":                        25,   # fallback for any unlisted operation
 }
 
@@ -3773,6 +3775,720 @@ def relink_order_line(
             "identity fields did not take the intended values. Check the "
             "order in the Linnworks UI before trying again."
         )
+    return result
+
+
+# ── create_order — manual / CS-replacement orders (issue #68) ─────────────────
+#
+# ⚠️  Orders/CreateOrders has NEVER been fired on this tenant. Not a 400-probe,
+#     nothing. Schema-valid is not works-here (GetOpenOrders, GetOpenOrderIds).
+#     Every live result is reported "unconfirmed", never "success".
+#
+# Three payload questions the first live call must settle:
+#   1. Wrapper or not. The swagger body parameter is named
+#      Orders_CreateOrdersRequest, but that name is NOT the wire key —
+#      Listings/GeteBayTemplates taught us that (its real key was "parameters").
+#      We send UNWRAPPED {"orders": [...], "location": ...}, matching the rest
+#      of the Orders/ family.
+#   2. What "location" is. Typed `string` in the spec, not `uuid` — unlike
+#      CreateNewOrder's `fulfilmentCenter`, which IS a uuid. It may want a
+#      location NAME. We send the GUID and report what came back.
+#   3. Whether PricePerUnit is read as tax-inclusive. `TaxCostInclusive` exists
+#      on ChannelOrderItem but its effect is unverified here, and this codebase
+#      has already been burned once by a tax-inclusivity assumption
+#      (PO line Cost, issue #15). Exposed as prices_include_tax, defaulted to
+#      True for UK retail, and flagged in the manifest as UNVERIFIED.
+
+_CREATE_ORDER_UNPROVEN_WARNING = (
+    "Orders/CreateOrders has never been fired on this tenant. A 2xx means "
+    "Linnworks ACCEPTED the payload — it is not proof the order was created "
+    "as intended. Read the order back and check it in the Linnworks UI before "
+    "letting it pick."
+)
+
+# ChannelAddress ← the snake_case keys this tool accepts.
+_ADDRESS_FIELD_MAP: dict[str, str] = {
+    "full_name": "FullName",
+    "company": "Company",
+    "address1": "Address1",
+    "address2": "Address2",
+    "address3": "Address3",
+    "town": "Town",
+    "region": "Region",
+    "postcode": "PostCode",
+    "country": "Country",
+    "phone": "PhoneNumber",
+    "email": "EmailAddress",
+}
+
+_ADDRESS_REQUIRED: tuple[str, ...] = ("full_name", "address1", "town", "postcode", "country")
+
+# ChannelOrder.PaymentStatus accepts ONLY these three. RESEND is NOT here —
+# it belongs to the Orders/ChangeStatus enum (_PAYMENT_STATUS_LABELS) and can
+# only be applied by a second call after the order exists.
+_CREATE_ORDER_PAYMENT_STATUSES: dict[str, str] = {
+    "paid": "Paid",
+    "unpaid": "Unpaid",
+    "resend": "Paid",  # created Paid, then flipped via ChangeStatus(4)
+}
+
+_RESEND_STATUS_CODE = 4
+
+
+def _parse_json_arg(raw: str, field: str, expect: type) -> tuple[object | None, str | None]:
+    """Parse a JSON string argument. Returns (value, error_message)."""
+    import json as _json
+
+    if not isinstance(raw, str) or not raw.strip():
+        return None, f"{field} is required and must be a non-empty JSON {expect.__name__}."
+    try:
+        parsed = _json.loads(raw)
+    except Exception as exc:
+        return None, f"Could not parse {field} JSON: {exc}"
+    if not isinstance(parsed, expect):
+        return None, f"{field} must be a JSON {expect.__name__}, got {type(parsed).__name__}."
+    if expect is list and not parsed:
+        return None, f"{field} must not be empty."
+    return parsed, None
+
+
+def _build_channel_address(addr: dict, label: str) -> tuple[dict | None, list[str]]:
+    """
+    Map a snake_case address dict onto a Linnworks ChannelAddress.
+
+    Returns (channel_address, errors). Every free-text value is injection-checked
+    here rather than at the call site, so no address field can reach Linnworks
+    unchecked.
+    """
+    errors: list[str] = []
+    missing = [f for f in _ADDRESS_REQUIRED if not str(addr.get(f, "") or "").strip()]
+    if missing:
+        errors.append(f"{label} is missing required field(s): {', '.join(missing)}.")
+
+    unknown = sorted(set(addr) - set(_ADDRESS_FIELD_MAP))
+    if unknown:
+        errors.append(
+            f"{label} has unrecognised field(s): {', '.join(unknown)}. "
+            f"Valid fields: {', '.join(sorted(_ADDRESS_FIELD_MAP))}."
+        )
+    if errors:
+        return None, errors
+
+    out: dict = {}
+    for snake, linn in _ADDRESS_FIELD_MAP.items():
+        value = str(addr.get(snake, "") or "").strip()
+        _check_injection(f"{label}.{snake}", value)
+        out[linn] = value
+    return out, []
+
+
+def _lookup_postal_services() -> list[str]:
+    """Every postal service name on the tenant, flattened across vendors.
+
+    Orders/GetShippingMethods nests them: [{Vendor, PostalServices:[{...}]}].
+    Live-confirmed 18 Sep 2026 — 99 services across 11 vendors.
+    """
+    rows = call_linnworks_get("Orders/GetShippingMethods")
+    names: list[str] = []
+    for vendor in rows if isinstance(rows, list) else []:
+        for svc in (vendor.get("PostalServices") or []):
+            name = svc.get("PostalServiceName")
+            if name:
+                names.append(name)
+    return names
+
+
+def _lookup_payment_methods() -> list[str]:
+    """Every payment method name on the tenant. Flat list, unlike shipping."""
+    rows = call_linnworks_get("Orders/GetPaymentMethods")
+    return [r.get("Name") for r in (rows if isinstance(rows, list) else []) if r.get("Name")]
+
+
+@mcp.tool()
+def create_order(
+    items: str,
+    delivery_address: str,
+    billing_address: str = "",
+    payment_status: str = "paid",
+    source: str = "DIRECT",
+    sub_source: str = "Phone",
+    reference_number: str = "",
+    external_reference: str = "",
+    postal_service: str = "",
+    payment_method: str = "",
+    postage_cost: float = 0.0,
+    prices_include_tax: bool = True,
+    currency: str = "GBP",
+    note: str = "",
+    location_id: str = DEFAULT_LOCATION_ID,
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Create a manual customer order in Linnworks (Orders/CreateOrders).
+
+    For phone / trade orders keyed in by hand, and for CS replacements and
+    resends (lost parcel, damaged goods — qty 1 at £0.00 to a replacement
+    address). This is the one step of that workflow that otherwise has to be
+    done in the Linnworks UI.
+
+    ⚠️  CREATES A REAL, PICKABLE, DISPATCHABLE ORDER. dry_run defaults to True:
+        it resolves every SKU, validates the postal service and payment method,
+        checks for a duplicate reference and shows the exact order that would be
+        created, writing nothing. Set dry_run=False only after reading that.
+
+    ⚠️  NOT LIVE-PROVEN. Orders/CreateOrders has never been fired on this tenant.
+        A 2xx means Linnworks accepted the payload, not that the order is right —
+        so every live result is reported as "unconfirmed", never "success", and
+        the order is read back and reported verbatim. Check it in the UI before
+        letting it pick.
+
+    Args:
+        items: JSON array of lines. Each needs "sku", "quantity", "price"
+            (price per unit — £0.00 is valid, which is what a CS replacement
+            uses). Optional per line: "tax_rate" (default 20.0), "title"
+            (defaults to the item's own title), "line_id" (the channel line
+            number; defaults to the SKU — supply it when two lines share a SKU).
+            Example: '[{"sku":"ABC-123","quantity":1,"price":0.00}]'
+        delivery_address: JSON object. Required: full_name, address1, town,
+            postcode, country. Optional: company, address2, address3, region,
+            phone, email.
+        billing_address: JSON object, same shape. Defaults to delivery_address.
+        payment_status: "paid" (default) | "unpaid" | "resend".
+            • "paid"   → order lands in the dispatch queue.
+            • "unpaid" → ⚠️ Linnworks FORCE-PARKS it. Per the ChannelOrder spec:
+              "If Unpaid ChannelOrderAdapter.Save() will ensure order is PARKED".
+              The order will NOT be in the queue whatever we send. This tool
+              predicts that in the manifest rather than promising otherwise.
+            • "resend" → ⚠️ TWO WRITES. RESEND is not on ChannelOrder's
+              PaymentStatus enum (Unpaid/Paid/Cancelled only) — it belongs to
+              Orders/ChangeStatus. The order is created Paid, then flipped with
+              ChangeStatus(4). If that second call fails the order ALREADY
+              EXISTS and is live as Paid; the result says so explicitly with
+              outcome "created_but_status_not_set".
+        source: Order source. Defaults to "DIRECT" — the value this codebase
+            already treats as a manual order (_NON_CHANNEL_ORDER_SOURCES).
+            ⚠️ Setting a real channel ("AMAZON", "SHOPIFY") puts a replacement's
+            cost against that channel in reporting, but its blank ItemSource
+            will then read as an ORPHANED LINE to find_unlinked_order_lines.
+            The tool warns when you do this.
+        sub_source: Sub-source label, e.g. "Phone", "Trade", "CS Replacement".
+        reference_number: Your reference. Used to block duplicates — a matching
+            open order aborts the write (Orders/CreateOrders silently skips
+            already-paid orders on save, so a re-run would look successful and
+            do nothing).
+        external_reference: Link back to an original order, e.g. the order being
+            replaced.
+        postal_service: Postal service NAME, validated against the tenant's own
+            list. A name that doesn't exist is refused rather than created
+            (SavePostalServiceIfNotExist=false), so a typo can't leave junk
+            behind. Blank lets Linnworks' own rules assign one.
+        payment_method: Payment method NAME, validated the same way.
+        postage_cost: Postage charged, inclusive of tax.
+        prices_include_tax: Whether "price" on each line is tax-INCLUSIVE.
+            Defaults True (UK retail). ⚠️ UNVERIFIED — maps to ChannelOrderItem
+            .TaxCostInclusive, whose effect has not been confirmed on this
+            tenant, and this codebase has already been burned by a tax
+            inclusivity assumption once (PO line Cost, issue #15). Check the
+            totals on the first order you create.
+        note: Internal note added to the order, saving a second call.
+        location_id: Fulfilment location. Defaults to Default.
+        confirmed_count: Echo back the number of LINES when staging triggers
+            (orders over 10 lines).
+        dry_run: True (default) shows the order without creating it.
+
+    Returns:
+        dry run  — status "dry_run" with the full manifest.
+        live run — status "unconfirmed" (never "success") plus order_id,
+        num_order_id, the read-back, and any warnings.
+        blocked  — status "error"/"blocked" with the reason and NO write made.
+    """
+    cache: dict = {}
+    warnings: list[str] = []
+
+    # ── 1. Validate arguments before anything is resolved or written ──────────
+    status_key = (payment_status or "").strip().lower()
+    if status_key not in _CREATE_ORDER_PAYMENT_STATUSES:
+        return {
+            "status": "error",
+            "error": (
+                f"payment_status must be one of "
+                f"{', '.join(sorted(_CREATE_ORDER_PAYMENT_STATUSES))} — got '{payment_status}'."
+            ),
+        }
+
+    for field, value in (
+        ("source", source),
+        ("sub_source", sub_source),
+        ("reference_number", reference_number),
+        ("external_reference", external_reference),
+        ("postal_service", postal_service),
+        ("payment_method", payment_method),
+        ("note", note),
+        ("currency", currency),
+    ):
+        _check_injection(field, value or "")
+
+    item_list, err = _parse_json_arg(items, "items", list)
+    if err:
+        return {"status": "error", "error": err}
+    delivery_raw, err = _parse_json_arg(delivery_address, "delivery_address", dict)
+    if err:
+        return {"status": "error", "error": err}
+    if billing_address and billing_address.strip():
+        billing_raw, err = _parse_json_arg(billing_address, "billing_address", dict)
+        if err:
+            return {"status": "error", "error": err}
+    else:
+        billing_raw = delivery_raw
+
+    delivery, addr_errors = _build_channel_address(delivery_raw, "delivery_address")
+    billing, billing_errors = _build_channel_address(billing_raw, "billing_address")
+    if addr_errors or billing_errors:
+        return {"status": "error", "error": "; ".join(addr_errors + billing_errors)}
+
+    # ── 2. Resolve every SKU. One bad SKU aborts the whole order. ─────────────
+    resolved: list[dict] = []
+    item_errors: list[dict] = []
+    rate_limited = False
+    seen_line_ids: set[str] = set()
+
+    for idx, raw_item in enumerate(item_list):
+        if not isinstance(raw_item, dict):
+            item_errors.append({"index": idx, "error": "each item must be a JSON object."})
+            continue
+        sku = str(raw_item.get("sku", "") or "").strip()
+        if not sku:
+            item_errors.append({"index": idx, "error": "missing 'sku'."})
+            continue
+        try:
+            quantity = int(raw_item.get("quantity", 0))
+            price = float(raw_item.get("price"))
+            tax_rate = float(raw_item.get("tax_rate", 20.0))
+        except (TypeError, ValueError) as exc:
+            item_errors.append({"index": idx, "sku": sku, "error": f"bad number: {exc}"})
+            continue
+        if quantity <= 0:
+            item_errors.append({"index": idx, "sku": sku, "error": "quantity must be > 0."})
+            continue
+        if price < 0:
+            item_errors.append({"index": idx, "sku": sku, "error": "price must be >= 0."})
+            continue
+
+        line_id = str(raw_item.get("line_id", "") or sku).strip()
+        if line_id in seen_line_ids:
+            item_errors.append({
+                "index": idx,
+                "sku": sku,
+                "error": (
+                    f"duplicate line id '{line_id}' — ChannelOrderItem.ItemNumber must be "
+                    "unique within an order. Merge the quantities, or give each line its "
+                    "own \"line_id\"."
+                ),
+            })
+            continue
+        seen_line_ids.add(line_id)
+
+        title = str(raw_item.get("title", "") or "").strip()
+        _check_injection(f"items[{idx}].title", title)
+        _check_injection(f"items[{idx}].line_id", line_id)
+
+        # A rate-limited resolve is NOT a missing SKU (issue #34/#37).
+        try:
+            stock_item_id = _resolve_sku_to_id(sku, cache)
+        except RateLimitError as exc:
+            rate_limited = True
+            item_errors.append({"index": idx, "sku": sku, "error": f"rate limited: {exc}"})
+            continue
+        except ValueError as exc:
+            item_errors.append({"index": idx, "sku": sku, "error": str(exc)})
+            continue
+
+        if not title:
+            try:
+                title = (call_linnworks("Inventory/GetInventoryItem", {"sku": sku}) or {}).get(
+                    "ItemTitle", ""
+                ) or sku
+            except RateLimitError:
+                title = sku
+                warnings.append(f"Rate limited reading the title for '{sku}' — used the SKU.")
+            except RuntimeError:
+                title = sku
+
+        if prices_include_tax:
+            line_total = round(quantity * price, 2)
+            line_tax = round(line_total - (line_total / (1 + tax_rate / 100)), 2) if tax_rate else 0.0
+        else:
+            net = round(quantity * price, 2)
+            line_tax = round(net * tax_rate / 100, 2)
+            line_total = round(net + line_tax, 2)
+
+        resolved.append({
+            "sku": sku,
+            "stock_item_id": stock_item_id,
+            "title": title,
+            "line_id": line_id,
+            "quantity": quantity,
+            "price_per_unit": price,
+            "tax_rate": tax_rate,
+            "line_tax": line_tax,
+            "line_total_inc_tax": line_total,
+        })
+
+    if item_errors:
+        out = {
+            "status": "error",
+            "error": (
+                f"{len(item_errors)} of {len(item_list)} line(s) could not be used — "
+                "no order was created. Fix them and retry."
+            ),
+            "item_errors": item_errors,
+            "resolved_items": resolved,
+        }
+        if rate_limited:
+            out["rate_limited"] = True
+            out["error"] += (
+                " NOTE: at least one failure was a rate limit (HTTP 429), NOT a missing "
+                "SKU — retry shortly."
+            )
+        return out
+
+    # ── 3. Validate postal service / payment method against the tenant ────────
+    # Refuse an unknown name rather than letting Linnworks create it
+    # (SavePostalServiceIfNotExist=false below) — a typo must not leave a junk
+    # postal service behind on the account.
+    for label, value, lookup in (
+        ("postal_service", postal_service, _lookup_postal_services),
+        ("payment_method", payment_method, _lookup_payment_methods),
+    ):
+        if not (value or "").strip():
+            continue
+        try:
+            known = lookup()
+        except RateLimitError as exc:
+            return {
+                "status": "error",
+                "rate_limited": True,
+                "error": (
+                    f"Rate limited (HTTP 429) while validating {label} — no order was "
+                    f"created. This is a quota failure, not a bad {label}. Retry shortly. ({exc})"
+                ),
+            }
+        except RuntimeError as exc:
+            return {
+                "status": "error",
+                "error": f"Could not read the {label} list to validate '{value}': {exc}",
+            }
+        if value not in known:
+            # Fuzzy first, then substring. A pure substring match returns nothing
+            # when the typo is LONGER than the real name ("...Parcell" vs
+            # "...Parcel"), i.e. exactly when a suggestion is most useful.
+            close = difflib.get_close_matches(value, known, n=5, cutoff=0.6)
+            close += [k for k in known if value.lower() in k.lower() and k not in close]
+            close = close[:8]
+            return {
+                "status": "error",
+                "error": (
+                    f"{label} '{value}' does not exist on this account, so the order was "
+                    f"NOT created. Names are matched exactly."
+                ),
+                "did_you_mean": close,
+                "available_count": len(known),
+            }
+
+    # ── 4. Duplicate-reference guard ─────────────────────────────────────────
+    # Orders/CreateOrders: "once an order is paid it will be skipped on save",
+    # so re-running with the same reference returns cleanly having done nothing
+    # — it would read as success. Same shape as the issue #38 duplicate-listing
+    # defect, caught before the write rather than after.
+    duplicate_of: list[dict] = []
+    if reference_number.strip():
+        try:
+            found = find_orders_by_reference(reference_number.strip(), include_processed=False)
+            for row in (found.get("orders") or []):
+                duplicate_of.append({
+                    "order_id": row.get("order_id"),
+                    "num_order_id": row.get("num_order_id"),
+                    "reference_num": row.get("reference_num"),
+                })
+        except RateLimitError:
+            warnings.append(
+                "Rate limited while checking for a duplicate reference — the duplicate "
+                "check was SKIPPED, not passed. An order with this reference may already exist."
+            )
+        except Exception as exc:  # noqa: BLE001 — degrade to a warning, never a false pass
+            warnings.append(f"Duplicate-reference check could not run ({exc}); it was SKIPPED, not passed.")
+
+    if duplicate_of:
+        return {
+            "status": "blocked",
+            "error": (
+                f"An open order with reference '{reference_number}' already exists — no order "
+                "was created. Orders/CreateOrders silently skips an already-paid order on save, "
+                "so creating another would look successful and do nothing. Use a different "
+                "reference_number, or amend the existing order."
+            ),
+            "duplicate_of": duplicate_of,
+        }
+
+    # ── 5. Manifest ──────────────────────────────────────────────────────────
+    linn_payment_status = _CREATE_ORDER_PAYMENT_STATUSES[status_key]
+    items_total = round(sum(r["line_total_inc_tax"] for r in resolved), 2)
+    order_total = round(items_total + float(postage_cost or 0.0), 2)
+
+    # Predict, never promise. Linnworks force-parks an unpaid order server-side
+    # whatever OrderState we send (assumption #9 — the server overriding a
+    # value you wrote, the UpdateImages precedent).
+    if status_key == "unpaid":
+        predicted_state = "PARKED"
+        predicted_state_reason = (
+            "Linnworks force-parks an unpaid order on save ('If Unpaid "
+            "ChannelOrderAdapter.Save() will ensure order is PARKED'), whatever OrderState "
+            "we send. It will NOT be in the dispatch queue."
+        )
+    else:
+        predicted_state = "IN DISPATCH QUEUE"
+        predicted_state_reason = "Paid orders are created live and pickable (OrderState 'None')."
+
+    if _is_channel_order_source(source):
+        warnings.append(
+            f"source='{source}' is a real channel, not DIRECT. The order's cost will sit "
+            f"against {source} in reporting — but its lines carry no channel line id, so "
+            "find_unlinked_order_lines will report them as ORPHANED. Use source='DIRECT' "
+            "unless you specifically want the channel attribution."
+        )
+    if status_key == "resend":
+        warnings.append(
+            "payment_status='resend' is TWO writes: create as Paid, then Orders/ChangeStatus(4). "
+            "If the second fails, the order still exists and is live as Paid."
+        )
+
+    manifest = {
+        "source": source,
+        "sub_source": sub_source,
+        "reference_number": reference_number,
+        "external_reference": external_reference,
+        "payment_status_requested": status_key,
+        "payment_status_sent_to_linnworks": linn_payment_status,
+        "predicted_state": predicted_state,
+        "predicted_state_reason": predicted_state_reason,
+        "postal_service": postal_service or "(Linnworks rules decide)",
+        "payment_method": payment_method or "(Linnworks default)",
+        "currency": currency,
+        "location_id": location_id,
+        "prices_include_tax": prices_include_tax,
+        "tax_note": (
+            "prices_include_tax maps to ChannelOrderItem.TaxCostInclusive, whose effect is "
+            "UNVERIFIED on this tenant. Check the tax and totals on the created order."
+        ),
+        "delivery_address": delivery,
+        "billing_address": billing,
+        "lines": resolved,
+        "line_count": len(resolved),
+        "items_total_inc_tax": items_total,
+        "postage_cost": round(float(postage_cost or 0.0), 2),
+        "order_total_inc_tax": order_total,
+        "note": note,
+    }
+
+    # ── 6. Staging gate — on the number of LINES ─────────────────────────────
+    guard = _write_guard("create_order", resolved, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, "manifest": manifest, "warnings": warnings}
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "status": "dry_run",
+            "manifest": manifest,
+            "warnings": warnings,
+            "unproven_endpoint_warning": _CREATE_ORDER_UNPROVEN_WARNING,
+            "next_step": "Re-run with dry_run=False to create this order.",
+        }
+
+    # ── 7. Live write ────────────────────────────────────────────────────────
+    channel_order: dict = {
+        "Source": source,
+        "SubSource": sub_source,
+        "ReferenceNumber": reference_number,
+        "ExternalReference": external_reference,
+        "SecondaryReferenceNumber": "",
+        "ChannelBuyerName": delivery.get("FullName", ""),
+        "Currency": currency,
+        "ReceivedDate": datetime.now(timezone.utc).isoformat(),
+        "PaymentStatus": linn_payment_status,
+        "OrderState": "None",
+        "PostalServiceCost": round(float(postage_cost or 0.0), 2),
+        "DeliveryAddress": delivery,
+        "BillingAddress": billing,
+        # Link lines to stock by SKU so they don't land unlinked (issue #52).
+        "AutomaticallyLinkBySKU": True,
+        # We are acting as the channel and supplying explicit tax rates, so use
+        # them rather than letting Linnworks silently recompute. UNVERIFIED.
+        "UseChannelTax": True,
+        "OrderItems": [
+            {
+                "ChannelSKU": r["sku"],
+                "ItemNumber": r["line_id"],
+                "ItemTitle": r["title"],
+                "Qty": r["quantity"],
+                "PricePerUnit": r["price_per_unit"],
+                "TaxRate": r["tax_rate"],
+                "TaxCostInclusive": prices_include_tax,
+                "UseChannelTax": True,
+                "IsService": False,
+            }
+            for r in resolved
+        ],
+    }
+    if postal_service.strip():
+        channel_order["MatchPostalServiceTag"] = postal_service
+        channel_order["PostalServiceName"] = postal_service
+        channel_order["SavePostalServiceIfNotExist"] = False
+    if payment_method.strip():
+        channel_order["MatchPaymentMethodTag"] = payment_method
+        channel_order["PaymentMethodName"] = payment_method
+        channel_order["SavePaymentMethodIfNotExist"] = False
+    if note.strip():
+        channel_order["Notes"] = [{
+            "Note": note,
+            "NoteEntryDate": datetime.now(timezone.utc).isoformat(),
+            "Internal": True,
+        }]
+
+    # Sent UNWRAPPED. The swagger body parameter is named
+    # Orders_CreateOrdersRequest, but that name is not the wire key — see the
+    # module note above. `location` is typed string, not uuid: unverified.
+    payload = {"orders": [channel_order], "location": location_id}
+
+    try:
+        created = call_linnworks("Orders/CreateOrders", payload)
+    except RateLimitError as exc:
+        return {
+            "dry_run": False,
+            "status": "error",
+            "rate_limited": True,
+            "error": (
+                f"Rate limited (HTTP 429) — the order was almost certainly NOT created, but "
+                f"verify before retrying so you don't create it twice. ({exc})"
+            ),
+            "manifest": manifest,
+        }
+    except RuntimeError as exc:
+        return {
+            "dry_run": False,
+            "status": "error",
+            "error": f"Orders/CreateOrders failed: {exc}",
+            "payload_sent": payload,
+            "hint": (
+                "This endpoint has never been fired on this tenant. If the error mentions a "
+                "missing parameter, the body may need the {'request': {...}} wrapper; if it "
+                "mentions the location, `location` may want a location NAME rather than a GUID."
+            ),
+            "manifest": manifest,
+        }
+
+    order_ids = created if isinstance(created, list) else (created.get("OrderIds") or [])
+    if not order_ids:
+        return {
+            "dry_run": False,
+            "status": "unconfirmed",
+            "error": (
+                "Orders/CreateOrders returned no order id. The call was accepted but nothing "
+                "confirms an order exists — CHECK THE LINNWORKS UI before retrying, so you "
+                "don't create a duplicate."
+            ),
+            "raw_response": created,
+            "manifest": manifest,
+        }
+
+    order_guid = order_ids[0]
+    result: dict = {
+        "dry_run": False,
+        "status": "unconfirmed",
+        "order_id": order_guid,
+        "manifest": manifest,
+        "warnings": warnings,
+        "unproven_endpoint_warning": _CREATE_ORDER_UNPROVEN_WARNING,
+    }
+
+    # ── 8. Resend: the second write ──────────────────────────────────────────
+    # RESEND is not on ChannelOrder's PaymentStatus enum, so it can only be
+    # applied after the order exists. A failure here leaves a LIVE PAID ORDER.
+    if status_key == "resend":
+        try:
+            call_linnworks(
+                "Orders/ChangeStatus",
+                {"orderIds": [order_guid], "status": _RESEND_STATUS_CODE},
+            )
+            result["resend_status_set"] = True
+        except (RateLimitError, RuntimeError) as exc:
+            result["resend_status_set"] = False
+            result["outcome"] = "created_but_status_not_set"
+            result["error"] = (
+                f"⚠️ THE ORDER WAS CREATED AND IS LIVE, but the follow-up "
+                f"Orders/ChangeStatus(4) failed, so it is still marked PAID rather than "
+                f"RESEND. Order {order_guid} exists in the dispatch queue right now. "
+                f"Fix the status in the Linnworks UI — do NOT re-run this tool, that would "
+                f"create a second order. ({exc})"
+            )
+
+    # ── 9. Read back — the write's own 2xx is not evidence ───────────────────
+    try:
+        _, raw = _resolve_order_guid(order_guid)
+        detail = _format_order_detail(raw)
+        result["read_back"] = {
+            "num_order_id": detail.get("num_order_id"),
+            "status": detail.get("status"),
+            "status_label": _PAYMENT_STATUS_LABELS.get(detail.get("status"), "UNKNOWN"),
+            "is_parked": detail.get("is_parked"),
+            "processed": detail.get("processed"),
+            "source": detail.get("source"),
+            "sub_source": detail.get("sub_source"),
+            "reference_num": detail.get("reference_num"),
+            "postal_service_name": detail.get("postal_service_name"),
+            "totals": detail.get("totals"),
+            "line_count": len(detail.get("items") or []),
+            "lines_linked": [
+                {
+                    "sku": i.get("sku"),
+                    "channel_line_id": i.get("channel_line_id"),
+                    "channel_line_source": i.get("channel_line_source"),
+                }
+                for i in (detail.get("items") or [])
+            ],
+        }
+        result["num_order_id"] = detail.get("num_order_id")
+
+        actual_parked = detail.get("is_parked")
+        if actual_parked is True and predicted_state != "PARKED":
+            result.setdefault("warnings", []).append(
+                "The order was PARKED, which is not what the manifest predicted. It is NOT in "
+                "the dispatch queue."
+            )
+        elif actual_parked is False and predicted_state == "PARKED":
+            result.setdefault("warnings", []).append(
+                "The order was NOT parked, though an unpaid order was expected to be. It may "
+                "be live in the dispatch queue — check it."
+            )
+    except RateLimitError as exc:
+        result["read_back"] = None
+        result.setdefault("warnings", []).append(
+            f"Rate limited reading the order back — it WAS created ({order_guid}), but nothing "
+            f"here confirms its state. Check the Linnworks UI. ({exc})"
+        )
+    except RuntimeError as exc:
+        result["read_back"] = None
+        result.setdefault("warnings", []).append(
+            f"The order was created ({order_guid}) but could not be read back: {exc}. "
+            "Check the Linnworks UI."
+        )
+
+    result.setdefault("outcome", "created")
+    result["next_step"] = (
+        "Verify the order in the Linnworks UI before it picks. If this was a test, cancel it "
+        "with cancel_order()."
+    )
     return result
 
 
