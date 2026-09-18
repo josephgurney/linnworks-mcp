@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.55.3"
+__version__ = "1.55.4"
 
 import json
 import os
@@ -3001,6 +3001,56 @@ def find_orders_by_reference(
 
 # ---------- Order cancellation and refunds ----------
 
+def _check_refund_eligibility(options: dict, push_to_channel: bool) -> str | None:
+    """
+    Decide whether Linnworks will accept a refund on this order.
+
+    Returns an error string when the refund must be refused, else None.
+
+    ⚠️  The gate used to check ONLY `CannotRefundReason`, which cannot tell the
+    two real cases apart. Live-probed 18 Sep 2026:
+
+        DIRECT order   CanRefund=False  CanRefundInternally=True   reason="None"
+        SHOPIFY order  CanRefund=True   CanRefundInternally=True   reason="None"
+
+    Both carry reason "None", so the old gate passed both — including the one
+    Linnworks had explicitly said it could not refund through the channel.
+
+    The two flags mean different things, established by proving a refund on a
+    DIRECT order: `CanRefund` is "can this be refunded VIA THE CHANNEL" (false
+    on a DIRECT order, which has no channel), while `CanRefundInternally` is
+    "can a refund be booked in Linnworks at all". A refund with
+    push_to_channel=False succeeded on an order reading CanRefund=False, so
+    refusing purely on that flag would break the case that demonstrably works.
+    The gate therefore depends on which one is actually being attempted.
+    """
+    cannot_reason = options.get("CannotRefundReason") or "None"
+    if cannot_reason != "None":
+        return f"Linnworks cannot refund this order: {cannot_reason}"
+
+    if push_to_channel and options.get("CanRefund") is False:
+        internally = options.get("CanRefundInternally")
+        hint = (
+            " Linnworks reports it CAN be refunded internally, so retry with "
+            "push_to_channel=False to book the refund without pushing it to a "
+            "channel."
+            if internally else ""
+        )
+        return (
+            "Linnworks reports CanRefund=False for this order, so a refund cannot "
+            "be pushed to the channel. This is normal for a manually created "
+            "(DIRECT) order, which has no channel to push to." + hint
+        )
+
+    if not push_to_channel and options.get("CanRefundInternally") is False:
+        return (
+            "Linnworks reports CanRefundInternally=False for this order, so no "
+            "refund can be booked against it."
+        )
+
+    return None
+
+
 def _get_refund_options(order_guid: str) -> dict:
     """Call ReturnsRefunds/GetRefundOptions for the given order GUID."""
     return call_linnworks(
@@ -4912,12 +4962,14 @@ def refund_order(
     # Check refund eligibility
     options_resp = _get_refund_options(guid)
     options = options_resp.get("RefundOptions") or {}
-    cannot_reason = options.get("CannotRefundReason") or "None"
-    if cannot_reason != "None":
+    eligibility_error = _check_refund_eligibility(options, push_to_channel)
+    if eligibility_error:
         return {
-            "error": f"Linnworks cannot refund this order: {cannot_reason}",
+            "error": eligibility_error,
             "order_id": guid,
             "num_order_id": fmt.get("num_order_id"),
+            "can_refund": options.get("CanRefund"),
+            "can_refund_internally": options.get("CanRefundInternally"),
         }
 
     # Create refund
@@ -5114,12 +5166,14 @@ def refund_order_lines(
     # Check refund eligibility
     options_resp = _get_refund_options(guid)
     options = options_resp.get("RefundOptions") or {}
-    cannot_reason = options.get("CannotRefundReason") or "None"
-    if cannot_reason != "None":
+    eligibility_error = _check_refund_eligibility(options, push_to_channel)
+    if eligibility_error:
         return {
-            "error": f"Linnworks cannot refund this order: {cannot_reason}",
+            "error": eligibility_error,
             "order_id": guid,
             "num_order_id": fmt.get("num_order_id"),
+            "can_refund": options.get("CanRefund"),
+            "can_refund_internally": options.get("CanRefundInternally"),
         }
 
     # Create refund
