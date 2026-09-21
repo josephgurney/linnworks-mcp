@@ -234,3 +234,83 @@ def test_docstring_no_longer_claims_amazon_variation_shape_is_unobserved():
     doc = server.refresh_channel_listing.__doc__
     assert "unestablished — nothing in this repo has observed it either way" not in doc
     assert "one observation, not a rule" in doc
+
+
+# --- refund channel-push proof state (issue #79) -----------------------------
+# server.REFUND_CHANNEL_PUSH_PROVEN is the single source of truth for whether
+# ReturnsRefunds/ActionRefund (the push to a sales channel) has been shown to
+# actually reach one. README.md and CLAUDE.md's tools-table rows for
+# refund_order and refund_order_lines must state the same position -- this is
+# the same kind of drift #78 found had already happened once for GLT_CHANNELS.
+
+def _readme_row(tool_name: str) -> str:
+    match = re.search(rf"^\| `{tool_name}` \|.*\|$", README_MD, re.M)
+    assert match, f"README.md is missing the {tool_name} row"
+    return match.group(0)
+
+
+def _claude_md_tools_table_row(tool_name: str) -> str:
+    match = re.search(rf"^\| `{tool_name}\(.*$", CLAUDE_MD, re.M)
+    assert match, f"CLAUDE.md is missing the {tool_name} tools-table row"
+    return match.group(0)
+
+
+def test_refund_docstrings_no_longer_claim_never_live_tested():
+    for doc in (server.refund_order.__doc__, server.refund_order_lines.__doc__):
+        assert "have not been live-tested" not in doc
+        assert "implemented from the Linnworks OpenAPI spec but have not" not in doc
+
+
+def test_refund_rows_no_longer_claim_spec_based_not_live_tested():
+    for tool_name in ("refund_order", "refund_order_lines"):
+        for doc_name, row in (
+            ("README.md", _readme_row(tool_name)),
+            ("CLAUDE.md", _claude_md_tools_table_row(tool_name)),
+        ):
+            assert "spec-based, not yet live-tested" not in row, (
+                f"{doc_name}'s {tool_name} row still claims the refund "
+                "endpoints have never been live-tested"
+            )
+
+
+def test_refund_rows_agree_with_the_code_on_the_channel_push_proof_flag():
+    """Fails the moment REFUND_CHANNEL_PUSH_PROVEN is flipped without the
+    docs being updated to match, or vice versa -- the same guard this file
+    already applies to GLT_CHANNELS' Amazon/TikTok revise claims."""
+    proven = server.REFUND_CHANNEL_PUSH_PROVEN
+    for tool_name in ("refund_order", "refund_order_lines"):
+        for doc_name, row in (
+            ("README.md", _readme_row(tool_name)),
+            ("CLAUDE.md", _claude_md_tools_table_row(tool_name)),
+        ):
+            assert "ActionRefund" in row, (
+                f"{doc_name}'s {tool_name} row must name ActionRefund"
+            )
+            unproven_claim = (
+                "not proven" in row.lower() or "never been shown" in row.lower()
+            )
+            if proven:
+                assert not unproven_claim, (
+                    f"{doc_name}'s {tool_name} row still claims the channel "
+                    "push is unproven, but REFUND_CHANNEL_PUSH_PROVEN is now True"
+                )
+            else:
+                assert unproven_claim, (
+                    f"{doc_name}'s {tool_name} row does not state the channel "
+                    "push is unproven, but REFUND_CHANNEL_PUSH_PROVEN is False"
+                )
+
+
+def test_get_refund_headers_row_documents_the_readback_use():
+    match = re.search(
+        r"^\| `ReturnsRefunds/GetRefundHeadersByOrderId` \|.*$", CLAUDE_MD, re.M
+    )
+    assert match, "CLAUDE.md is missing the GetRefundHeadersByOrderId confirmed-endpoints row"
+    row = match.group(0)
+    assert "read-back" in row.lower()
+    assert "refund_order" in row
+
+
+def test_cancel_and_refund_test_header_no_longer_claims_never_live_tested():
+    header = (ROOT / "tests" / "test_cancel_and_refund.py").read_text()
+    assert "have not been live-tested" not in header.split('"""')[1]
