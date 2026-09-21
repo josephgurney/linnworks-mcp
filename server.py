@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.55.5"
+__version__ = "1.55.6"
 
 import json
 import os
@@ -3001,6 +3001,137 @@ def find_orders_by_reference(
 
 # ---------- Order cancellation and refunds ----------
 
+# Single source of truth for "has a refund push to the sales channel ever been
+# shown to actually reach that channel?" (issue #79). Both refund_order and
+# refund_order_lines read this pair rather than each carrying their own copy
+# of the flag or the warning text -- typing the warning into both tools is
+# exactly the drift #78 found had already happened once elsewhere in this
+# codebase (GLT_CHANNELS/EBAY_CHANNELS), and this repo has already had to
+# consolidate two competing spellings of "is this proven?" once (issue #47's
+# adoption of #45's vocabulary). A correction to either value here is a
+# one-line change that reaches both tools automatically.
+#
+# Proven live 18 Sep 2026 (issue #68's post-merge verification): CreateRefund
+# creates a real refund header that GetRefundHeadersByOrderId can read back,
+# and DeleteRefund fully removes one (used for test-order teardown only, not
+# wrapped as a tool here). NOT proven: ReturnsRefunds/ActionRefund, the call
+# that pushes a refund to the sales channel, has never been shown to actually
+# reach a channel -- it cannot be proven on a throwaway order (a manually
+# created DIRECT order has no channel to push to), only by refunding a real
+# Shopify/Amazon/eBay order and watching the channel's own admin. Flip this to
+# True only once that has genuinely been done and recorded on the issue.
+REFUND_CHANNEL_PUSH_PROVEN = False
+REFUND_CHANNEL_PUSH_WARNING = (
+    "⚠️ Pushing this refund to the sales channel (ReturnsRefunds/ActionRefund) "
+    "has never been shown to actually reach a channel on this tenant. "
+    "Linnworks accepting the call (a 2xx response, or even "
+    "SuccessfullyActioned=True) is NOT evidence the customer has been paid, "
+    "or that any money has left the store. The only way to know is to check "
+    "that channel's own admin (Shopify/Amazon/eBay), not Linnworks."
+)
+
+
+def _refund_channel_push_warning() -> Optional[str]:
+    """
+    The one place every refund tool derives the channel-push-unproven
+    warning from -- never retype REFUND_CHANNEL_PUSH_WARNING directly.
+    Returns None once REFUND_CHANNEL_PUSH_PROVEN is flipped True, so a caller
+    can always `if warning:` without a separate proven check.
+    """
+    if REFUND_CHANNEL_PUSH_PROVEN:
+        return None
+    return REFUND_CHANNEL_PUSH_WARNING
+
+
+# The unconfirmed read-back outcome (below) must never be read as "the refund
+# failed" or "the refund was not created" -- a read-back racing the write is
+# the obvious explanation, and the obvious-but-wrong human response to
+# "failed" is to run the refund again, which double-refunds the customer.
+_REFUND_UNCONFIRMED_MESSAGE = (
+    "The refund could not be confirmed by re-reading the order's refund "
+    "headers, but this does NOT mean the refund failed or was not created -- "
+    "CreateRefund itself succeeded. A read-back can race the write. "
+    "DO NOT re-run this refund on this order -- running it again risks "
+    "refunding the customer twice. Check the order directly in Linnworks "
+    "before doing anything else."
+)
+
+
+def _get_refund_headers(order_guid: str) -> list:
+    """
+    Call ReturnsRefunds/GetRefundHeadersByOrderId for the given order GUID.
+
+    Live-proven 18 Sep 2026 (issue #68): returns a plain JSON array of refund
+    headers (each carrying RefundHeaderId among other fields), empty when the
+    order has none -- confirmed both on an order with no refunds and as the
+    read-back that showed DeleteRefund had fully removed a header. Tolerates
+    a dict-wrapped shape defensively, since no other Linnworks list endpoint
+    in this codebase has stayed consistently unwrapped across releases.
+    """
+    resp = call_linnworks(
+        "ReturnsRefunds/GetRefundHeadersByOrderId",
+        {"request": {"OrderId": order_guid}},
+    )
+    if isinstance(resp, list):
+        return resp
+    if isinstance(resp, dict):
+        return resp.get("RefundHeaders") or resp.get("Data") or []
+    return []
+
+
+def _apply_refund_readback(result: dict, order_guid: str, refund_header_id) -> dict:
+    """
+    Re-read ReturnsRefunds/GetRefundHeadersByOrderId after a live refund and
+    classify the outcome onto `result` (mutated and returned). Issue #79.
+
+    Outcomes, mutually exclusive:
+      "confirmed"        a header matching refund_header_id is present on the
+                          fresh read.
+      "unconfirmed"       the read succeeded but no matching header was
+                          found. This can race the write -- see
+                          _REFUND_UNCONFIRMED_MESSAGE, attached under
+                          result["unconfirmed_message"]. NEVER treat this as
+                          a failed or missing refund.
+      "read_back_failed"  the read call itself raised something other than a
+                          rate limit.
+      "rate_limited"      a RateLimitError was raised while reading the
+                          headers -- distinct from every outcome above, per
+                          the standing rule (issues #34/#37) that a quota
+                          failure must never be folded into "not found" or
+                          "failed", because here that mistake points at the
+                          destructive answer: re-run the refund.
+    """
+    if refund_header_id is None:
+        result["outcome"] = "read_back_failed"
+        result["read_back_error"] = (
+            "CreateRefund did not return a RefundHeaderId to match against."
+        )
+        return result
+
+    try:
+        headers = _get_refund_headers(order_guid)
+    except RateLimitError as exc:
+        result["outcome"] = "rate_limited"
+        result["read_back_error"] = f"rate_limited reading refund headers: {exc}"
+        return result
+    except RuntimeError as exc:
+        result["outcome"] = "read_back_failed"
+        result["read_back_error"] = f"reading refund headers failed: {exc}"
+        return result
+
+    match = next(
+        (h for h in headers if h.get("RefundHeaderId") == refund_header_id), None
+    )
+    result["refund_headers_found"] = len(headers)
+    if match is not None:
+        result["outcome"] = "confirmed"
+        result["matched_refund_header"] = match
+    else:
+        result["outcome"] = "unconfirmed"
+        result["unconfirmed_message"] = _REFUND_UNCONFIRMED_MESSAGE
+    return result
+
+
 def _check_refund_eligibility(options: dict, push_to_channel: bool) -> str | None:
     """
     Decide whether Linnworks will accept a refund on this order.
@@ -3077,6 +3208,17 @@ def cancel_order(
     Stock management on cancellation is controlled by your Linnworks workspace
     settings.
 
+    After a live cancellation, the order is read back FRESH -- a new call,
+    keyed on the GUID already resolved before the write, never on whatever
+    order_id was originally passed. This matters because a cancelled order
+    drops out of open-order searches, so re-resolving from a numeric order
+    number afterwards can fail and look like the cancel did not work, even
+    though it succeeded (issue #79). The read-back only checks whether the
+    order now reads as `processed` -- cancelling has been observed to leave
+    an order still reading as parked, with its payment status unchanged, so
+    those fields are reported for information but never used to decide
+    success or failure.
+
     IMPORTANT: dry_run defaults to True. Set dry_run=False only when you are
     sure the cancellation is correct — confirm with the user before doing so.
     Cancellations cannot be reversed via the API.
@@ -3102,6 +3244,25 @@ def cancel_order(
           - customer_name: customer name
           - items:         list of items in the order
           - status:        "would_cancel" (dry run) or "cancelled"
+
+        On a live run, also:
+          - outcome:              "cancelled" (read-back confirms the order
+                                   now reads processed), "not_cancelled" (the
+                                   read-back succeeded but the order still
+                                   does not read processed), "unconfirmed"
+                                   (the read-back itself failed -- NEVER
+                                   reported as a failed cancellation), or
+                                   "rate_limited" (a RateLimitError was
+                                   raised during the read-back -- distinct
+                                   from "unconfirmed", never folded into it).
+          - read_back_processed:   the fresh `processed` value, or None when
+                                   the read-back did not complete.
+          - read_back_is_parked:   the fresh `is_parked` value, reported for
+                                   information only -- a cancelled order has
+                                   been observed to still read as parked.
+          - read_back_status:      the fresh payment `status` value, also
+                                   reported for information only, for the
+                                   same reason.
     """
     try:
         guid, raw = _resolve_order_guid(order_id)
@@ -3156,14 +3317,38 @@ def cancel_order(
         "refund": float(refund),
         "note": note or "",
     }
-    result = call_linnworks("Orders/CancelOrder", payload)
+    write_result = call_linnworks("Orders/CancelOrder", payload)
 
-    return {
+    result = {
         "dry_run": False,
         "status": "cancelled",
-        "linnworks_response": result,
+        "linnworks_response": write_result,
         **summary,
     }
+
+    # Read-back keyed on the GUID already resolved before the write (`guid`),
+    # never on the caller's original order_id -- a cancelled order drops out
+    # of open-order searches, so re-resolving by numeric order number here
+    # could fail even though the cancel itself succeeded (issue #79).
+    try:
+        _, raw_after = _resolve_order_guid(guid)
+    except RateLimitError as exc:
+        result["outcome"] = "rate_limited"
+        result["read_back_error"] = f"rate_limited on read-back: {exc}"
+        return result
+    except RuntimeError as exc:
+        result["outcome"] = "unconfirmed"
+        result["read_back_error"] = f"read-back failed: {exc}"
+        return result
+
+    fmt_after = _format_order_detail(raw_after)
+    # Cancelling has been observed to leave an order still reading as parked
+    # with an unchanged payment status -- only `processed` decides outcome.
+    result["outcome"] = "cancelled" if fmt_after.get("processed") else "not_cancelled"
+    result["read_back_processed"] = fmt_after.get("processed")
+    result["read_back_is_parked"] = fmt_after.get("is_parked")
+    result["read_back_status"] = fmt_after.get("status")
+    return result
 
 
 # Orders/RemoveOrderItem has been probed for existence only (issue #52, 9 Sep
@@ -4869,11 +5054,24 @@ def refund_order(
       3. Creates a refund record via ReturnsRefunds/CreateRefund.
       4. If push_to_channel=True, actions the refund via ReturnsRefunds/ActionRefund,
          which pushes the refund to the sales channel (Shopify, Amazon, eBay, etc.).
+      5. Re-reads the order's refund headers (ReturnsRefunds/GetRefundHeadersByOrderId)
+         and reports whether the created refund is now visible there.
 
-    NOTE: The refund endpoints (ReturnsRefunds/CreateRefund, ActionRefund) are
-    implemented from the Linnworks OpenAPI spec but have not been live-tested
-    against this tenant. Run with dry_run=True first to confirm order data,
-    then dry_run=False when ready. Any Linnworks API errors are surfaced verbatim.
+    PROVEN LIVE (18 Sep 2026, issue #68's post-merge verification):
+    ReturnsRefunds/CreateRefund creates a real refund header, and the header
+    is then visible via GetRefundHeadersByOrderId — the same read-back this
+    tool now performs after every live refund. The eligibility gate
+    (_check_refund_eligibility) has also been proven, both refusing and
+    permitting correctly against real order data.
+
+    NOT PROVEN: ReturnsRefunds/ActionRefund — the call that pushes a refund
+    to the sales channel — has never been shown to actually reach a channel.
+    It cannot be proven on a throwaway order (a manually created DIRECT order
+    has no channel to push to); the only proof is refunding a genuine
+    Shopify/Amazon/eBay order and watching that channel's own admin. Every
+    live response that attempts a channel push (push_to_channel=True) carries
+    this warning under "channel_push_warning" — see REFUND_CHANNEL_PUSH_WARNING,
+    the single place this text is written.
 
     IMPORTANT: dry_run defaults to True. Refunds move real customer money —
     always confirm the order and refund amounts before setting dry_run=False.
@@ -4889,7 +5087,23 @@ def refund_order(
 
     Returns:
         A dict with order details, per-line refund amounts, total refund, and
-        if live: the refund header ID, status, and action result.
+        if live:
+          - refund_header_id, refund_reference, status: from CreateRefund.
+          - actioned: True/False from ActionRefund's SuccessfullyActioned —
+            keeps its existing name, type and meaning unchanged.
+          - actioned_with_errors: True when actioned is True but ActionRefund
+            also returned a non-empty Errors array — a contradiction
+            Linnworks itself does not reconcile. Carries its own warning.
+          - channel_push_warning: present whenever a channel push was
+            attempted (push_to_channel=True and a refund was created) and
+            REFUND_CHANNEL_PUSH_PROVEN is False.
+          - outcome: "confirmed" (the refund header is visible on a fresh
+            read-back), "unconfirmed" (the read-back succeeded but no
+            matching header was found yet — see unconfirmed_message; NEVER
+            re-run the refund on this outcome), "read_back_failed" (the
+            read-back call itself failed), or "rate_limited" (a
+            RateLimitError was raised during the read-back — distinct from
+            every other outcome).
     """
     try:
         guid, raw = _resolve_order_guid(order_id)
@@ -5020,7 +5234,23 @@ def refund_order(
         result["actioned"] = action_resp.get("SuccessfullyActioned", False)
         result["action_status"] = (action_resp.get("Status") or {})
         result["action_errors"] = action_resp.get("Errors") or []
+        # SuccessfullyActioned can come back True alongside non-empty Errors
+        # -- neither field is redefined, this only flags the contradiction.
+        result["actioned_with_errors"] = bool(
+            result["actioned"] and result["action_errors"]
+        )
+        if result["actioned_with_errors"]:
+            result["warning"] = (
+                "ActionRefund reported SuccessfullyActioned=True but also "
+                "returned a non-empty Errors array. Linnworks has not "
+                "reconciled this itself — do not treat SuccessfullyActioned "
+                "alone as proof the refund reached the channel."
+            )
+        push_warning = _refund_channel_push_warning()
+        if push_warning:
+            result["channel_push_warning"] = push_warning
 
+    _apply_refund_readback(result, guid, refund_header_id)
     return result
 
 
@@ -5040,12 +5270,32 @@ def refund_order_lines(
     items list). Optionally supply `amount` to override the full line cost, or
     `quantity` when the refund is part of a return.
 
+    ⚠️ If you pass `quantity` WITHOUT an explicit `amount`, and that quantity
+    does not match the line's own total quantity, this tool REFUSES the call
+    rather than silently defaulting `amount` to the whole line's cost —
+    passing quantity=1 against a 3-unit line with no amount would otherwise
+    refund the money for all 3 units while only crediting 1 back to stock.
+    Pass an explicit `amount` for that line to proceed.
+
     Use get_order() first to see the order's items including their `row_id` values,
     then call this tool with only the lines you want to refund.
 
-    NOTE: The refund endpoints (ReturnsRefunds/CreateRefund, ActionRefund) are
-    implemented from the Linnworks OpenAPI spec but have not been live-tested
-    against this tenant. Run dry_run=True first to verify, then dry_run=False.
+    PROVEN LIVE (18 Sep 2026, issue #68's post-merge verification):
+    ReturnsRefunds/CreateRefund creates a real refund header for a partial,
+    per-line refund, and the header is then visible via
+    GetRefundHeadersByOrderId — the same read-back this tool now performs
+    after every live refund. The eligibility gate (_check_refund_eligibility)
+    has also been proven, both refusing and permitting correctly against
+    real order data.
+
+    NOT PROVEN: ReturnsRefunds/ActionRefund — the call that pushes a refund
+    to the sales channel — has never been shown to actually reach a channel.
+    It cannot be proven on a throwaway order (a manually created DIRECT order
+    has no channel to push to); the only proof is refunding a genuine
+    Shopify/Amazon/eBay order and watching that channel's own admin. Every
+    live response that attempts a channel push (push_to_channel=True) carries
+    this warning under "channel_push_warning" — see REFUND_CHANNEL_PUSH_WARNING,
+    the single place this text is written.
 
     IMPORTANT: dry_run defaults to True. Refunds move real customer money.
 
@@ -5055,7 +5305,9 @@ def refund_order_lines(
             - row_id (str, required): OrderItemRowId from get_order items.
             - amount (float, optional): Amount to refund for this line. Defaults
               to the full cost_inc_tax of the matched item.
-            - quantity (int, optional): Quantity being refunded.
+            - quantity (int, optional): Quantity being refunded. If supplied
+              without an explicit amount, and it does not equal the line's
+              own quantity, the call is refused (see the warning above).
         refund_postage: If True, also refund the postage/shipping cost.
         note: Optional note/reason to include with the refund.
         push_to_channel: If True (default), submits the refund to the sales
@@ -5063,7 +5315,23 @@ def refund_order_lines(
         dry_run: If True (default), shows what would be refunded without doing it.
 
     Returns:
-        A dict with the refund summary and, if live, the result from Linnworks.
+        A dict with the refund summary and, if live:
+          - refund_header_id, refund_reference, status: from CreateRefund.
+          - actioned: True/False from ActionRefund's SuccessfullyActioned —
+            keeps its existing name, type and meaning unchanged.
+          - actioned_with_errors: True when actioned is True but ActionRefund
+            also returned a non-empty Errors array — a contradiction
+            Linnworks itself does not reconcile. Carries its own warning.
+          - channel_push_warning: present whenever a channel push was
+            attempted (push_to_channel=True and a refund was created) and
+            REFUND_CHANNEL_PUSH_PROVEN is False.
+          - outcome: "confirmed" (the refund header is visible on a fresh
+            read-back), "unconfirmed" (the read-back succeeded but no
+            matching header was found yet — see unconfirmed_message; NEVER
+            re-run the refund on this outcome), "read_back_failed" (the
+            read-back call itself failed), or "rate_limited" (a
+            RateLimitError was raised during the read-back — distinct from
+            every other outcome).
     """
     try:
         guid, raw = _resolve_order_guid(order_id)
@@ -5091,6 +5359,7 @@ def refund_order_lines(
 
     refund_lines: list[dict] = []
     unknown_row_ids: list[str] = []
+    quantity_mismatch_lines: list[dict] = []
 
     for ln in (lines or []):
         row_id = ln.get("row_id")
@@ -5100,7 +5369,31 @@ def refund_order_lines(
         if item is None:
             unknown_row_ids.append(row_id)
             continue
-        amount = float(ln["amount"]) if ln.get("amount") is not None else float(
+
+        explicit_amount = ln.get("amount") is not None
+        quantity = ln.get("quantity")
+        line_quantity = item.get("Quantity")
+        # Refuse rather than silently default `amount` to the WHOLE line's
+        # cost when a caller asks to refund only PART of a multi-unit line
+        # without saying how much money that is — the obvious-looking
+        # default over-refunds the customer for the units not being
+        # returned. Behaviour when `amount` is supplied is unchanged.
+        if (
+            quantity is not None
+            and not explicit_amount
+            and line_quantity is not None
+            and int(quantity) != int(line_quantity)
+        ):
+            quantity_mismatch_lines.append({
+                "row_id": row_id,
+                "sku": item.get("SKU"),
+                "requested_quantity": quantity,
+                "line_quantity": line_quantity,
+                "line_cost_inc_tax": item.get("CostIncTax"),
+            })
+            continue
+
+        amount = float(ln["amount"]) if explicit_amount else float(
             item.get("CostIncTax") or 0.0
         )
         rl: dict = {
@@ -5108,8 +5401,8 @@ def refund_order_lines(
             "RefundedUnit": "Item",
             "Amount": amount,
         }
-        if ln.get("quantity") is not None:
-            rl["Quantity"] = int(ln["quantity"])
+        if quantity is not None:
+            rl["Quantity"] = int(quantity)
         if note:
             rl["FreeTextOrNote"] = note
         refund_lines.append(rl)
@@ -5121,6 +5414,19 @@ def refund_order_lines(
                 "Use get_order() to list valid row_ids for this order."
             ),
             "order_id": guid,
+        }
+
+    if quantity_mismatch_lines:
+        return {
+            "error": (
+                "Refusing to refund a partial quantity without an explicit "
+                "amount — this would silently refund the WHOLE line's cost "
+                "for only some of its units, over-refunding the customer. "
+                f"Pass an explicit 'amount' for these line(s): "
+                f"{quantity_mismatch_lines}"
+            ),
+            "order_id": guid,
+            "quantity_mismatch_lines": quantity_mismatch_lines,
         }
 
     # Optionally add shipping line
@@ -5223,7 +5529,23 @@ def refund_order_lines(
         result["actioned"] = action_resp.get("SuccessfullyActioned", False)
         result["action_status"] = (action_resp.get("Status") or {})
         result["action_errors"] = action_resp.get("Errors") or []
+        # SuccessfullyActioned can come back True alongside non-empty Errors
+        # -- neither field is redefined, this only flags the contradiction.
+        result["actioned_with_errors"] = bool(
+            result["actioned"] and result["action_errors"]
+        )
+        if result["actioned_with_errors"]:
+            result["warning"] = (
+                "ActionRefund reported SuccessfullyActioned=True but also "
+                "returned a non-empty Errors array. Linnworks has not "
+                "reconciled this itself — do not treat SuccessfullyActioned "
+                "alone as proof the refund reached the channel."
+            )
+        push_warning = _refund_channel_push_warning()
+        if push_warning:
+            result["channel_push_warning"] = push_warning
 
+    _apply_refund_readback(result, guid, refund_header_id)
     return result
 
 

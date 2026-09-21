@@ -4,9 +4,16 @@ QA tests for cancel_order, refund_order, and refund_order_lines.
 All tests use unittest.mock — no live Linnworks API calls.
 Run with: pytest tests/test_cancel_and_refund.py -v
 
-Note: ReturnsRefunds/CreateRefund and ActionRefund were implemented from the
-Linnworks OpenAPI spec (returnsrefunds.json) and have not been live-tested
-against a tenant as of May 2026.
+Proof state (issue #79, corrected — this header previously claimed the
+refund endpoints had never been live-tested, which stopped being true on
+18 Sep 2026): ReturnsRefunds/CreateRefund creates a real refund header, that
+header is visible via GetRefundHeadersByOrderId (the read-back both refund
+tools now perform), and _check_refund_eligibility has been proven both
+refusing and permitting against real order data. NOT proven:
+ReturnsRefunds/ActionRefund — the call that pushes a refund to a sales
+channel — has never been shown to actually reach a channel. Every live
+response that attempts a channel push carries a warning saying so (see
+REFUND_CHANNEL_PUSH_WARNING in server.py).
 """
 
 import sys
@@ -112,6 +119,14 @@ ACTION_REFUND_RESP = {
     "CannotRefundReason": "None",
     "Errors": [],
 }
+
+# The refund-headers read-back fixture (issue #79) — a header matching
+# CREATE_REFUND_RESP's RefundHeaderId, as GetRefundHeadersByOrderId would
+# show once the refund is visible.
+REFUND_HEADERS_MATCH = [
+    {"RefundHeaderId": 42, "RefundReference": "REF-42", "Status": {"StatusHeader": "OPEN"}},
+]
+REFUND_HEADERS_EMPTY = []
 
 
 def _orders_by_id_side_effect(path, payload, **kwargs):
@@ -378,6 +393,8 @@ class TestRefundOrder:
                 return CREATE_REFUND_RESP
             if "ActionRefund" in path:
                 return ACTION_REFUND_RESP
+            if "GetRefundHeadersByOrderId" in path:
+                return REFUND_HEADERS_MATCH
             raise AssertionError(f"Unexpected path: {path}")
 
         with patch("server.call_linnworks", side_effect=side_effect):
@@ -402,6 +419,8 @@ class TestRefundOrder:
                 return REFUND_OPTIONS_CAN
             if "CreateRefund" in path:
                 return CREATE_REFUND_RESP
+            if "GetRefundHeadersByOrderId" in path:
+                return REFUND_HEADERS_MATCH
             raise AssertionError(f"Unexpected path: {path}")
 
         with patch("server.call_linnworks", side_effect=side_effect):
@@ -426,6 +445,8 @@ class TestRefundOrder:
                 return CREATE_REFUND_RESP
             if "ActionRefund" in path:
                 return ACTION_REFUND_RESP
+            if "GetRefundHeadersByOrderId" in path:
+                return REFUND_HEADERS_MATCH
             raise AssertionError(f"Unexpected path: {path}")
 
         with patch("server.call_linnworks", side_effect=side_effect):
@@ -576,6 +597,8 @@ class TestRefundOrderLines:
                 return CREATE_REFUND_RESP
             if "ActionRefund" in path:
                 return ACTION_REFUND_RESP
+            if "GetRefundHeadersByOrderId" in path:
+                return REFUND_HEADERS_MATCH
             raise AssertionError(f"Unexpected path: {path}")
 
         with patch("server.call_linnworks", side_effect=side_effect):
@@ -740,3 +763,672 @@ class TestRefundEligibilityGate:
 
         assert r["can_refund"] is False
         assert r["can_refund_internally"] is True
+
+
+# ── Docstrings state the proof position, not "never live-tested" (AC2) ──────
+
+class TestDocstringsStateProofPosition:
+
+    def test_refund_order_docstring_no_longer_claims_never_live_tested(self):
+        import server
+        doc = server.refund_order.__doc__
+        assert "have not been live-tested" not in doc
+        assert "implemented from the Linnworks OpenAPI spec but have not" not in doc
+
+    def test_refund_order_lines_docstring_no_longer_claims_never_live_tested(self):
+        import server
+        doc = server.refund_order_lines.__doc__
+        assert "have not been live-tested" not in doc
+        assert "implemented from the Linnworks OpenAPI spec but have not" not in doc
+
+    def test_refund_order_docstring_states_what_is_and_is_not_proven(self):
+        import server
+        doc = server.refund_order.__doc__
+        assert "PROVEN LIVE" in doc
+        assert "CreateRefund" in doc
+        assert "eligibility gate" in doc.lower()
+        assert "NOT PROVEN" in doc
+        assert "ActionRefund" in doc
+
+    def test_refund_order_lines_docstring_states_what_is_and_is_not_proven(self):
+        import server
+        doc = server.refund_order_lines.__doc__
+        assert "PROVEN LIVE" in doc
+        assert "NOT PROVEN" in doc
+        assert "ActionRefund" in doc
+
+    def test_module_docstring_no_longer_claims_never_live_tested(self):
+        # __doc__ is this test module's own docstring (the module-level
+        # string at the top of this file) -- a plain global reference, no
+        # import needed, and robust to whether "tests" is a package.
+        assert "have not been live-tested" not in (__doc__ or "")
+
+
+# ── channel_push_warning: presence, and single source of truth (AC3, AC4) ───
+
+class TestChannelPushWarning:
+
+    def _live_refund_side_effect(self, order, refund_headers=None):
+        headers = refund_headers if refund_headers is not None else REFUND_HEADERS_MATCH
+
+        def side_effect(path, payload, **kwargs):
+            if "GetOrdersById" in path:
+                return [order]
+            if "GetRefundOptions" in path:
+                return REFUND_OPTIONS_CAN
+            if "CreateRefund" in path:
+                return CREATE_REFUND_RESP
+            if "ActionRefund" in path:
+                return ACTION_REFUND_RESP
+            if "GetRefundHeadersByOrderId" in path:
+                return headers
+            raise AssertionError(f"Unexpected path: {path}")
+
+        return side_effect
+
+    def test_refund_order_carries_warning_on_live_channel_push(self):
+        import server
+
+        with patch("server.call_linnworks",
+                   side_effect=self._live_refund_side_effect(PROCESSED_ORDER)):
+            result = server.refund_order(GUID, dry_run=False, push_to_channel=True)
+
+        assert "channel_push_warning" in result
+        assert "never been shown to actually reach a channel" in result["channel_push_warning"]
+        assert "not evidence the customer has been paid" in result["channel_push_warning"].lower()
+
+    def test_refund_order_lines_carries_warning_on_live_channel_push(self):
+        import server
+
+        with patch("server.call_linnworks",
+                   side_effect=self._live_refund_side_effect(PROCESSED_ORDER)):
+            result = server.refund_order_lines(
+                GUID, lines=[{"row_id": ROW_ID_1}], dry_run=False, push_to_channel=True,
+            )
+
+        assert "channel_push_warning" in result
+        assert "never been shown to actually reach a channel" in result["channel_push_warning"]
+
+    def test_no_warning_when_push_to_channel_is_false(self):
+        """No channel push was attempted, so no push warning is owed."""
+        import server
+
+        with patch("server.call_linnworks",
+                   side_effect=self._live_refund_side_effect(PROCESSED_ORDER)):
+            result = server.refund_order(GUID, dry_run=False, push_to_channel=False)
+
+        assert "channel_push_warning" not in result
+
+    def test_changing_the_single_warning_constant_changes_both_tools(self):
+        """AC4: the warning text exists in exactly ONE place. Proven by
+        changing server.REFUND_CHANNEL_PUSH_WARNING and observing BOTH
+        refund_order and refund_order_lines reflect the new text — a test
+        that only checks the string appears twice would not prove this."""
+        import server
+
+        custom_text = "CUSTOM-WARNING-MARKER-6f3a9c"
+        with patch("server.REFUND_CHANNEL_PUSH_WARNING", custom_text), \
+             patch("server.call_linnworks",
+                   side_effect=self._live_refund_side_effect(PROCESSED_ORDER)):
+            r1 = server.refund_order(GUID, dry_run=False, push_to_channel=True)
+            r2 = server.refund_order_lines(
+                GUID, lines=[{"row_id": ROW_ID_1}], dry_run=False, push_to_channel=True,
+            )
+
+        assert r1["channel_push_warning"] == custom_text
+        assert r2["channel_push_warning"] == custom_text
+
+    def test_flipping_the_single_proven_flag_removes_the_warning_from_both(self):
+        """The other half of AC4 -- the PROVEN flag is also derived from one
+        place. Flipping it removes the warning from both tools at once."""
+        import server
+
+        with patch("server.REFUND_CHANNEL_PUSH_PROVEN", True), \
+             patch("server.call_linnworks",
+                   side_effect=self._live_refund_side_effect(PROCESSED_ORDER)):
+            r1 = server.refund_order(GUID, dry_run=False, push_to_channel=True)
+            r2 = server.refund_order_lines(
+                GUID, lines=[{"row_id": ROW_ID_1}], dry_run=False, push_to_channel=True,
+            )
+
+        assert "channel_push_warning" not in r1
+        assert "channel_push_warning" not in r2
+
+
+# ── actioned keeps its meaning; a new key flags the True+Errors contradiction
+# (AC9) ───────────────────────────────────────────────────────────────────────
+
+class TestActionedWithErrorsContradiction:
+
+    ACTION_REFUND_TRUE_WITH_ERRORS = {
+        "SuccessfullyActioned": True,
+        "RefundHeaderId": 42,
+        "RefundReference": "REF-42",
+        "Status": {"StatusHeader": "PROCESSED"},
+        "CannotRefundReason": "None",
+        "Errors": [{"Error": "Channel push partially failed"}],
+    }
+
+    def _side_effect(self, order):
+        def side_effect(path, payload, **kwargs):
+            if "GetOrdersById" in path:
+                return [order]
+            if "GetRefundOptions" in path:
+                return REFUND_OPTIONS_CAN
+            if "CreateRefund" in path:
+                return CREATE_REFUND_RESP
+            if "ActionRefund" in path:
+                return self.ACTION_REFUND_TRUE_WITH_ERRORS
+            if "GetRefundHeadersByOrderId" in path:
+                return REFUND_HEADERS_MATCH
+            raise AssertionError(f"Unexpected path: {path}")
+        return side_effect
+
+    def test_actioned_key_unchanged_when_true_with_errors(self):
+        import server
+
+        with patch("server.call_linnworks", side_effect=self._side_effect(PROCESSED_ORDER)):
+            result = server.refund_order(GUID, dry_run=False, push_to_channel=True)
+
+        # `actioned` keeps its existing name, type and value: True, from
+        # SuccessfullyActioned, regardless of the Errors array.
+        assert result["actioned"] is True
+        assert isinstance(result["actioned"], bool)
+
+    def test_new_key_flags_the_contradiction_with_a_warning(self):
+        import server
+
+        with patch("server.call_linnworks", side_effect=self._side_effect(PROCESSED_ORDER)):
+            result = server.refund_order(GUID, dry_run=False, push_to_channel=True)
+
+        assert result["actioned_with_errors"] is True
+        assert "warning" in result
+        assert "SuccessfullyActioned" in result["warning"]
+
+    def test_no_contradiction_flag_when_actioned_true_and_no_errors(self):
+        import server
+
+        with patch("server.call_linnworks",
+                   side_effect=TestChannelPushWarning()._live_refund_side_effect(PROCESSED_ORDER)):
+            result = server.refund_order(GUID, dry_run=False, push_to_channel=True)
+
+        assert result["actioned"] is True
+        assert result["actioned_with_errors"] is False
+
+    def test_refund_order_lines_also_flags_the_contradiction(self):
+        import server
+
+        with patch("server.call_linnworks", side_effect=self._side_effect(PROCESSED_ORDER)):
+            result = server.refund_order_lines(
+                GUID, lines=[{"row_id": ROW_ID_1}], dry_run=False, push_to_channel=True,
+            )
+
+        assert result["actioned"] is True
+        assert result["actioned_with_errors"] is True
+        assert "warning" in result
+
+
+# ── Refund read-back outcomes: confirmed / unconfirmed / read_back_failed
+# (AC5, AC6) ──────────────────────────────────────────────────────────────────
+
+class TestRefundReadback:
+
+    def _side_effect(self, order, headers_behavior):
+        """headers_behavior: a value returned by/raised from
+        GetRefundHeadersByOrderId -- a list to return, or an exception
+        instance/class to raise."""
+        def side_effect(path, payload, **kwargs):
+            if "GetOrdersById" in path:
+                return [order]
+            if "GetRefundOptions" in path:
+                return REFUND_OPTIONS_CAN
+            if "CreateRefund" in path:
+                return CREATE_REFUND_RESP
+            if "ActionRefund" in path:
+                return ACTION_REFUND_RESP
+            if "GetRefundHeadersByOrderId" in path:
+                if isinstance(headers_behavior, Exception):
+                    raise headers_behavior
+                if isinstance(headers_behavior, type) and issubclass(headers_behavior, Exception):
+                    raise headers_behavior("boom")
+                return headers_behavior
+            raise AssertionError(f"Unexpected path: {path}")
+        return side_effect
+
+    # -- refund_order --
+
+    def test_refund_order_confirmed_when_header_matches(self):
+        import server
+        with patch("server.call_linnworks",
+                   side_effect=self._side_effect(PROCESSED_ORDER, REFUND_HEADERS_MATCH)):
+            result = server.refund_order(GUID, dry_run=False, push_to_channel=True)
+
+        assert result["outcome"] == "confirmed"
+        assert result["matched_refund_header"]["RefundHeaderId"] == 42
+        assert "error" not in result
+
+    def test_refund_order_unconfirmed_when_no_matching_header(self):
+        import server
+        with patch("server.call_linnworks",
+                   side_effect=self._side_effect(PROCESSED_ORDER, REFUND_HEADERS_EMPTY)):
+            result = server.refund_order(GUID, dry_run=False, push_to_channel=True)
+
+        assert result["outcome"] == "unconfirmed"
+        assert "error" not in result
+
+    def test_refund_order_read_back_failed_on_non_rate_limit_error(self):
+        import server
+        with patch("server.call_linnworks",
+                   side_effect=self._side_effect(PROCESSED_ORDER, RuntimeError("boom"))):
+            result = server.refund_order(GUID, dry_run=False, push_to_channel=True)
+
+        assert result["outcome"] == "read_back_failed"
+
+    # -- refund_order_lines --
+
+    def test_refund_order_lines_confirmed_when_header_matches(self):
+        import server
+        with patch("server.call_linnworks",
+                   side_effect=self._side_effect(PROCESSED_ORDER, REFUND_HEADERS_MATCH)):
+            result = server.refund_order_lines(
+                GUID, lines=[{"row_id": ROW_ID_1}], dry_run=False,
+            )
+
+        assert result["outcome"] == "confirmed"
+
+    def test_refund_order_lines_unconfirmed_when_no_matching_header(self):
+        import server
+        with patch("server.call_linnworks",
+                   side_effect=self._side_effect(PROCESSED_ORDER, REFUND_HEADERS_EMPTY)):
+            result = server.refund_order_lines(
+                GUID, lines=[{"row_id": ROW_ID_1}], dry_run=False,
+            )
+
+        assert result["outcome"] == "unconfirmed"
+
+    def test_refund_order_lines_read_back_failed_on_non_rate_limit_error(self):
+        import server
+        with patch("server.call_linnworks",
+                   side_effect=self._side_effect(PROCESSED_ORDER, RuntimeError("boom"))):
+            result = server.refund_order_lines(
+                GUID, lines=[{"row_id": ROW_ID_1}], dry_run=False,
+            )
+
+        assert result["outcome"] == "read_back_failed"
+
+
+# ── The unconfirmed message: unmistakable, never "failed" (AC6) ─────────────
+
+class TestUnconfirmedMessage:
+
+    def _side_effect(self, order):
+        def side_effect(path, payload, **kwargs):
+            if "GetOrdersById" in path:
+                return [order]
+            if "GetRefundOptions" in path:
+                return REFUND_OPTIONS_CAN
+            if "CreateRefund" in path:
+                return CREATE_REFUND_RESP
+            if "ActionRefund" in path:
+                return ACTION_REFUND_RESP
+            if "GetRefundHeadersByOrderId" in path:
+                return REFUND_HEADERS_EMPTY
+            raise AssertionError(f"Unexpected path: {path}")
+        return side_effect
+
+    def test_unconfirmed_message_instructs_do_not_rerun_and_check_linnworks(self):
+        import server
+        with patch("server.call_linnworks", side_effect=self._side_effect(PROCESSED_ORDER)):
+            result = server.refund_order(GUID, dry_run=False, push_to_channel=True)
+
+        assert result["outcome"] == "unconfirmed"
+        message = result["unconfirmed_message"]
+        assert "do not re-run" in message.lower()
+        assert "linnworks" in message.lower()
+
+    def test_unconfirmed_is_never_reported_as_failed_or_not_created(self):
+        import server
+        with patch("server.call_linnworks", side_effect=self._side_effect(PROCESSED_ORDER)):
+            result = server.refund_order(GUID, dry_run=False, push_to_channel=True)
+
+        assert "error" not in result
+        assert result["outcome"] != "failed"
+        assert result["outcome"] != "not_created"
+        assert result["refund_header_id"] == 42  # the refund WAS created
+
+    def test_refund_order_lines_unconfirmed_message_present(self):
+        import server
+        with patch("server.call_linnworks", side_effect=self._side_effect(PROCESSED_ORDER)):
+            result = server.refund_order_lines(
+                GUID, lines=[{"row_id": ROW_ID_1}], dry_run=False,
+            )
+
+        assert result["outcome"] == "unconfirmed"
+        assert "do not re-run" in result["unconfirmed_message"].lower()
+        assert "error" not in result
+
+
+# ── Rate-limited read-backs: their own outcome, for all three tools (AC7) ───
+
+class TestRateLimitedReadbacks:
+
+    def test_cancel_order_rate_limited_readback(self):
+        import server
+
+        counter = {"n": 0}
+
+        def side_effect(path, payload, **kwargs):
+            if "GetOrdersById" in path:
+                counter["n"] += 1
+                if counter["n"] == 1:
+                    return [OPEN_ORDER]
+                raise server.RateLimitError("quota exceeded")
+            if "CancelOrder" in path:
+                return "OK"
+            raise AssertionError(f"Unexpected path: {path}")
+
+        with patch("server.call_linnworks", side_effect=side_effect):
+            result = server.cancel_order(GUID, dry_run=False)
+
+        assert result["outcome"] == "rate_limited"
+        assert result["outcome"] != "unconfirmed"
+        assert result["outcome"] != "not_cancelled"
+
+    def test_refund_order_rate_limited_readback(self):
+        import server
+
+        def side_effect(path, payload, **kwargs):
+            if "GetOrdersById" in path:
+                return [PROCESSED_ORDER]
+            if "GetRefundOptions" in path:
+                return REFUND_OPTIONS_CAN
+            if "CreateRefund" in path:
+                return CREATE_REFUND_RESP
+            if "ActionRefund" in path:
+                return ACTION_REFUND_RESP
+            if "GetRefundHeadersByOrderId" in path:
+                raise server.RateLimitError("quota exceeded")
+            raise AssertionError(f"Unexpected path: {path}")
+
+        with patch("server.call_linnworks", side_effect=side_effect):
+            result = server.refund_order(GUID, dry_run=False, push_to_channel=True)
+
+        assert result["outcome"] == "rate_limited"
+        assert result["outcome"] != "unconfirmed"
+        assert result["outcome"] != "read_back_failed"
+        assert "error" not in result
+
+    def test_refund_order_lines_rate_limited_readback(self):
+        import server
+
+        def side_effect(path, payload, **kwargs):
+            if "GetOrdersById" in path:
+                return [PROCESSED_ORDER]
+            if "GetRefundOptions" in path:
+                return REFUND_OPTIONS_CAN
+            if "CreateRefund" in path:
+                return CREATE_REFUND_RESP
+            if "ActionRefund" in path:
+                return ACTION_REFUND_RESP
+            if "GetRefundHeadersByOrderId" in path:
+                raise server.RateLimitError("quota exceeded")
+            raise AssertionError(f"Unexpected path: {path}")
+
+        with patch("server.call_linnworks", side_effect=side_effect):
+            result = server.refund_order_lines(
+                GUID, lines=[{"row_id": ROW_ID_1}], dry_run=False,
+            )
+
+        assert result["outcome"] == "rate_limited"
+        assert result["outcome"] != "unconfirmed"
+        assert result["outcome"] != "read_back_failed"
+
+
+# ── cancel_order read-back: GUID-keying, parked/status ignored, failure
+# handling (AC8) ─────────────────────────────────────────────────────────────
+
+class TestCancelOrderReadback:
+
+    def test_readback_uses_resolved_guid_not_numeric_order_id(self):
+        import server
+
+        call_log = []
+
+        def get_side(path, params=None, **kwargs):
+            call_log.append(("GET", path))
+            if "GetOrderDetailsByNumOrderId" in path:
+                return _make_raw_order(processed=False)
+            raise AssertionError(f"Unexpected GET: {path}")
+
+        after = _make_raw_order(processed=True)
+
+        def post_side(path, payload, **kwargs):
+            call_log.append(("POST", path))
+            if "GetOrdersById" in path:
+                return [after]
+            if "CancelOrder" in path:
+                return "OK"
+            raise AssertionError(f"Unexpected POST: {path}")
+
+        with patch("server.call_linnworks", side_effect=post_side), \
+             patch("server.call_linnworks_get", side_effect=get_side):
+            result = server.cancel_order("123456", dry_run=False)
+
+        assert result["outcome"] == "cancelled"
+        get_calls = [c for c in call_log if c[0] == "GET"]
+        post_calls = [c for c in call_log if c[0] == "POST"]
+        # Only the initial numeric resolution used the GET route; the
+        # read-back must go by GUID (POST GetOrdersById), never a second
+        # GetOrderDetailsByNumOrderId lookup.
+        assert len(get_calls) == 1
+        assert any("GetOrdersById" in p for _, p in post_calls)
+
+    def test_still_parked_and_unchanged_status_still_classified_cancelled(self):
+        """Cancelling has been observed to leave an order still reading as
+        parked with its old payment status -- only `processed` must decide
+        the outcome."""
+        import server
+
+        after = _make_raw_order(processed=True)
+        after["GeneralInfo"]["IsParked"] = True
+        after["GeneralInfo"]["Status"] = 1  # unchanged from before cancellation
+
+        counter = {"n": 0}
+
+        def side_effect(path, payload, **kwargs):
+            if "GetOrdersById" in path:
+                counter["n"] += 1
+                # First call: the pre-write read, confirming the order is
+                # still open. Second call: the post-write read-back.
+                return [OPEN_ORDER] if counter["n"] == 1 else [after]
+            if "CancelOrder" in path:
+                return "OK"
+            raise AssertionError(f"Unexpected path: {path}")
+
+        with patch("server.call_linnworks", side_effect=side_effect):
+            result = server.cancel_order(GUID, dry_run=False)
+
+        assert result["outcome"] == "cancelled"
+        assert result["read_back_is_parked"] is True
+        assert result["read_back_status"] == 1
+
+    def test_failed_readback_reported_as_unconfirmed_not_failed_cancellation(self):
+        import server
+
+        counter = {"n": 0}
+
+        def side_effect(path, payload, **kwargs):
+            if "GetOrdersById" in path:
+                counter["n"] += 1
+                if counter["n"] == 1:
+                    return [OPEN_ORDER]
+                raise RuntimeError("No order found for GUID")
+            if "CancelOrder" in path:
+                return "OK"
+            raise AssertionError(f"Unexpected path: {path}")
+
+        with patch("server.call_linnworks", side_effect=side_effect):
+            result = server.cancel_order(GUID, dry_run=False)
+
+        assert result["outcome"] == "unconfirmed"
+        assert result["outcome"] != "not_cancelled"
+        # The write itself is not reported as failed -- status keeps its
+        # existing meaning ("we performed the cancel call").
+        assert result["status"] == "cancelled"
+
+
+# ── refund_order_lines: quantity-without-amount over-refund guard (AC10) ────
+
+class TestQuantityAmountGuard:
+
+    def test_partial_quantity_without_amount_is_refused(self):
+        """quantity=1 against a 3-unit line, no explicit amount: refuse
+        rather than silently refunding the WHOLE line's cost."""
+        import server
+
+        three_unit_order = _make_raw_order(processed=True)
+        three_unit_order["Items"][0]["Quantity"] = 3
+        three_unit_order["Items"][0]["CostIncTax"] = 30.00
+
+        def side_effect(path, payload, **kwargs):
+            if "GetOrdersById" in path:
+                return [three_unit_order]
+            raise AssertionError(f"Unexpected write: {path}")
+
+        with patch("server.call_linnworks", side_effect=side_effect):
+            result = server.refund_order_lines(
+                GUID,
+                lines=[{"row_id": ROW_ID_1, "quantity": 1}],
+                dry_run=False,
+            )
+
+        assert "error" in result
+        assert ROW_ID_1 in str(result.get("quantity_mismatch_lines", result["error"]))
+        assert "amount" in result["error"].lower()
+        # No write must have happened -- the side_effect raises on anything
+        # other than the initial GetOrdersById read.
+
+    def test_quantity_matching_full_line_quantity_is_not_refused(self):
+        """quantity == the line's own quantity: refunding "all of it" by
+        quantity is consistent with the cost-based default, no refusal."""
+        import server
+
+        three_unit_order = _make_raw_order(processed=True)
+        three_unit_order["Items"][0]["Quantity"] = 3
+        three_unit_order["Items"][0]["CostIncTax"] = 30.00
+
+        with patch("server.call_linnworks",
+                   side_effect=lambda path, payload, **kw: (
+                       [three_unit_order] if "GetOrdersById" in path
+                       else (_ for _ in ()).throw(AssertionError(path))
+                   )):
+            result = server.refund_order_lines(
+                GUID,
+                lines=[{"row_id": ROW_ID_1, "quantity": 3}],
+                dry_run=True,
+            )
+
+        assert "error" not in result
+        assert result["refund_lines"][0]["amount"] == 30.00
+
+    def test_explicit_amount_bypasses_the_guard_unchanged(self):
+        """Behaviour when `amount` IS supplied is unchanged: no refusal,
+        even though quantity=1 against a 3-unit line would otherwise
+        trigger it."""
+        import server
+
+        three_unit_order = _make_raw_order(processed=True)
+        three_unit_order["Items"][0]["Quantity"] = 3
+        three_unit_order["Items"][0]["CostIncTax"] = 30.00
+
+        with patch("server.call_linnworks",
+                   side_effect=lambda path, payload, **kw: (
+                       [three_unit_order] if "GetOrdersById" in path
+                       else (_ for _ in ()).throw(AssertionError(path))
+                   )):
+            result = server.refund_order_lines(
+                GUID,
+                lines=[{"row_id": ROW_ID_1, "quantity": 1, "amount": 10.00}],
+                dry_run=True,
+            )
+
+        assert "error" not in result
+        assert result["refund_lines"][0]["amount"] == 10.00
+        assert result["refund_lines"][0]["quantity"] == 1
+
+
+# ── dry_run stays byte-identical: no read-back, no write call (AC12) ────────
+
+class TestDryRunUnchanged:
+
+    def test_cancel_order_dry_run_makes_exactly_one_call(self):
+        import server
+
+        calls = []
+
+        def side_effect(path, payload, **kwargs):
+            calls.append(path)
+            if "GetOrdersById" in path:
+                return [OPEN_ORDER]
+            raise AssertionError(f"Unexpected call in dry run: {path}")
+
+        with patch("server.call_linnworks", side_effect=side_effect):
+            result = server.cancel_order(GUID, dry_run=True)
+
+        assert len(calls) == 1
+        assert "outcome" not in result
+        assert set(result.keys()) == {
+            "dry_run", "status", "message", "order_id", "num_order_id",
+            "customer_name", "customer_email", "reference_num",
+            "external_reference", "source", "items", "note",
+        }
+
+    def test_refund_order_dry_run_makes_exactly_one_call(self):
+        import server
+
+        calls = []
+
+        def side_effect(path, payload, **kwargs):
+            calls.append(path)
+            if "GetOrdersById" in path:
+                return [PROCESSED_ORDER]
+            raise AssertionError(f"Unexpected call in dry run: {path}")
+
+        with patch("server.call_linnworks", side_effect=side_effect):
+            result = server.refund_order(GUID, dry_run=True)
+
+        assert len(calls) == 1
+        assert "outcome" not in result
+        assert "channel_push_warning" not in result
+        assert set(result.keys()) == {
+            "dry_run", "order_id", "num_order_id", "customer_name",
+            "customer_email", "reference_num", "external_reference",
+            "total_refund", "currency", "push_to_channel", "refund_lines",
+            "note", "message",
+        }
+
+    def test_refund_order_lines_dry_run_makes_exactly_one_call(self):
+        import server
+
+        calls = []
+
+        def side_effect(path, payload, **kwargs):
+            calls.append(path)
+            if "GetOrdersById" in path:
+                return [PROCESSED_ORDER]
+            raise AssertionError(f"Unexpected call in dry run: {path}")
+
+        with patch("server.call_linnworks", side_effect=side_effect):
+            result = server.refund_order_lines(
+                GUID, lines=[{"row_id": ROW_ID_1}], dry_run=True,
+            )
+
+        assert len(calls) == 1
+        assert "outcome" not in result
+        assert "channel_push_warning" not in result
+        assert set(result.keys()) == {
+            "dry_run", "order_id", "num_order_id", "customer_name",
+            "customer_email", "reference_num", "external_reference",
+            "total_refund", "currency", "push_to_channel", "refund_lines",
+            "note", "message",
+        }
