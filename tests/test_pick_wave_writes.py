@@ -17,6 +17,9 @@ import os
 import sys
 from unittest.mock import patch
 
+import pytest
+import requests
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server
@@ -56,7 +59,8 @@ def _wave_order(num, guid, *, locked=False, on_hold=False, cancelled=False, proc
     }
 
 
-def _wave_resp(wave_id=9001, state="Unallocated", orders=(), user_id=None, email=None, start=None):
+def _wave_resp(wave_id=9001, state="Unallocated", orders=(), user_id=None, email=None, start=None,
+               items_picked=None):
     """A whole GetPickingWave response. UserId/EmailAddress are ABSENT when unassigned."""
     wave = {
         "PickingWaveId": wave_id,
@@ -73,6 +77,8 @@ def _wave_resp(wave_id=9001, state="Unallocated", orders=(), user_id=None, email
         wave["EmailAddress"] = email
     if start is not None:
         wave["StartTime"] = start
+    if items_picked is not None:
+        wave["ItemsPicked"] = items_picked
     return {
         "PickingWaves": [wave],
         "Skus": [{"SKU": "SKU-1", "StockItemId": SID, "ItemTitle": "Thing"}],
@@ -233,6 +239,25 @@ class TestGetPickWaveDetail:
         assert "dry_run" not in inspect.signature(server.get_pick_wave_detail).parameters
         assert "get_pick_wave_detail" not in server.WRITE_THRESHOLDS
 
+    # M1 — the wave is selected by id, never just "the first one".
+    def test_a_response_for_a_different_wave_is_not_found(self):
+        fake = FakeLinnworks(waves={9001: _wave_resp(wave_id=9999, orders=[_wave_order(1, GUID_A)])})
+        with fake.active():
+            out = server.get_pick_wave_detail(9001)
+        assert out["found"] is False
+        assert "orders" not in out
+
+    def test_format_detail_picks_the_wave_with_the_matching_id(self):
+        resp = _wave_resp(wave_id=9999, orders=[_wave_order(1, GUID_A)])
+        resp["PickingWaves"].append(
+            _wave_resp(wave_id=9001, orders=[_wave_order(2, GUID_B)])["PickingWaves"][0])
+        detail = server._format_pick_wave_detail(resp, 9001)
+        assert detail["picking_wave_id"] == 9001
+        assert [o["order_id"] for o in detail["orders"]] == [2]
+        assert server._format_pick_wave_detail(resp, 4242) is None
+        # Without an id the first wave is still used (unchanged behaviour).
+        assert server._format_pick_wave_detail(resp)["picking_wave_id"] == 9999
+
 
 # ── Shared pre-write helpers ────────────────────────────────────────────────
 
@@ -314,6 +339,28 @@ class TestSharedHelpers:
 
     def test_settable_states_are_exactly_the_three_agreed(self):
         assert server._PICK_WAVE_SETTABLE_STATES == ("Abandoned", "Paused", "Unallocated")
+
+    # C1 — Generate and UpdateHeader go unwrapped first; Delete stays wrapped.
+    def test_write_wrapper_flags_follow_the_c1_ruling(self):
+        assert server._PICKING_WRITE_WRAPPED == {
+            "Picking/GeneratePickingWave": False,
+            "Picking/UpdatePickingWaveHeader": False,
+            "Picking/DeleteOrdersFromPickingWaves": True,
+        }
+
+    def test_started_and_all_state_sets(self):
+        assert server._PICK_WAVE_STARTED_STATES == ("InProgress", "Paused", "Complete", "Packing")
+        assert set(server._PICK_WAVE_ALL_STATES) == {
+            "Unallocated", "Allocated", "InProgress", "Paused",
+            "Complete", "Abandoned", "Packing", "Shipped",
+        }
+
+    # M6 — registration.
+    def test_write_threshold_registration(self):
+        assert server.WRITE_THRESHOLDS["generate_pick_waves"] == 25
+        assert server.WRITE_THRESHOLDS["remove_orders_from_pick_waves"] == 25
+        assert "update_pick_wave" not in server.WRITE_THRESHOLDS
+        assert "get_pick_wave_detail" not in server.WRITE_THRESHOLDS
 
     def test_as_int(self):
         assert server._as_int("611385") == 611385
@@ -423,6 +470,28 @@ class TestGenerateRefusesBeforeAnyWrite:
         assert "nothing was written" in out["error"]
         assert fake.writes() == []
 
+    # M6 — a 429 at the FIFO and roster call sites.
+    def test_fifo_rate_limit_writes_nothing(self):
+        fake = FakeLinnworks(orders=ORDERS, raise_on={
+            "OpenOrders/GetIdentifiersByOrderIds": server.RateLimitError("quota exceeded")})
+        with fake.active():
+            out = server.generate_pick_waves([{"order_ids": ["611385"]}], dry_run=False)
+        assert out["success"] is False
+        assert out["complete"] is False
+        assert out["rate_limited"][0]["step"] == "FIFO_READY check"
+        assert fake.writes() == []
+
+    def test_roster_rate_limit_writes_nothing(self):
+        fake = FakeLinnworks(orders=ORDERS, raise_on={
+            "Picking/GetPickwaveUsersWithSummary": server.RateLimitError("quota exceeded")})
+        with fake.active():
+            out = server.generate_pick_waves(
+                [{"order_ids": ["611385"], "user_id": 19}], dry_run=False)
+        assert out["success"] is False
+        assert out["complete"] is False
+        assert out["rate_limited"][0]["step"] == "picker roster"
+        assert fake.writes() == []
+
 
 class TestGenerateDryRun:
 
@@ -467,6 +536,37 @@ class TestGenerateDryRun:
         assert out["item_count"] == 26
         assert "manifest" in out
         assert fake.writes() == []
+
+
+def _many_orders(n=26):
+    return {str(700000 + i): (f"{i:08d}-0000-0000-0000-000000000000", 700000 + i)
+            for i in range(n)}
+
+
+class TestGenerateStaging:
+    """M6 — the confirmed_count echo for a batch above the 25-order threshold."""
+
+    def test_wrong_confirmed_count_is_an_error_and_writes_nothing(self):
+        many = _many_orders()
+        with FakeLinnworks(orders=many).active() as fake:
+            out = server.generate_pick_waves(
+                [{"order_ids": list(many)}], confirmed_count=25, dry_run=False)
+        assert out["success"] is False
+        assert out["staged"] is False
+        assert "does not match" in out["message"]
+        assert fake.writes() == []
+
+    def test_matching_confirmed_count_writes(self):
+        many = _many_orders()
+        fake = FakeLinnworks(orders=many)
+        fake.on_write["Picking/GeneratePickingWave"] = _generate_creates(fake, [9001])
+        with fake.active():
+            out = server.generate_pick_waves(
+                [{"order_ids": list(many)}], confirmed_count=26, dry_run=False)
+        assert len(fake.writes()) == 1
+        assert len(_body(fake.writes()[0][2])["Orders"]) == 26
+        assert out["results"][0]["outcome"] == "created"
+        assert out["results"][0]["readback_matches"] is True
 
 
 class TestGenerateLive:
@@ -536,15 +636,196 @@ class TestGenerateLive:
         assert out["created_wave_ids"] == [9001]
         assert out["complete"] is False
 
+    def test_body_wrapping_follows_the_flag(self):
+        fake = FakeLinnworks(orders=ORDERS)
+        fake.on_write["Picking/GeneratePickingWave"] = _generate_creates(fake, [9001])
+        with fake.active():
+            server.generate_pick_waves([{"order_ids": ["611385"]}], dry_run=False)
+        raw = fake.writes()[0][2]
+        assert ("request" in raw) is server._PICKING_WRITE_WRAPPED["Picking/GeneratePickingWave"]
+
+    # I1 — an ambiguous response is never reported as a refusal.
+    def test_empty_response_is_unconfirmed_not_refused(self):
+        fake = FakeLinnworks(orders=ORDERS)
+        fake.on_write["Picking/GeneratePickingWave"] = lambda body: {}
+        with fake.active():
+            out = server.generate_pick_waves([{"order_ids": ["611385"]}], dry_run=False)
+        result = out["results"][0]
+        assert result["outcome"] == "unconfirmed"
+        assert result["validation_results"] == []
+        assert result["raw_response"] == {}
+        assert "get_pick_waves(state='Unallocated')" in result["note"]
+        assert out["complete"] is False
+        assert "[0] may exist" in out["message"]
+
+    def test_list_response_is_unconfirmed_without_crashing(self):
+        fake = FakeLinnworks(orders=ORDERS)
+        fake.on_write["Picking/GeneratePickingWave"] = lambda body: [{"PickingWaveId": n}
+                                                                     for n in range(300)]
+        with fake.active():
+            out = server.generate_pick_waves([{"order_ids": ["611385"]}], dry_run=False)
+        result = out["results"][0]
+        assert result["outcome"] == "unconfirmed"
+        assert result["validation_results"] == []
+        assert isinstance(result["raw_response"], str)
+        assert result["raw_response"].startswith("[{'PickingWaveId': 0}")
+        assert len(result["raw_response"]) == 500
+        assert out["created_wave_ids"] == []
+
+    def test_raw_text_response_is_unconfirmed_and_kept_verbatim(self):
+        fake = FakeLinnworks(orders=ORDERS)
+        fake.on_write["Picking/GeneratePickingWave"] = lambda body: {"raw": "OK"}
+        with fake.active():
+            out = server.generate_pick_waves([{"order_ids": ["611385"]}], dry_run=False)
+        assert out["results"][0]["outcome"] == "unconfirmed"
+        assert out["results"][0]["raw_response"] == {"raw": "OK"}
+
+    # I2 — a network error after wave 1 must not hide wave 1.
+    def test_network_error_on_a_later_wave_is_unconfirmed_and_named(self):
+        fake = FakeLinnworks(orders=ORDERS)
+        creates = _generate_creates(fake, [9001])
+        calls = {"n": 0}
+
+        def handler(body):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise requests.exceptions.Timeout("read timed out")
+            return creates(body)
+        fake.on_write["Picking/GeneratePickingWave"] = handler
+        with fake.active():
+            out = server.generate_pick_waves(
+                [{"order_ids": ["611385"]}, {"order_ids": ["611386"]}], dry_run=False)
+        assert out["results"][0]["outcome"] == "created"
+        second = out["results"][1]
+        assert second["outcome"] == "unconfirmed"
+        assert second["error"] == "Timeout: read timed out"
+        assert "may have reached Linnworks" in second["note"]
+        assert out["created_wave_ids"] == [9001]
+        assert "[9001]" in out["message"]
+        assert "wave index(es) [1] may exist" in out["message"]
+        assert "check get_pick_waves before re-sending" in out["message"]
+        assert "re-send only" not in out["message"]
+        assert out["complete"] is False
+
+    def test_os_error_is_caught_too(self):
+        fake = FakeLinnworks(orders=ORDERS, raise_on={
+            "Picking/GeneratePickingWave": OSError("connection reset")})
+        with fake.active():
+            out = server.generate_pick_waves([{"order_ids": ["611385"]}], dry_run=False)
+        assert out["results"][0]["outcome"] == "unconfirmed"
+        assert out["results"][0]["error"] == "OSError: connection reset"
+
+    def test_unconfirmed_waves_are_not_in_the_resend_list(self):
+        fake = FakeLinnworks(orders=ORDERS)
+        creates = _generate_creates(fake, [9001])
+        refusal = {"ValidationResults": [{"OrderId": 611386, "HasErrors": True,
+                                          "Errors": [{"Error": "Order is already in a pickwave"}]}],
+                   "PickingWaves": []}
+        calls = {"n": 0}
+
+        def handler(body):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return creates(body)
+            if calls["n"] == 2:
+                return refusal
+            raise requests.exceptions.ConnectionError("dropped")
+        fake.on_write["Picking/GeneratePickingWave"] = handler
+        with fake.active():
+            out = server.generate_pick_waves(
+                [{"order_ids": ["611385"]}, {"order_ids": ["611386"]}, {"order_ids": ["611387"]}],
+                dry_run=False)
+        assert [r["outcome"] for r in out["results"]] == ["created", "refused", "unconfirmed"]
+        assert "re-send only wave index(es) [1]." in out["message"]
+        assert "wave index(es) [2] may exist" in out["message"]
+        assert "Do NOT re-run" in out["message"]
+
+    # I3 — ValidationResults are never dropped, and a mismatched create is named.
+    def test_created_wave_with_none_of_the_requested_orders_is_named(self):
+        fake = FakeLinnworks(orders=ORDERS)
+
+        def handler(body):
+            fake.waves[9001] = _wave_resp(wave_id=9001, orders=[_wave_order(999999, GUID_C)])
+            return {"ValidationResults": [], "PickingWaves": [{"PickingWaveId": 9001}]}
+        fake.on_write["Picking/GeneratePickingWave"] = handler
+        with fake.active():
+            out = server.generate_pick_waves([{"order_ids": ["611385"]}], dry_run=False)
+        result = out["results"][0]
+        assert result["outcome"] == "created"
+        assert result["readback_matches"] is False
+        assert result["missing_order_ids"] == [611385]
+        assert result["extra_order_ids"] == [999999]
+        assert result["validation_results"] == []
+        assert "wave 9001 does not match the request (missing [611385], extra [999999])" \
+            in out["message"]
+        assert out["complete"] is False
+
+    def test_partial_create_keeps_its_validation_results(self):
+        fake = FakeLinnworks(orders=ORDERS)
+        reasons = [{"OrderId": 611386, "HasErrors": True,
+                    "Errors": [{"Error": "Order is already in a pickwave"}]}]
+
+        def handler(body):
+            fake.waves[9001] = _wave_resp(wave_id=9001, orders=[_wave_order(611385, GUID_A)])
+            return {"ValidationResults": reasons, "PickingWaves": [{"PickingWaveId": 9001}]}
+        fake.on_write["Picking/GeneratePickingWave"] = handler
+        with fake.active():
+            out = server.generate_pick_waves([{"order_ids": ["611385", "611386"]}], dry_run=False)
+        result = out["results"][0]
+        assert result["outcome"] == "created"
+        assert result["validation_results"] == reasons
+        assert result["missing_order_ids"] == [611386]
+        assert result["extra_order_ids"] == []
+        assert "wave 9001 does not match the request (missing [611386], extra [])" in out["message"]
+
+    def test_matching_create_reports_empty_differences(self):
+        fake = FakeLinnworks(orders=ORDERS)
+        fake.on_write["Picking/GeneratePickingWave"] = _generate_creates(fake, [9001])
+        with fake.active():
+            out = server.generate_pick_waves([{"order_ids": ["611385"]}], dry_run=False)
+        result = out["results"][0]
+        assert result["missing_order_ids"] == []
+        assert result["extra_order_ids"] == []
+        assert result["validation_results"] == []
+        assert "does not match" not in out["message"]
+
+    def test_every_live_result_carries_validation_results(self):
+        fake = FakeLinnworks(orders=ORDERS, raise_on={
+            "Picking/GeneratePickingWave": server.RateLimitError("quota exceeded")})
+        with fake.active():
+            out = server.generate_pick_waves(
+                [{"order_ids": ["611385"]}, {"order_ids": ["nope"]}], dry_run=False)
+        assert [r["outcome"] for r in out["results"]] == ["rate_limited", "blocked"]
+        assert all(r["validation_results"] == [] for r in out["results"])
+
+    # Deferred minor 5 — _read_back_generated_wave's failure branches.
+    def test_generated_wave_readback_rate_limit_is_unconfirmed(self):
+        fake = FakeLinnworks(raise_on={
+            "Picking/GetPickingWave": server.RateLimitError("quota exceeded")})
+        with fake.active():
+            out = server._read_back_generated_wave([9001], [611385])
+        assert out["outcome"] == "unconfirmed"
+        assert out["picking_wave_ids"] == [9001]
+        assert out["readback_error"].startswith("rate limited:")
+        assert "quota exceeded" in out["readback_error"]
+
+    def test_generated_wave_readback_error_is_unconfirmed(self):
+        fake = FakeLinnworks(raise_on={"Picking/GetPickingWave": RuntimeError("HTTP 500 — boom")})
+        with fake.active():
+            out = server._read_back_generated_wave([9001], [611385])
+        assert out["outcome"] == "unconfirmed"
+        assert out["readback_error"] == "HTTP 500 — boom"
+
 
 # ── update_pick_wave ────────────────────────────────────────────────────────
 
 JO = "jo@thewarehousegroup.co.uk"
 
 
-def _assigned_wave(state="Unallocated", start=None):
+def _assigned_wave(state="Unallocated", start=None, items_picked=None):
     return _wave_resp(wave_id=9001, state=state, user_id=19, email=JO,
-                      orders=[_wave_order(611385, GUID_A)], start=start)
+                      orders=[_wave_order(611385, GUID_A)], start=start,
+                      items_picked=items_picked)
 
 
 def _update_applies(fake):
@@ -603,15 +884,35 @@ class TestUpdateChecks:
         assert "FINISHED" in out["error"]
         assert fake.writes() == []
 
-    def test_abandoning_an_in_progress_wave_needs_the_flag(self):
-        fake = FakeLinnworks(waves={9001: _assigned_wave(state="InProgress")})
+    # I5 / deferred minor 9 — any started wave, not just InProgress.
+    @pytest.mark.parametrize("target", ["Abandoned", "Unallocated"])
+    @pytest.mark.parametrize("current,items_picked", [
+        ("InProgress", None),
+        ("Paused", None),
+        ("Complete", None),
+        ("Packing", None),
+        ("Unallocated", 1),
+    ])
+    def test_resetting_a_started_wave_needs_the_flag(self, current, items_picked, target):
+        fake = FakeLinnworks(waves={9001: _assigned_wave(state=current, items_picked=items_picked)})
+        fake.on_write["Picking/UpdatePickingWaveHeader"] = _update_applies(fake)
         with fake.active():
-            refused = server.update_pick_wave(9001, state="Abandoned")
-            allowed = server.update_pick_wave(9001, state="Abandoned", allow_in_progress=True)
+            refused = server.update_pick_wave(9001, state=target, dry_run=False)
+            assert fake.writes() == []
+            allowed = server.update_pick_wave(9001, state=target, allow_in_progress=True)
         assert refused["success"] is False
+        assert refused["current_state"] == current
         assert "allow_in_progress" in refused["error"]
+        assert "trolley" in refused["error"]
         assert allowed["dry_run"] is True
-        assert allowed["plan"]["new_state"] == "Abandoned"
+        assert allowed["plan"]["new_state"] == target
+
+    def test_abandoning_an_unstarted_wave_needs_no_flag(self):
+        fake = FakeLinnworks(waves={9001: _assigned_wave(state="Unallocated", items_picked=0)})
+        with fake.active():
+            out = server.update_pick_wave(9001, state="Abandoned")
+        assert out["dry_run"] is True
+        assert out["plan"]["new_state"] == "Abandoned"
 
     def test_pausing_an_in_progress_wave_is_allowed(self):
         fake = FakeLinnworks(waves={9001: _assigned_wave(state="InProgress")})
@@ -654,6 +955,35 @@ class TestUpdateChecks:
         assert out["success"] is False
         assert "HTTP 500 — boom" in out["error"]
         assert "nothing was written" in out["error"]
+        assert fake.writes() == []
+
+    # M1 — a response for another wave id is not this wave.
+    def test_response_for_another_wave_is_refused(self):
+        resp = _wave_resp(wave_id=9999, orders=[_wave_order(611385, GUID_A)])
+        fake = FakeLinnworks(waves={9001: resp})
+        fake.on_write["Picking/UpdatePickingWaveHeader"] = lambda body: {}
+        with fake.active():
+            out = server.update_pick_wave(9001, state="Paused", dry_run=False)
+        assert out["success"] is False
+        assert "No live wave with that id" in out["error"]
+        assert fake.writes() == []
+
+    # M2 — an unknown current state is refused before any write.
+    @pytest.mark.parametrize("raw_state", [None, "Weird"])
+    def test_unknown_current_state_is_refused(self, raw_state):
+        resp = _assigned_wave()
+        wave = resp["PickingWaves"][0]
+        if raw_state is None:
+            del wave["State"]
+        else:
+            wave["State"] = raw_state
+        fake = FakeLinnworks(waves={9001: resp})
+        fake.on_write["Picking/UpdatePickingWaveHeader"] = lambda body: {}
+        with fake.active():
+            out = server.update_pick_wave(9001, user_id=68, dry_run=False)
+        assert out["success"] is False
+        assert out["current_state"] == raw_state
+        assert "not a documented pickwave state" in out["error"]
         assert fake.writes() == []
 
 
@@ -732,6 +1062,129 @@ class TestUpdateLive:
         with fake.active():
             out = server.update_pick_wave(9001, state="Paused", dry_run=False)
         assert out["outcome"] == "unconfirmed"
+
+    def test_body_wrapping_follows_the_flag(self):
+        fake = FakeLinnworks(waves={9001: _assigned_wave()})
+        fake.on_write["Picking/UpdatePickingWaveHeader"] = _update_applies(fake)
+        with fake.active():
+            server.update_pick_wave(9001, state="Paused", dry_run=False)
+        raw = fake.writes()[0][2]
+        assert ("request" in raw) is server._PICKING_WRITE_WRAPPED["Picking/UpdatePickingWaveHeader"]
+
+    # Deferred minor 8 — a plain Linnworks error from the write itself.
+    def test_write_error_is_outcome_error(self):
+        fake = FakeLinnworks(waves={9001: _assigned_wave()}, raise_on={
+            "Picking/UpdatePickingWaveHeader": RuntimeError("HTTP 500 — boom")})
+        with fake.active():
+            out = server.update_pick_wave(9001, state="Paused", dry_run=False)
+        assert out["outcome"] == "error"
+        assert out["complete"] is False
+        assert "HTTP 500 — boom" in out["error"]
+
+    # I4 — judge only what the caller asked to change; report the rest.
+    def test_reassign_where_the_server_also_moves_the_state(self):
+        fake = FakeLinnworks(waves={9001: _assigned_wave()})
+        apply = _update_applies(fake)
+
+        def handler(body):
+            apply(body)
+            fake.waves[9001]["PickingWaves"][0]["State"] = "Allocated"
+            return {}
+        fake.on_write["Picking/UpdatePickingWaveHeader"] = handler
+        with fake.active():
+            out = server.update_pick_wave(9001, user_id=68, dry_run=False)
+        assert out["outcome"] == "updated"
+        assert out["complete"] is True
+        assert out["after_state"] == "Allocated"
+        assert out["after_user_id"] == 68
+        assert out["state_changed_by_server"] is True
+        assert "user_changed_by_server" not in out
+
+    def test_reassign_where_the_state_is_kept_reports_no_server_change(self):
+        fake = FakeLinnworks(waves={9001: _assigned_wave()})
+        fake.on_write["Picking/UpdatePickingWaveHeader"] = _update_applies(fake)
+        with fake.active():
+            out = server.update_pick_wave(9001, user_id=68, dry_run=False)
+        assert out["outcome"] == "updated"
+        assert out["state_changed_by_server"] is False
+
+    def test_state_change_where_the_server_clears_the_user(self):
+        fake = FakeLinnworks(waves={9001: _assigned_wave()})
+        apply = _update_applies(fake)
+
+        def handler(body):
+            apply(body)
+            fake.waves[9001]["PickingWaves"][0].pop("UserId", None)
+            return {}
+        fake.on_write["Picking/UpdatePickingWaveHeader"] = handler
+        with fake.active():
+            out = server.update_pick_wave(9001, state="Paused", dry_run=False)
+        assert out["outcome"] == "updated"
+        assert out["complete"] is True
+        assert out["after_state"] == "Paused"
+        assert out["after_user_id"] is None
+        assert out["user_changed_by_server"] is True
+        assert "state_changed_by_server" not in out
+
+    def test_state_change_that_keeps_the_user_reports_no_server_change(self):
+        fake = FakeLinnworks(waves={9001: _assigned_wave()})
+        fake.on_write["Picking/UpdatePickingWaveHeader"] = _update_applies(fake)
+        with fake.active():
+            out = server.update_pick_wave(9001, state="Paused", dry_run=False)
+        assert out["user_changed_by_server"] is False
+
+    @pytest.mark.parametrize("read_back_user", [0, -1])
+    def test_unassign_reading_back_zero_or_minus_one_counts_as_no_user(self, read_back_user):
+        fake = FakeLinnworks(waves={9001: _assigned_wave()})
+        apply = _update_applies(fake)
+
+        def handler(body):
+            apply(body)
+            fake.waves[9001]["PickingWaves"][0]["UserId"] = read_back_user
+            return {}
+        fake.on_write["Picking/UpdatePickingWaveHeader"] = handler
+        with fake.active():
+            out = server.update_pick_wave(9001, unassign=True, dry_run=False)
+        assert out["outcome"] == "updated"
+        assert out["after_user_id"] == read_back_user
+
+    def test_both_changed_and_state_ignored_is_not_applied(self):
+        fake = FakeLinnworks(waves={9001: _assigned_wave()})
+        apply = _update_applies(fake)
+
+        def handler(body):
+            apply({**body, "State": "Unallocated"})  # user applied, state not
+            return {}
+        fake.on_write["Picking/UpdatePickingWaveHeader"] = handler
+        with fake.active():
+            out = server.update_pick_wave(9001, user_id=68, state="Paused", dry_run=False)
+        assert out["outcome"] == "not_applied"
+        assert out["after_user_id"] == 68
+        assert out["after_state"] == "Unallocated"
+
+    def test_abandon_reports_user_change_only_when_the_header_carries_a_user(self):
+        fake = FakeLinnworks(waves={9001: _assigned_wave()})
+        fake.on_write["Picking/UpdatePickingWaveHeader"] = _update_applies(fake)
+        with fake.active():
+            out = server.update_pick_wave(9001, state="Abandoned", dry_run=False)
+        assert out["outcome"] == "updated"
+        assert out["user_changed_by_server"] is False
+
+    def test_abandon_without_a_user_key_on_the_header_reports_nothing(self):
+        fake = FakeLinnworks(waves={9001: _assigned_wave()})
+        apply = _update_applies(fake)
+
+        def handler(body):
+            apply(body)
+            for row in fake.headers["Abandoned"]:
+                row.pop("UserId", None)
+                row.pop("EmailAddress", None)
+            return {}
+        fake.on_write["Picking/UpdatePickingWaveHeader"] = handler
+        with fake.active():
+            out = server.update_pick_wave(9001, state="Abandoned", dry_run=False)
+        assert out["outcome"] == "updated"
+        assert "user_changed_by_server" not in out
 
 
 # ── remove_orders_from_pick_waves ───────────────────────────────────────────
@@ -849,3 +1302,101 @@ class TestRemoveOrders:
             out = server.remove_orders_from_pick_waves(list(many), dry_run=False)
         assert out["staged"] is True
         assert fake.writes() == []
+
+    # M6 — the confirmed_count echo.
+    def test_wrong_confirmed_count_is_an_error_and_writes_nothing(self):
+        many = _many_orders()
+        with FakeLinnworks(orders=many).active() as fake:
+            out = server.remove_orders_from_pick_waves(list(many), confirmed_count=27, dry_run=False)
+        assert out["success"] is False
+        assert out["staged"] is False
+        assert "does not match" in out["message"]
+        assert fake.writes() == []
+
+    def test_matching_confirmed_count_writes(self):
+        many = _many_orders()
+        wave = _wave_resp(wave_id=9001, orders=[_wave_order(num, guid) for guid, num in many.values()])
+        fake = FakeLinnworks(orders=many, waves={9001: wave},
+                             headers={"Unallocated": [{"PickingWaveId": 9001, "State": "Unallocated"}]})
+        fake.on_write["Picking/DeleteOrdersFromPickingWaves"] = _delete_removes(fake)
+        with fake.active():
+            out = server.remove_orders_from_pick_waves(list(many), confirmed_count=26, dry_run=False)
+        assert len(fake.writes()) == 1
+        assert len(_body(fake.writes()[0][2])["OrderIds"]) == 26
+        assert {r["outcome"] for r in out["results"]} == {"removed"}
+        assert out["complete"] is True
+
+    # M5 — Linnworks' delete is not location-scoped.
+    def test_not_found_note_says_the_delete_is_not_location_scoped(self):
+        fake = FakeLinnworks(orders=ORDERS, **_two_open_waves())
+        with fake.active():
+            out = server.remove_orders_from_pick_waves(["611387"])
+        note = out["manifest"][0]["note"]
+        assert note.startswith("Not found in any open wave at this location.")
+        assert "not location-scoped" in note
+
+    # I5 — the warning covers any started wave.
+    @pytest.mark.parametrize("state", ["InProgress", "Paused", "Complete", "Packing"])
+    def test_warns_when_the_holding_wave_has_started(self, state):
+        waves = {9001: _wave_resp(wave_id=9001, state=state, orders=[_wave_order(611385, GUID_A)])}
+        fake = FakeLinnworks(orders=ORDERS, waves=waves,
+                             headers={state: [{"PickingWaveId": 9001, "State": state}]})
+        with fake.active():
+            out = server.remove_orders_from_pick_waves(["611385"])
+        warning = out["manifest"][0]["warning"]
+        assert state in warning
+        assert "trolley" in warning
+
+    # I1 — a non-dict delete response never crashes; the read-back decides.
+    def test_list_response_falls_through_to_the_read_back(self):
+        fake = FakeLinnworks(orders=ORDERS, **_two_open_waves())
+        remove = _delete_removes(fake)
+
+        def handler(body):
+            remove({"OrderIds": [611385]})  # only 611385 actually leaves its wave
+            return ["ok"]
+        fake.on_write["Picking/DeleteOrdersFromPickingWaves"] = handler
+        with fake.active():
+            out = server.remove_orders_from_pick_waves(["611385", "611386"], dry_run=False)
+        outcomes = {r["num_order_id"]: r["outcome"] for r in out["results"]}
+        assert outcomes == {611385: "unconfirmed", 611386: "still_present"}
+        assert out["complete"] is False
+
+    # Deferred minor 11 — the read-back error is kept.
+    def test_readback_rate_limit_is_unconfirmed_with_the_reason(self):
+        fake = FakeLinnworks(orders=ORDERS, **_two_open_waves())
+        remove = _delete_removes(fake)
+
+        def handler(body):
+            reply = remove(body)
+            fake.raise_on["Picking/GetPickingWave"] = server.RateLimitError("quota exceeded")
+            return reply
+        fake.on_write["Picking/DeleteOrdersFromPickingWaves"] = handler
+        with fake.active():
+            out = server.remove_orders_from_pick_waves(["611385"], dry_run=False)
+        result = out["results"][0]
+        assert result["outcome"] == "unconfirmed"
+        assert result["readback_error"].startswith("rate limited:")
+        assert "quota exceeded" in result["readback_error"]
+        assert out["complete"] is False
+
+    def test_readback_error_is_kept_verbatim(self):
+        fake = FakeLinnworks(orders=ORDERS, **_two_open_waves())
+        remove = _delete_removes(fake)
+
+        def handler(body):
+            reply = remove(body)
+            fake.raise_on["Picking/GetPickingWave"] = RuntimeError("HTTP 500 — boom")
+            return reply
+        fake.on_write["Picking/DeleteOrdersFromPickingWaves"] = handler
+        with fake.active():
+            out = server.remove_orders_from_pick_waves(["611385"], dry_run=False)
+        assert out["results"][0]["outcome"] == "unconfirmed"
+        assert out["results"][0]["readback_error"] == "HTTP 500 — boom"
+
+    def test_removed_order_carries_no_readback_error(self):
+        fake = FakeLinnworks(orders=ORDERS, **_two_open_waves())
+        fake.on_write["Picking/DeleteOrdersFromPickingWaves"] = _delete_removes(fake)
+        with fake.active():
+            out = server.remove_orders_from_pick_waves(["611385"], dry_run=False)
+        assert "readback_error" not in out["results"][0]
