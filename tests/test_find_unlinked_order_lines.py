@@ -834,3 +834,182 @@ class TestClaudeMdRecordsTheLiveFindings:
         next_section_idx = claude_md.index("\n## ", do_not_work_idx + 1)
         do_not_work_section = claude_md[do_not_work_idx:next_section_idx]
         assert "Orders/UpdateOrderItem" not in do_not_work_section
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Issue #77 — internal marker/service SKUs are not_expected (reason internal_sku)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _orphan(sku):
+    """An orphaned-shape line: identity keys present but ItemSource blank."""
+    return _raw_item(sku, item_number=sku, item_source="", channel_sku=sku)
+
+
+def _classify_one(raw, is_channel_order=True):
+    rows = server._classify_order_line(server._flatten_order_item(raw), is_channel_order)
+    assert len(rows) == 1
+    return rows[0]
+
+
+def _scan(orders):
+    """Run the tool over processed orders, only_problems=False."""
+    dispatch = _make_dispatch(
+        processed_pages=[_processed_orders_page([
+            {"pkOrderID": o["OrderId"], "nOrderId": o["NumOrderId"],
+             "Source": o["GeneralInfo"]["Source"]}
+            for o in orders
+        ])],
+        order_details=orders,
+    )
+    with patch.object(server, "call_linnworks", side_effect=dispatch):
+        return server.find_unlinked_order_lines(
+            include_open=False, from_date="2026-08-01", to_date="2026-09-19",
+            only_problems=False,
+        )
+
+
+class TestInternalSkuConstant:
+    def test_constant_sits_beside_non_channel_sources(self):
+        assert isinstance(server._INTERNAL_SKUS, (set, frozenset))
+        assert server._INTERNAL_SKUS  # never silently empty
+
+    def test_entries_are_stored_casefolded(self):
+        assert all(s == s.casefold() for s in server._INTERNAL_SKUS)
+
+    def test_every_sku_from_the_issue_evidence_is_present(self):
+        """The six FULFILLED orders in the issue carried exactly these."""
+        for sku in ("royal-mail-placement", "APPLYGRIP", "vmn_griptape_black",
+                    "ven_ttool", "BuildMyBoard", "Check-notes"):
+            assert sku.casefold() in server._INTERNAL_SKUS
+
+    def test_source_comment_names_the_authoritative_repo(self):
+        import inspect
+        src = inspect.getsource(server)
+        idx = src.index("_INTERNAL_SKUS = {")
+        comment = src[max(0, idx - 1500):idx]
+        assert "order-sync-service" in comment
+        assert "authoritative" in comment
+        assert "changed together" in comment
+
+
+class TestClassifyInternalSku:
+    def test_orphaned_internal_line_is_not_expected_internal_sku(self):
+        row = _classify_one(_orphan("check-notes"))
+        assert row["status"] == "not_expected"
+        assert row["reason"] == "internal_sku"
+
+    @pytest.mark.parametrize("sku", ["APPLYGRIP", "Check-notes", "BuildMyBoard", "  Ven_TTool  "])
+    def test_matching_is_case_insensitive(self, sku):
+        row = _classify_one(_orphan(sku))
+        assert row["status"] == "not_expected"
+        assert row["reason"] == "internal_sku"
+
+    def test_genuine_orphan_is_still_unlinked(self):
+        row = _classify_one(UNLINKED_ITEM)
+        assert row["status"] == "unlinked"
+        assert row["reason"] is None
+
+    def test_internal_sku_that_is_linked_stays_linked(self):
+        raw = _raw_item("swh_GRIP_OPTION", item_number="17061777080566", item_source="SHOPIFY")
+        row = _classify_one(raw)
+        assert row["status"] == "linked"
+        assert row["reason"] is None
+
+    def test_internal_sku_composite_child_reports_composite_child(self):
+        """blackgrip-9x33 is on the internal list AND is the live composite
+        child example: the more specific reason (composite_child) wins."""
+        child = _orphan("blackgrip-9x33")
+        parent = _raw_item("swh_GRIP_OPTION", item_number="p1", item_source="SHOPIFY", sub_items=[child])
+        rows = server._classify_order_line(server._flatten_order_item(parent), True)
+        assert rows[0]["status"] == "linked"
+        assert rows[1]["status"] == "not_expected"
+        assert rows[1]["reason"] == "composite_child"
+
+    def test_internal_sku_on_manual_order_reports_manual_order(self):
+        row = _classify_one(_orphan("Check-notes"), is_channel_order=False)
+        assert row["status"] == "not_expected"
+        assert row["reason"] == "manual_order"
+
+    def test_internal_sku_with_fields_absent_stays_unknown(self):
+        row = _classify_one(_raw_item("Check-notes"))  # identity keys never returned
+        assert row["status"] == "unknown"
+        assert row["reason"] == "fields_absent"
+
+    @pytest.mark.parametrize("raw", [
+        {"Title": "no sku key", "ItemNumber": "", "ItemSource": ""},
+        {"SKU": None, "Title": "sku none", "ItemNumber": "", "ItemSource": ""},
+        {"SKU": "", "Title": "sku blank", "ItemNumber": "", "ItemSource": ""},
+    ])
+    def test_missing_sku_does_not_raise_and_classifies_as_today(self, raw):
+        row = _classify_one(raw)
+        assert row["status"] == "unlinked"
+        assert row["reason"] is None
+
+
+class TestFindUnlinkedOrderLinesInternalSku:
+    def test_internal_and_genuine_orphans_separate_in_one_scan(self):
+        order = _raw_order(
+            "guid-609368", 609368, "SHOPIFY", True,
+            [_orphan("vmn_griptape_black"), _orphan("ven_ttool"), _orphan("BuildMyBoard"),
+             UNLINKED_ITEM, LINKED_ITEM],
+        )
+        result = _scan([order])
+
+        assert result["counts"]["unlinked"] == 1
+        assert result["counts"]["not_expected"] == 3
+        assert result["counts"]["linked"] == 1
+        assert result["internal_sku_suppressed"] == 3
+
+        by_sku = {l["sku"]: l for l in result["orders"][0]["lines"]}
+        assert by_sku["IND-SKT-5149"]["status"] == "unlinked"
+        for sku in ("vmn_griptape_black", "ven_ttool", "BuildMyBoard"):
+            assert by_sku[sku]["status"] == "not_expected"
+            assert by_sku[sku]["reason"] == "internal_sku"
+
+    def test_suppressed_count_is_distinct_from_other_not_expected_reasons(self):
+        child = _orphan("blackgrip-9x33")
+        orders = [
+            _raw_order("guid-a", 610113, "SHOPIFY", True, [_orphan("Check-notes")]),
+            _raw_order("guid-b", 595169, "DIRECT", True, [_orphan("H159ORANGEL/XL")]),
+            _raw_order("guid-c", 605126, "SHOPIFY", True,
+                       [_raw_item("swh_GRIP_OPTION", item_number="p1", item_source="SHOPIFY",
+                                  sub_items=[child])]),
+        ]
+        result = _scan(orders)
+        assert result["counts"]["not_expected"] == 3
+        assert result["internal_sku_suppressed"] == 1
+        assert result["counts"]["unlinked"] == 0
+
+    def test_suppressed_count_present_and_zero_on_a_clean_scan(self):
+        result = _scan([_raw_order("guid-a", 1, "SHOPIFY", True, [LINKED_ITEM])])
+        assert result["internal_sku_suppressed"] == 0
+
+    def test_only_problems_drops_the_order_but_still_reports_the_suppression(self):
+        orders = [_raw_order("guid-a", 610693, "SHOPIFY", True, [_orphan("Check-notes")])]
+        dispatch = _make_dispatch(
+            processed_pages=[_processed_orders_page(
+                [{"pkOrderID": "guid-a", "nOrderId": 610693, "Source": "SHOPIFY"}]
+            )],
+            order_details=orders,
+        )
+        with patch.object(server, "call_linnworks", side_effect=dispatch):
+            result = server.find_unlinked_order_lines(
+                include_open=False, from_date="2026-08-01", to_date="2026-09-19",
+            )
+        assert result["orders"] == []
+        assert result["order_count_scanned"] == 1
+        assert result["internal_sku_suppressed"] == 1
+
+
+class TestInternalSkuDocstrings:
+    def test_tool_docstring_names_the_third_reason_and_its_coarseness(self):
+        doc = server.find_unlinked_order_lines.__doc__ or ""
+        assert "internal_sku" in doc
+        assert "internal_sku_suppressed" in doc
+        assert "coarse" in doc
+
+    def test_classifier_docstring_names_the_third_reason_and_ordering(self):
+        doc = server._classify_order_line.__doc__ or ""
+        assert "internal_sku" in doc
+        assert "checked LAST" in doc
+        assert "coarse" in doc

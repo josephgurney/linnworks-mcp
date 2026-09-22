@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.55.6"
+__version__ = "1.55.7"
 
 import json
 import os
@@ -6550,6 +6550,34 @@ def get_processed_order_items(
 # not the line's own blank fields, is what decides this bucket).
 _NON_CHANNEL_ORDER_SOURCES = {"", "DIRECT"}
 
+# Marker/service SKUs added deliberately in Linnworks to work around gaps in
+# its functionality (Check-notes flags an order whose notes need reading,
+# royal-mail-placement is a shipping placeholder, APPLYGRIP / BuildMyBoard /
+# swh_GRIP_OPTION are build-service options). They have no Shopify
+# counterpart by design, so a channel order carrying one always shows that
+# line with a blank channel reference — and it must never be "repaired"
+# (issue #77, owner-confirmed 18 Sep 2026).
+#
+# SOURCE OF TRUTH: order-sync-service's ordersync/config.py INTERNAL_SKUS is
+# the authoritative copy of this list. This is a second copy, and the two
+# MUST be changed together — no test here can check the other repo, so the
+# only guard against drift is this comment and the one at the other site.
+#
+# Stored casefolded; matching is case-insensitive (live data carries
+# APPLYGRIP, Check-notes and BuildMyBoard in mixed case). Suppression is by
+# SKU alone and so is coarse: ven_ttool and vmn_griptape_black are also
+# ordinary sellable products, and a real customer line for one of them that
+# has lost its channel link is suppressed along with the service uses.
+_INTERNAL_SKUS = {
+    "check-notes", "applygrip", "buildmyboard", "ven_ttool", "vmn_griptape_black",
+    "blackgrip-9x33", "royal-mail-placement", "swh_grip_option", "service",
+}
+
+
+def _is_internal_sku(sku: str | None) -> bool:
+    """True when a line's SKU is one of _INTERNAL_SKUS. None/blank is never internal."""
+    return bool(sku) and sku.strip().casefold() in _INTERNAL_SKUS
+
 
 def _is_channel_order_source(source: str | None) -> bool:
     """True when an order's Source represents a real channel download."""
@@ -6579,16 +6607,26 @@ def _classify_order_line(
                         channel reference: a composite child (the parent line
                         carries the link, not the child), or any line on an
                         order whose own Source is not a channel download
-                        (manually created / phone / DIRECT orders). Excluded
+                        (manually created / phone / DIRECT orders), or a
+                        channel-order line whose SKU is an internal
+                        marker/service SKU (_INTERNAL_SKUS) that has no
+                        storefront counterpart by design. Excluded
                         from the unlinked count so that number means "lines
                         that should be linked and are not" — a manually
-                        created order or an upsell composite component looking
-                        unlinked is not a fault.
+                        created order, an upsell composite component or a
+                        Check-notes marker looking unlinked is not a fault.
 
     Precedence matters: a composite child on a manual order is still
     `composite_child`, not `manual_order` — either reason alone is sufficient
     to explain why the line was never expected to carry a link, and the more
-    specific one (composite_child) is reported first.
+    specific one (composite_child) is reported first. The third reason,
+    `internal_sku`, is checked LAST and only where a line would otherwise be
+    `unlinked`: an internal SKU that is a composite child stays
+    `composite_child`, one on a manual order stays `manual_order`, one that
+    does carry a real channel reference stays `linked`, and one whose channel
+    fields are absent entirely stays `unknown`. Suppression is by SKU alone,
+    so it is coarse — a genuine sale of an internal SKU that is also sold as
+    a product (ven_ttool, vmn_griptape_black) is suppressed too.
     """
     channel_line_id = flat_item.get("channel_line_id")
     channel_line_source = flat_item.get("channel_line_source")
@@ -6600,7 +6638,10 @@ def _classify_order_line(
     elif channel_line_id is None and channel_line_source is None:
         status, reason = "unknown", "fields_absent"
     elif not (channel_line_source or "").strip():
-        status, reason = "unlinked", None
+        if _is_internal_sku(flat_item.get("sku")):
+            status, reason = "not_expected", "internal_sku"
+        else:
+            status, reason = "unlinked", None
     else:
         status, reason = "linked", None
 
@@ -6659,8 +6700,20 @@ def find_unlinked_order_lines(
     A line is classified `not_expected` — and excluded from the `unlinked`
     count — when it was never expected to carry its own channel reference:
     a composite child, or any line on an order whose own Source is not a
-    channel download (e.g. a manually created "DIRECT" order). Without this
-    bucket, `unlinked` would be swamped by lines that were never broken.
+    channel download (e.g. a manually created "DIRECT" order), or a line
+    whose SKU is an internal marker/service SKU (Check-notes, APPLYGRIP,
+    royal-mail-placement, ...) that has no storefront counterpart by design
+    (reason `internal_sku`). Without this bucket, `unlinked` would be swamped
+    by lines that were never broken.
+
+    `internal_sku` only ever applies where a line would otherwise be
+    `unlinked`: a composite child or manual-order line keeps its own reason,
+    a line that does carry a channel reference stays `linked`, and a line
+    whose fields are absent stays `unknown`. It is decided by SKU alone, so
+    it is coarse — ven_ttool and vmn_griptape_black are also sold as
+    products, and a genuine orphaned sale of one is suppressed with the rest.
+    Every suppressed line is counted in `internal_sku_suppressed`, so a scan
+    never hides findings without saying how many.
 
     A line is classified `unknown` — also excluded from `unlinked` — only
     when the raw order data never carried the identity fields at all (as
@@ -6708,6 +6761,11 @@ def find_unlinked_order_lines(
             response is only counted once
           - counts: {linked, unlinked, unknown, not_expected} totals across
             every line in every classified order
+          - internal_sku_suppressed: how many of the not_expected lines are
+            there only because their SKU is an internal marker/service SKU
+            (reason `internal_sku`) — lines that would otherwise have been
+            counted unlinked. Reported separately because only_problems can
+            drop such an order from `orders` entirely
           - orders: per-order rows (order_id, num_order_id, reference_num,
             source, processed, lines), each line row carrying sku, title,
             channel_line_id, channel_line_source, channel_sku,
@@ -6783,6 +6841,7 @@ def find_unlinked_order_lines(
 
     guids = list(order_meta.keys())
     counts = {"linked": 0, "unlinked": 0, "unknown": 0, "not_expected": 0}
+    internal_sku_suppressed = 0
     order_rows: list[dict] = []
     rate_limited_orders: list[dict] = []
     missing_orders: list[dict] = []
@@ -6837,6 +6896,8 @@ def find_unlinked_order_lines(
 
             for line in lines:
                 counts[line["status"]] += 1
+                if line["reason"] == "internal_sku":
+                    internal_sku_suppressed += 1
 
             order_rows.append({
                 "order_id": guid,
@@ -6870,6 +6931,7 @@ def find_unlinked_order_lines(
         "only_problems": only_problems,
         "order_count_scanned": order_count_scanned,
         "counts": counts,
+        "internal_sku_suppressed": internal_sku_suppressed,
         "orders": order_rows,
         "rate_limited_orders": rate_limited_orders,
         "missing_orders": missing_orders,
