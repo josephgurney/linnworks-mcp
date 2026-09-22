@@ -7695,29 +7695,7 @@ def check_orders_pickable(order_ids: list[str]) -> dict:
             Linnworks' full retry ladder — order_id and reason
           - complete: False if resolve_errors or rate_limited is non-empty
     """
-    resolved: list[tuple[str, int, str]] = []  # (input_order_id, num_order_id, order_guid)
-    resolve_errors: list[dict] = []
-    rate_limited: list[dict] = []
-
-    for order_id in order_ids:
-        try:
-            order_guid, raw = _resolve_order_guid(order_id)
-        except RateLimitError as exc:
-            rate_limited.append({"order_id": order_id, "reason": str(exc)})
-            continue
-        except RuntimeError as exc:
-            resolve_errors.append({"order_id": order_id, "reason": str(exc)})
-            continue
-
-        num_order_id = raw.get("NumOrderId")
-        if num_order_id is None:
-            resolve_errors.append({
-                "order_id": order_id,
-                "reason": f"Order '{order_id}' resolved but carries no NumOrderId.",
-            })
-            continue
-
-        resolved.append((order_id, num_order_id, order_guid))
+    resolved, resolve_errors, rate_limited = _resolve_order_numbers(order_ids)
 
     results: list[dict] = []
 
@@ -7927,6 +7905,169 @@ def get_pick_wave_detail(picking_wave_id: int) -> dict:
             "complete": True,
         }
     return {**detail, "found": True, "rate_limited": False, "complete": True}
+
+
+_PICK_WAVE_SETTABLE_STATES = ("Abandoned", "Paused", "Unallocated")
+_PICK_WAVE_OPEN_STATES = ("Unallocated", "Allocated", "InProgress", "Paused", "Complete", "Packing")
+_PICK_WAVE_SORTING_TYPES = ("BinPriority", "OrderView")
+_PICK_WAVE_GROUP_TYPES = ("Items", "Orders")
+_FIFO_READY_TAG = "FIFO_READY"
+
+# Whether each Picking write endpoint takes the {"request": {...}} wrapper.
+# DeleteOrdersFromPickingWaves' spec schema has an explicit `request`
+# property, so it is wrapped. GeneratePickingWave and UpdatePickingWaveHeader
+# are UNVERIFIED until their first live call (#67 live proof); the sibling
+# CheckAllocatableToPickwave needs the wrapper, so that is the starting guess.
+# Set each entry from live evidence and record it in CLAUDE.md.
+_PICKING_WRITE_WRAPPED: dict[str, bool] = {
+    "Picking/GeneratePickingWave": True,
+    "Picking/UpdatePickingWaveHeader": True,
+    "Picking/DeleteOrdersFromPickingWaves": True,
+}
+
+
+def _picking_write(path: str, body: dict) -> dict:
+    """POST a Picking write body, wrapped or not per _PICKING_WRITE_WRAPPED."""
+    payload = {"request": body} if _PICKING_WRITE_WRAPPED[path] else body
+    return call_linnworks(path, payload)
+
+
+def _as_int(value) -> int | None:
+    """int(value), or None if it isn't one."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_order_numbers(order_ids: list) -> tuple[list[tuple], list[dict], list[dict]]:
+    """
+    Resolve GUID-or-numeric order ids to (input_id, NumOrderId, order GUID).
+
+    Returns (resolved, resolve_errors, rate_limited). Never raises for a
+    per-id failure: an unknown id goes to resolve_errors, and a throttle goes
+    to rate_limited — never folded into "not found" (#34/#37). Shared by
+    check_orders_pickable and the #67 write tools.
+    """
+    resolved: list[tuple] = []
+    resolve_errors: list[dict] = []
+    rate_limited: list[dict] = []
+    for order_id in order_ids:
+        try:
+            order_guid, raw = _resolve_order_guid(str(order_id))
+        except RateLimitError as exc:
+            rate_limited.append({"order_id": order_id, "reason": str(exc)})
+            continue
+        except RuntimeError as exc:
+            resolve_errors.append({"order_id": order_id, "reason": str(exc)})
+            continue
+        num_order_id = raw.get("NumOrderId")
+        if num_order_id is None:
+            resolve_errors.append({
+                "order_id": order_id,
+                "reason": f"Order '{order_id}' resolved but carries no NumOrderId.",
+            })
+            continue
+        resolved.append((order_id, num_order_id, order_guid))
+    return resolved, resolve_errors, rate_limited
+
+
+def _fetch_picker_roster() -> dict[int, str | None]:
+    """
+    user_id -> email for every warehouse user a wave can be assigned to.
+
+    Source: Picking/GetPickwaveUsersWithSummary with state=Unallocated, which
+    returns one row per registered user plus any unassigned wave rows
+    (UserId null) — live 22 Sep 2026: 15 users, e.g. warehouse+01 = 68. Lets
+    RateLimitError propagate.
+    """
+    resp = call_linnworks_get(
+        "Picking/GetPickwaveUsersWithSummary",
+        _pick_wave_query_params("Unallocated", None, None),
+    )
+    roster: dict[int, str | None] = {}
+    for row in (resp.get("PickingWaves") or []) if isinstance(resp, dict) else []:
+        user_id = row.get("UserId")
+        if isinstance(user_id, int) and not isinstance(user_id, bool) and user_id > 0:
+            roster.setdefault(user_id, row.get("EmailAddress"))
+    return roster
+
+
+def _fetch_fifo_ready_guids(order_guids: list[str]) -> set[str]:
+    """
+    Lower-cased GUIDs of the orders carrying the FIFO_READY identifier.
+
+    OpenOrders/GetIdentifiersByOrderIds, sent UNWRAPPED as {"OrderIds": [guid]}
+    — the {"request": ...} form 400s "OrderIds not provided in request" (live,
+    22 Sep 2026). Returns a flat list of {fkOrderId, IdentifierId, IsCustom,
+    Tag}. Chunked at 100, like the FIFO worker. Lets RateLimitError and
+    RuntimeError propagate.
+    """
+    ready: set[str] = set()
+    for start in range(0, len(order_guids), 100):
+        chunk = order_guids[start:start + 100]
+        resp = call_linnworks("OpenOrders/GetIdentifiersByOrderIds", {"OrderIds": chunk})
+        for row in resp if isinstance(resp, list) else []:
+            if str(row.get("Tag", "")).strip().upper() == _FIFO_READY_TAG:
+                ready.add(str(row.get("fkOrderId", "")).lower())
+    return ready
+
+
+def _check_pickable_numbers(num_ids: list[int]) -> dict[int, dict]:
+    """
+    NumOrderId -> {"pickable": bool, "errors": [...]} via
+    Picking/CheckAllocatableToPickwave (wrapped; proven side-effect free in
+    v1.54.0). Lets RateLimitError propagate.
+    """
+    if not num_ids:
+        return {}
+    resp = call_linnworks(
+        "Picking/CheckAllocatableToPickwave", {"request": {"OrderIds": num_ids}}
+    )
+    return {
+        r.get("OrderId"): {"pickable": not r.get("HasErrors"), "errors": r.get("Errors") or []}
+        for r in (resp.get("Results") or [])
+    }
+
+
+def _find_wave_header(
+    picking_wave_id: int, state: str, location_id: str = DEFAULT_LOCATION_ID
+) -> dict | None:
+    """
+    The formatted header for one wave, from GetAllPickingWaveHeaders(state=).
+    This is how a wave that GetPickingWave no longer returns (an Abandoned one)
+    gets read back. None if the wave isn't in that state's list. Lets
+    RateLimitError propagate.
+    """
+    resp = call_linnworks_get(
+        "Picking/GetAllPickingWaveHeaders", {"state": state, "locationId": location_id}
+    )
+    for row in (resp.get("PickwaveHeaders") or []) if isinstance(resp, dict) else []:
+        if row.get("PickingWaveId") == picking_wave_id:
+            return _format_pick_wave(row)
+    return None
+
+
+def _pick_wave_preflight_throttled(rate_limited: list[dict]) -> dict:
+    """The response when a pre-write read is rate limited: nothing is written."""
+    return {
+        "success": False,
+        "rate_limited": rate_limited,
+        "complete": False,
+        "message": (
+            "Linnworks' rate limit was hit during the checks before writing. "
+            "Nothing was written. Wait a minute and call again."
+        ),
+    }
+
+
+def _pick_wave_unknown_user(user_id, roster: dict) -> dict:
+    """The refusal for a user_id that isn't on the live picker roster."""
+    known = ", ".join(f"{uid} ({email})" for uid, email in sorted(roster.items()))
+    return {
+        "success": False,
+        "error": f"user_id {user_id} is not a Linnworks picker. Known pickers: {known}",
+    }
 
 
 @mcp.tool()

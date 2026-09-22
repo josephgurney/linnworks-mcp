@@ -232,3 +232,90 @@ class TestGetPickWaveDetail:
     def test_is_a_read_tool(self):
         assert "dry_run" not in inspect.signature(server.get_pick_wave_detail).parameters
         assert "get_pick_wave_detail" not in server.WRITE_THRESHOLDS
+
+
+# ── Shared pre-write helpers ────────────────────────────────────────────────
+
+class TestSharedHelpers:
+
+    def test_resolve_order_numbers_splits_resolved_from_errors(self):
+        fake = FakeLinnworks(orders={"611385": (GUID_A, 611385)})
+        with fake.active():
+            resolved, errors, limited = server._resolve_order_numbers(["611385", "999"])
+        assert resolved == [("611385", 611385, GUID_A)]
+        assert [e["order_id"] for e in errors] == ["999"]
+        assert limited == []
+
+    def test_resolve_order_numbers_accepts_ints(self):
+        fake = FakeLinnworks(orders={"611385": (GUID_A, 611385)})
+        with fake.active():
+            resolved, _, _ = server._resolve_order_numbers([611385])
+        assert resolved == [(611385, 611385, GUID_A)]
+
+    def test_resolve_order_numbers_reports_rate_limit_separately(self):
+        fake = FakeLinnworks(raise_on={"resolve": server.RateLimitError("quota exceeded")})
+        with fake.active():
+            resolved, errors, limited = server._resolve_order_numbers(["611385"])
+        assert resolved == []
+        assert errors == []
+        assert limited == [{"order_id": "611385", "reason": "quota exceeded"}]
+
+    def test_picker_roster_skips_unassigned_rows_and_asks_for_unallocated(self):
+        with FakeLinnworks().active() as fake:
+            roster = server._fetch_picker_roster()
+        assert roster == {
+            19: "jo@thewarehousegroup.co.uk",
+            68: "warehouse+01@thewarehousegroup.co.uk",
+        }
+        params = [c[2] for c in fake.calls if c[1] == "Picking/GetPickwaveUsersWithSummary"][0]
+        assert params["state"] == "Unallocated"
+
+    def test_fifo_ready_read_is_unwrapped(self):
+        fake = FakeLinnworks(fifo_ready=[GUID_A])
+        with fake.active():
+            ready = server._fetch_fifo_ready_guids([GUID_A, GUID_B])
+        assert ready == {GUID_A}
+        call = [c for c in fake.calls if c[1] == "OpenOrders/GetIdentifiersByOrderIds"][0]
+        assert call[2] == {"OrderIds": [GUID_A, GUID_B]}
+
+    def test_fifo_ready_read_chunks_at_100(self):
+        guids = [f"{i:08d}-0000-0000-0000-000000000000" for i in range(150)]
+        with FakeLinnworks().active() as fake:
+            server._fetch_fifo_ready_guids(guids)
+        sizes = [len(c[2]["OrderIds"]) for c in fake.calls
+                 if c[1] == "OpenOrders/GetIdentifiersByOrderIds"]
+        assert sizes == [100, 50]
+
+    def test_check_pickable_numbers_maps_linnworks_errors(self):
+        err = [{"Error": "Order doesn't exist", "ErrorType": "OrderDoesntExist"}]
+        with FakeLinnworks(unpickable={2: err}).active():
+            out = server._check_pickable_numbers([1, 2])
+        assert out == {1: {"pickable": True, "errors": []}, 2: {"pickable": False, "errors": err}}
+
+    def test_check_pickable_numbers_makes_no_call_for_an_empty_list(self):
+        with FakeLinnworks().active() as fake:
+            assert server._check_pickable_numbers([]) == {}
+        assert fake.calls == []
+
+    def test_find_wave_header_reads_the_state_list(self):
+        hdr = {"PickingWaveId": 7, "State": "Abandoned", "LocationId": DEFAULT}
+        with FakeLinnworks(headers={"Abandoned": [hdr]}).active():
+            assert server._find_wave_header(7, "Abandoned")["picking_wave_id"] == 7
+            assert server._find_wave_header(8, "Abandoned") is None
+
+    def test_picking_write_follows_the_per_endpoint_wrapper_setting(self):
+        fake = FakeLinnworks(on_write={"Picking/DeleteOrdersFromPickingWaves": lambda b: {}})
+        with fake.active():
+            server._picking_write("Picking/DeleteOrdersFromPickingWaves", {"OrderIds": [1]})
+        raw = fake.writes()[0][2]
+        wrapped = server._PICKING_WRITE_WRAPPED["Picking/DeleteOrdersFromPickingWaves"]
+        assert ("request" in raw) is wrapped
+        assert _body(raw) == {"OrderIds": [1]}
+
+    def test_settable_states_are_exactly_the_three_agreed(self):
+        assert server._PICK_WAVE_SETTABLE_STATES == ("Abandoned", "Paused", "Unallocated")
+
+    def test_as_int(self):
+        assert server._as_int("611385") == 611385
+        assert server._as_int(None) is None
+        assert server._as_int("x") is None
