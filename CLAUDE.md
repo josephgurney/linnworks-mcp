@@ -1,6 +1,6 @@
 # Linnworks MCP Server — Claude context
 
-**Current version: 1.55.11** — 98 tools. See `pyproject.toml` for full metadata.
+**Current version: 1.56.0** — 98 tools. See `pyproject.toml` for full metadata.
 
 ---
 
@@ -368,6 +368,16 @@ def set_stock_levels(updates: list[dict], confirmed_count: int | None = None, dr
 ## Tools
 
 98 tools. `python server.py --list-tools` is the authoritative count; see `server.py` for full docstrings and parameter details.
+
+> **v1.56.0 (issue #67) — pickwave write tools: `generate_pick_waves`, `update_pick_wave`, `remove_orders_from_pick_waves`, plus the `get_pick_wave_detail` read (22 Sep 2026):** The write half split from #64. Built from `docs/superpowers/specs/2026-09-22-pickwave-write-tools-design.md` via the plan in `docs/superpowers/plans/2026-09-22-pickwave-write-tools.md`. **Found read-only before design, all on 22 Sep 2026:**
+> - `GetPickingWave` returns full order and item detail for a LIVE wave; the v1.54.0 "returns zero" note only ever tested finished waves.
+> - The header state filter does discriminate among live states: Unallocated → 2 waves, InProgress → 1, Allocated → 0.
+> - `GeneratePickingWavesNode` is held, because both reads gated on it work.
+> - Picker ids come from the roster: `warehouse+01`–`+05` = 68, 69, 70, 71, 73.
+> - FIFO_READY is readable via `OpenOrders/GetIdentifiersByOrderIds` (UNWRAPPED; the wrapper 400s "OrderIds not provided in request").
+> - Wave `Bins[]` carries real bin codes, even though `GetItemBinracks` can't return any here.
+>
+> **Design decisions (owner):** trolley planning deferred to a follow-up; one `GeneratePickingWave` per wave, because the batch form needs every order line's row id; FIFO_READY warns and doesn't block; only Abandoned/Paused/Unallocated are settable; weight and dimensions deferred. **Two traps designed around:** an abandoned wave drops out of `GetPickingWave`, so its read-back uses the Abandoned header list; and the spec only promises that a null `UserId` keeps the picker, so `update_pick_wave` always sends `State` and carries StartTime/EndTime through. A plain Linnworks error during any pre-write read (picker roster, pickability, wave lookup) returns a structured refusal saying nothing was written, instead of an unhandled exception. Thresholds: generate 25 orders, remove 25 orders, update none (single wave). 98 tools.
 
 > **v1.55.11 — `unpublish_channel_listing`'s docstring stops saying Amazon and TikTok deletes are unproven (22 Sep 2026):** Text-only; no behaviour change. The docstring still said Delete was "live-proven on SHOPIFY only (v1.25.0)" and told the reader to prove Amazon on a throwaway listing first, though Amazon was proven in v1.32.0 (5 Aug 2026) and TikTok in v1.42.0 (7 Aug 2026). The runtime warnings were already right, because they come from `GLT_CHANNELS` through `_proven_delete_channels()`. Only the docstring, which Claude reads when choosing and using the tool, had been left behind: the same drift the hard-coded "only Shopify is" string caused before v1.42.0. It now names the three proven channels with their dates and templates, says neither `NextSuggestedAction` nor `Status` gates a Delete, and says Magento and Walmart are unproven. A new `test_docs_consistency.py` guard reads `GLT_CHANNELS` and fails if the docstring calls a proven channel unproven, or leaves one out.
 
