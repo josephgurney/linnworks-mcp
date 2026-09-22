@@ -340,14 +340,21 @@ def test_resend_is_sent_to_linnworks_as_paid_because_the_enum_has_no_resend():
     assert any("TWO writes" in w for w in r["warnings"])
 
 
-def test_channel_source_warns_about_the_orphaned_line_consequence():
-    r = _run(source="AMAZON")
-    assert any("ORPHANED" in w for w in r["warnings"])
+def test_untested_channel_source_warns_it_may_be_refused():
+    """Issue #71: the old warning claimed the lines would read as ORPHANED.
+    That was never observed, and AMAZON turned out to be refused outright,
+    so the warning now says the source may be refused and the line
+    classification is unverified."""
+    r = _run(source="SHOPIFY")
+    w = " ".join(r["warnings"])
+    assert "may be refused" in w
+    assert "unverified" in w
+    assert "ORPHANED" not in w
 
 
-def test_direct_source_produces_no_orphan_warning():
+def test_direct_source_produces_no_channel_source_warning():
     r = _run(source="DIRECT")
-    assert not any("ORPHANED" in w for w in r["warnings"])
+    assert not any("may be refused" in w for w in r["warnings"])
 
 
 # ── Totals ───────────────────────────────────────────────────────────────────
@@ -659,3 +666,97 @@ def test_wrong_confirmed_count_is_refused():
         r = server.create_order(items=many, delivery_address=ADDRESS,
                                 confirmed_count=5, dry_run=False)
     assert r.get("success") is False
+
+
+# ── Issue #71: reserved sources and the location name ────────────────────────
+
+import pytest
+
+
+@pytest.mark.parametrize("source", ["AMAZON", "amazon", " Amazon "])
+def test_amazon_source_is_refused_before_any_call(source):
+    with patch.object(server, "call_linnworks") as post, \
+         patch.object(server, "call_linnworks_get") as get, \
+         patch.object(server, "_resolve_sku_to_id") as resolve:
+        r = server.create_order(items=ITEMS, delivery_address=ADDRESS, source=source, dry_run=True)
+    assert r["status"] == "error"
+    assert r["reserved_source"] is True
+    assert "DIRECT" in r["error"]
+    post.assert_not_called()
+    get.assert_not_called()
+    resolve.assert_not_called()
+
+
+def test_amazon_source_is_refused_on_a_live_run_too():
+    r = _run(source="AMAZON", dry_run=False)
+    assert r["status"] == "error"
+    assert r["reserved_source"] is True
+
+
+def test_live_reserved_source_refusal_from_linnworks_is_reported_clearly():
+    msg = ("Linnworks Orders/CreateOrders failed: HTTP 400 — {\"Code\":null,\"Message\":"
+           "\"Order of Source SHOPIFY cannot be saved due to being reserved for linnworks "
+           "integrated channels\"}")
+    r = _run(source="SHOPIFY", dry_run=False, _raise=RuntimeError(msg))
+    assert r["status"] == "error"
+    assert r["reserved_source"] is True
+    assert "Nothing was created" in r["error"]
+    assert "reserved" in r["error"]
+
+
+def test_other_create_failures_are_not_mistaken_for_a_reserved_source():
+    r = _run(dry_run=False, _raise=RuntimeError("HTTP 400 request is missing"))
+    assert r["status"] == "error"
+    assert "reserved_source" not in r
+
+
+@pytest.mark.parametrize("location", [server.DEFAULT_LOCATION_ID, "Default", "default", ""])
+def test_default_location_is_sent_as_the_name_default(location):
+    """v1.55.1 found the GUID returns 'Location not found.'; 'Default' works."""
+    captured, r = _capture_payload(location_id=location)
+    assert captured["payload"]["location"] == "Default"
+    assert r["manifest"]["location_sent_to_linnworks"] == "Default"
+
+
+def test_default_location_is_the_default_argument_and_is_sent_as_a_name():
+    captured, _ = _capture_payload()
+    assert captured["payload"]["location"] == "Default"
+    assert captured["payload"]["location"] != server.DEFAULT_LOCATION_ID
+
+
+LOCATIONS = [
+    {"StockLocationId": server.DEFAULT_LOCATION_ID, "LocationName": "Default"},
+    {"StockLocationId": "e1db16df-581d-4e11-bc57-077aab68cad3", "LocationName": "Core"},
+]
+
+
+@pytest.mark.parametrize("given", ["E1DB16DF-581D-4E11-BC57-077AAB68CAD3", "core", "Core"])
+def test_other_location_resolves_to_the_tenants_own_name(given):
+    with patch.object(server, "call_linnworks_get", return_value=LOCATIONS):
+        name, err = server._create_order_location_name(given)
+    assert err is None
+    assert name == "Core"
+
+
+def test_unknown_location_is_refused_before_any_write():
+    def fake_get(path, params=None):
+        if path == "Inventory/GetStockLocations":
+            return LOCATIONS
+        raise AssertionError(path)
+    with patch.object(server, "call_linnworks_get", side_effect=fake_get), \
+         patch.object(server, "call_linnworks") as post, \
+         patch.object(server, "_resolve_sku_to_id") as resolve:
+        r = server.create_order(items=ITEMS, delivery_address=ADDRESS,
+                                location_id="Narnia", dry_run=False)
+    assert r["status"] == "error"
+    assert "Narnia" in r["error"]
+    post.assert_not_called()
+    resolve.assert_not_called()
+
+
+def test_rate_limited_location_lookup_is_not_reported_as_unknown():
+    with patch.object(server, "call_linnworks_get", side_effect=server.RateLimitError("429")):
+        name, err = server._create_order_location_name("Core")
+    assert name is None
+    assert "Rate limited" in err
+    assert "not one of this tenant" not in err
