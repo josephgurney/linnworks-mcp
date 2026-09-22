@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.55.9"
+__version__ = "1.55.10"
 
 import json
 import os
@@ -4068,16 +4068,19 @@ def relink_order_line(
 
 # ── create_order — manual / CS-replacement orders (issue #68) ─────────────────
 #
-# ⚠️  Orders/CreateOrders has NEVER been fired on this tenant. Not a 400-probe,
-#     nothing. Schema-valid is not works-here (GetOpenOrders, GetOpenOrderIds).
-#     Every live result is reported "unconfirmed", never "success".
+# Orders/CreateOrders is LIVE-PROVEN on this tenant (v1.55.1/v1.55.2, 18 Sep
+# 2026): all three payment paths were fired against real orders on the
+# Default location, read back and cancelled — paid (611394), resend (611397)
+# and unpaid (611398). Every live result is still reported "unconfirmed",
+# never "success": a 2xx says Linnworks accepted THIS payload, and the
+# read-back is what shows the order is right.
 #
-# Three payload questions the first live call must settle:
+# The three payload questions the first live call settled:
 #   1. Wrapper or not. The swagger body parameter is named
 #      Orders_CreateOrdersRequest, but that name is NOT the wire key —
 #      Listings/GeteBayTemplates taught us that (its real key was "parameters").
 #      We send UNWRAPPED {"orders": [...], "location": ...}, matching the rest
-#      of the Orders/ family.
+#      of the Orders/ family. SETTLED 18 Sep 2026 (v1.55.1): unwrapped works.
 #   2. What "location" is. Typed `string` in the spec, not `uuid` — unlike
 #      CreateNewOrder's `fulfilmentCenter`, which IS a uuid. SETTLED 18 Sep
 #      2026 (v1.55.1): it wants the location NAME. The zero GUID returns HTTP
@@ -4085,11 +4088,11 @@ def relink_order_line(
 #      but the code kept sending the GUID until issue #71 (22 Sep 2026), so
 #      every call on the default location failed. _create_order_location_name
 #      now translates.
-#   3. Whether PricePerUnit is read as tax-inclusive. `TaxCostInclusive` exists
-#      on ChannelOrderItem but its effect is unverified here, and this codebase
-#      has already been burned once by a tax-inclusivity assumption
-#      (PO line Cost, issue #15). Exposed as prices_include_tax, defaulted to
-#      True for UK retail, and flagged in the manifest as UNVERIFIED.
+#   3. Whether PricePerUnit is read as tax-inclusive. SETTLED for the default
+#      18 Sep 2026 (v1.55.1): with TaxCostInclusive true, £1.95 at 20% came
+#      back as subtotal 1.625 / tax 0.325 / total 1.95, so the issue #15
+#      PO-Cost trap did not repeat. prices_include_tax=False has never been
+#      sent live and remains unverified.
 
 # Order Sources Linnworks refuses to let CreateOrders save. Live-confirmed
 # 22 Sep 2026 (issue #71): source "AMAZON" returned HTTP 400 "Order of Source
@@ -4136,11 +4139,14 @@ def _create_order_location_name(location: str) -> tuple[str | None, str | None]:
     )
 
 
+# Key name kept as `unproven_endpoint_warning` on the response so nothing
+# reading it breaks; the text reflects the 18 Sep 2026 live proofs.
 _CREATE_ORDER_UNPROVEN_WARNING = (
-    "Orders/CreateOrders has never been fired on this tenant. A 2xx means "
-    "Linnworks ACCEPTED the payload — it is not proof the order was created "
-    "as intended. Read the order back and check it in the Linnworks UI before "
-    "letting it pick."
+    "Orders/CreateOrders is live-proven on this tenant (paid, resend and unpaid, "
+    "18 Sep 2026, Default location), but a 2xx only means Linnworks ACCEPTED "
+    "this payload — it is not proof this order was created as intended. Check "
+    "the read-back (state, total, lines) and the order in the Linnworks UI "
+    "before letting it pick."
 )
 
 # ChannelAddress ← the snake_case keys this tool accepts.
@@ -4275,11 +4281,12 @@ def create_order(
         checks for a duplicate reference and shows the exact order that would be
         created, writing nothing. Set dry_run=False only after reading that.
 
-    ⚠️  NOT LIVE-PROVEN. Orders/CreateOrders has never been fired on this tenant.
-        A 2xx means Linnworks accepted the payload, not that the order is right —
-        so every live result is reported as "unconfirmed", never "success", and
-        the order is read back and reported verbatim. Check it in the UI before
-        letting it pick.
+    ✅  LIVE-PROVEN 18 Sep 2026 on the Default location: paid, resend and
+        unpaid orders were each created, read back and cancelled. A 2xx still
+        only means Linnworks accepted the payload, not that THIS order is
+        right — so every live result is reported as "unconfirmed", never
+        "success", and the order is read back and reported verbatim. Check it
+        in the UI before letting it pick.
 
     Args:
         items: JSON array of lines. Each needs "sku", "quantity", "price"
@@ -4327,11 +4334,10 @@ def create_order(
         payment_method: Payment method NAME, validated the same way.
         postage_cost: Postage charged, inclusive of tax.
         prices_include_tax: Whether "price" on each line is tax-INCLUSIVE.
-            Defaults True (UK retail). ⚠️ UNVERIFIED — maps to ChannelOrderItem
-            .TaxCostInclusive, whose effect has not been confirmed on this
-            tenant, and this codebase has already been burned by a tax
-            inclusivity assumption once (PO line Cost, issue #15). Check the
-            totals on the first order you create.
+            Defaults True (UK retail). Maps to ChannelOrderItem
+            .TaxCostInclusive. True is verified live (18 Sep 2026: £1.95 at
+            20% came back as 1.625 + 0.325 tax = 1.95). ⚠️ False has never
+            been sent live — check the totals if you use it.
         dispatch_by: When the order must be dispatched by, ISO format
             (e.g. "2026-09-19" or "2026-09-19T14:00:00"). ⚠️ REQUIRED BY
             LINNWORKS even though the spec documents it as an ordinary optional
@@ -4668,8 +4674,11 @@ def create_order(
         "location_sent_to_linnworks": location_name,
         "prices_include_tax": prices_include_tax,
         "tax_note": (
-            "prices_include_tax maps to ChannelOrderItem.TaxCostInclusive, whose effect is "
-            "UNVERIFIED on this tenant. Check the tax and totals on the created order."
+            "prices_include_tax=True (TaxCostInclusive) is verified live: prices are read as "
+            "tax-inclusive. False has never been sent live — check the totals if you use it."
+            if prices_include_tax else
+            "⚠️ prices_include_tax=False has never been sent live on this tenant (True is "
+            "verified). Check the tax and totals on the created order."
         ),
         "delivery_address": delivery,
         "billing_address": billing,
@@ -4715,7 +4724,8 @@ def create_order(
         # Link lines to stock by SKU so they don't land unlinked (issue #52).
         "AutomaticallyLinkBySKU": True,
         # We are acting as the channel and supplying explicit tax rates, so use
-        # them rather than letting Linnworks silently recompute. UNVERIFIED.
+        # them rather than letting Linnworks silently recompute. Held on the
+        # 18 Sep 2026 proof order (20% rate applied as sent).
         "UseChannelTax": True,
         "OrderItems": [
             {

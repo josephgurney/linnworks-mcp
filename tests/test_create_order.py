@@ -475,8 +475,30 @@ def test_live_result_is_unconfirmed_never_success():
 
 
 def test_live_result_carries_the_unproven_endpoint_warning():
+    """The key is kept for compatibility; its text now reflects the 18 Sep
+    2026 live proofs while still saying a 2xx is not proof of THIS order."""
     _, r = _capture_payload()
-    assert "never been fired" in r["unproven_endpoint_warning"]
+    w = r["unproven_endpoint_warning"]
+    assert "live-proven" in w
+    assert "not proof" in w
+    assert "never been fired" not in w
+
+
+def test_no_create_order_text_still_claims_the_endpoint_was_never_fired():
+    import inspect
+    doc = server.create_order.__doc__ or ""
+    assert "never been fired" not in doc.lower()
+    assert "NOT LIVE-PROVEN" not in doc
+    src = inspect.getsource(server)
+    section = src[src.index("# ── create_order"):src.index("def create_order(")]
+    assert "NEVER been fired" not in section
+
+
+def test_tax_note_distinguishes_the_proven_default_from_the_unsent_false():
+    r = _run()
+    assert "verified live" in r["manifest"]["tax_note"]
+    r = _run(prices_include_tax=False)
+    assert "never been sent live" in r["manifest"]["tax_note"]
 
 
 def test_read_back_reports_actual_state_from_a_fresh_read():
