@@ -1,6 +1,6 @@
 # Linnworks MCP Server — Claude context
 
-**Current version: 1.55.11** — 97 tools. See `pyproject.toml` for full metadata.
+**Current version: 1.55.11** — 98 tools. See `pyproject.toml` for full metadata.
 
 ---
 
@@ -302,6 +302,7 @@ Thresholds (defined in `WRITE_THRESHOLDS`):
 | `set_order_status` | 25 | Reversible, but lock RELEASES allocated stock |
 | `create_order` | 10 | CREATES a real, pickable, dispatchable customer order |
 | `generate_pick_waves` | 25 | Creates live pickwaves the warehouse will pick from |
+| `remove_orders_from_pick_waves` | 25 | Pulls orders out of waves — a picker may already hold the items |
 | `archive_inventory_items` | 25 | Reversible (unarchive) |
 | `unarchive_inventory_items` | 25 | Reversible (archive) |
 | `list_to_shopify` | 25 | Creates live customer-facing channel listings |
@@ -366,7 +367,7 @@ def set_stock_levels(updates: list[dict], confirmed_count: int | None = None, dr
 
 ## Tools
 
-97 tools. `python server.py --list-tools` is the authoritative count; see `server.py` for full docstrings and parameter details.
+98 tools. `python server.py --list-tools` is the authoritative count; see `server.py` for full docstrings and parameter details.
 
 > **v1.55.11 — `unpublish_channel_listing`'s docstring stops saying Amazon and TikTok deletes are unproven (22 Sep 2026):** Text-only; no behaviour change. The docstring still said Delete was "live-proven on SHOPIFY only (v1.25.0)" and told the reader to prove Amazon on a throwaway listing first, though Amazon was proven in v1.32.0 (5 Aug 2026) and TikTok in v1.42.0 (7 Aug 2026). The runtime warnings were already right, because they come from `GLT_CHANNELS` through `_proven_delete_channels()`. Only the docstring, which Claude reads when choosing and using the tool, had been left behind: the same drift the hard-coded "only Shopify is" string caused before v1.42.0. It now names the three proven channels with their dates and templates, says neither `NextSuggestedAction` nor `Status` gates a Delete, and says Magento and Walmart are unproven. A new `test_docs_consistency.py` guard reads `GLT_CHANNELS` and fails if the docstring calls a proven channel unproven, or leaves one out.
 
@@ -504,6 +505,7 @@ Built in v1.56.0 from `docs/superpowers/specs/2026-09-22-pickwave-write-tools-de
 |---|---|---|---|
 | `generate_pick_waves(waves, location_id, confirmed_count, dry_run=True)` | `Picking/GeneratePickingWave` (one POST per wave) + `CheckAllocatableToPickwave` + `OpenOrders/GetIdentifiersByOrderIds` + `GetPickwaveUsersWithSummary` | 25 orders | Each wave `{order_ids, user_id?, sorting_type=BinPriority, group_type=Items}`. Refused before any write: an order appearing twice (including once by GUID and once by number), or a `user_id` not on the live picker roster. An unresolved order blocks its own wave only. Linnworks' pickability check and a FIFO_READY check feed the manifest; missing FIFO_READY is a **warning, not a block**. A throttle during the checks stops with nothing written. Per-wave outcome: `created` / `refused` (ValidationResults verbatim) / `rate_limited` / `error` / `unconfirmed` / `blocked`. **Not atomic across waves**: a partial run names the created waves and says not to re-run the batch. Whether the body is wrapped is set by `_PICKING_WRITE_WRAPPED`. |
 | `update_pick_wave(picking_wave_id, user_id, unassign, state, allow_in_progress, dry_run=True)` | `Picking/UpdatePickingWaveHeader` (POST) | — (single wave) | Reassign (`user_id`, validated against the roster), unassign (`UserId: -1`), or set `state` to **Abandoned / Paused / Unallocated only**. Abandoning an InProgress wave, or setting it back to Unallocated, needs `allow_in_progress=True`; pausing it doesn't. **`State` is always sent**, even for a reassign, and StartTime/EndTime are carried through — the spec says only that a null `UserId` keeps the user, so a missing `State` could reset to the enum default. The read-back uses the **Abandoned header list** for an abandon, because GetPickingWave drops finished waves. Outcome `updated` / `not_applied` / `unconfirmed` / `rate_limited` / `error`. |
+| `remove_orders_from_pick_waves(order_ids, location_id, confirmed_count, dry_run=True)` | `Picking/DeleteOrdersFromPickingWaves` (POST `{"OrderIds":[int]}`) + header/detail reads to locate each order | 25 orders | Takes orders out of their waves; the orders themselves are unchanged. The manifest names each order's wave and warns if it's InProgress. Needs **`DeletePickingWavesNode`**, which no read tool exercises. Per-order outcome: `removed` / `not_in_a_wave` (Linnworks' `NoPickwaves`) / `still_present` (the read-back still finds it) / `unconfirmed`. There is no delete-wave endpoint: abandon an emptied wave with `update_pick_wave`. |
 
 ### Reporting (read, autopaginating)
 

@@ -732,3 +732,120 @@ class TestUpdateLive:
         with fake.active():
             out = server.update_pick_wave(9001, state="Paused", dry_run=False)
         assert out["outcome"] == "unconfirmed"
+
+
+# ── remove_orders_from_pick_waves ───────────────────────────────────────────
+
+def _two_open_waves():
+    return {
+        "waves": {
+            9001: _wave_resp(wave_id=9001, state="Unallocated",
+                             orders=[_wave_order(611385, GUID_A)]),
+            9002: _wave_resp(wave_id=9002, state="InProgress", user_id=69,
+                             email="warehouse+02@thewarehousegroup.co.uk",
+                             orders=[_wave_order(611386, GUID_B)]),
+        },
+        "headers": {
+            "Unallocated": [{"PickingWaveId": 9001, "State": "Unallocated"}],
+            "InProgress": [{"PickingWaveId": 9002, "State": "InProgress"}],
+        },
+    }
+
+
+def _delete_removes(fake):
+    """on_write handler: remove the orders from their waves, reply like Linnworks."""
+    def handler(body):
+        processed, none = [], []
+        for num in body["OrderIds"]:
+            hit = False
+            for resp in fake.waves.values():
+                wave = resp["PickingWaves"][0]
+                before = len(wave["Orders"])
+                wave["Orders"] = [o for o in wave["Orders"] if o["OrderId"] != num]
+                hit = hit or len(wave["Orders"]) < before
+            (processed if hit else none).append(num)
+        return {"ProcessedOrderIds": processed, "NoPickwaves": none}
+    return handler
+
+
+class TestRemoveOrders:
+
+    def test_empty_list_is_refused(self):
+        with FakeLinnworks().active() as fake:
+            out = server.remove_orders_from_pick_waves([])
+        assert out["success"] is False
+        assert fake.calls == []
+
+    def test_dry_run_maps_orders_to_waves_and_warns_on_in_progress(self):
+        fake = FakeLinnworks(orders=ORDERS, **_two_open_waves())
+        with fake.active():
+            out = server.remove_orders_from_pick_waves(["611385", "611386", "611387"])
+        rows = {r["num_order_id"]: r for r in out["manifest"]}
+        assert rows[611385]["picking_wave_id"] == 9001
+        assert "warning" not in rows[611385]
+        assert rows[611386]["picking_wave_id"] == 9002
+        assert "InProgress" in rows[611386]["warning"]
+        assert rows[611387]["picking_wave_id"] is None
+        assert "Not found" in rows[611387]["note"]
+        assert fake.writes() == []
+
+    def test_live_removal_sends_integer_ids_and_reads_back(self):
+        fake = FakeLinnworks(orders=ORDERS, **_two_open_waves())
+        fake.on_write["Picking/DeleteOrdersFromPickingWaves"] = _delete_removes(fake)
+        with fake.active():
+            out = server.remove_orders_from_pick_waves(["611385"], dry_run=False)
+        assert _body(fake.writes()[0][2]) == {"OrderIds": [611385]}
+        assert out["results"][0]["outcome"] == "removed"
+        assert out["complete"] is True
+
+    def test_still_present_when_the_read_back_finds_the_order(self):
+        fake = FakeLinnworks(orders=ORDERS, **_two_open_waves())
+        fake.on_write["Picking/DeleteOrdersFromPickingWaves"] = lambda body: {
+            "ProcessedOrderIds": body["OrderIds"], "NoPickwaves": []}
+        with fake.active():
+            out = server.remove_orders_from_pick_waves(["611385"], dry_run=False)
+        assert out["results"][0]["outcome"] == "still_present"
+        assert out["complete"] is False
+
+    def test_order_in_no_wave_is_reported_as_such(self):
+        fake = FakeLinnworks(orders=ORDERS, **_two_open_waves())
+        fake.on_write["Picking/DeleteOrdersFromPickingWaves"] = _delete_removes(fake)
+        with fake.active():
+            out = server.remove_orders_from_pick_waves(["611387"], dry_run=False)
+        assert out["results"][0]["outcome"] == "not_in_a_wave"
+
+    def test_permission_error_is_surfaced_verbatim(self):
+        msg = "HTTP 401 — missing DeletePickingWavesNode"
+        fake = FakeLinnworks(orders=ORDERS, raise_on={
+            "Picking/DeleteOrdersFromPickingWaves": RuntimeError(msg)}, **_two_open_waves())
+        with fake.active():
+            out = server.remove_orders_from_pick_waves(["611385"], dry_run=False)
+        assert out["outcome"] == "error"
+        assert msg in out["error"]
+
+    def test_rate_limit_while_locating_writes_nothing(self):
+        fake = FakeLinnworks(orders=ORDERS, raise_on={
+            "Picking/GetAllPickingWaveHeaders": server.RateLimitError("quota exceeded")})
+        with fake.active():
+            out = server.remove_orders_from_pick_waves(["611385"], dry_run=False)
+        assert out["success"] is False
+        assert out["complete"] is False
+        assert fake.writes() == []
+
+    def test_locate_failure_is_a_structured_refusal(self):
+        fake = FakeLinnworks(orders=ORDERS, raise_on={
+            "Picking/GetAllPickingWaveHeaders": RuntimeError("HTTP 500 — boom")})
+        with fake.active():
+            out = server.remove_orders_from_pick_waves(["611385"], dry_run=False)
+        assert out["success"] is False
+        assert "HTTP 500 — boom" in out["error"]
+        assert "nothing was written" in out["error"]
+        assert fake.writes() == []
+
+    def test_stages_above_25_orders(self):
+        many = {str(700000 + i): (f"{i:08d}-0000-0000-0000-000000000000", 700000 + i)
+                for i in range(26)}
+        with FakeLinnworks(orders=many).active() as fake:
+            out = server.remove_orders_from_pick_waves(list(many), dry_run=False)
+        assert out["staged"] is True
+        assert fake.writes() == []

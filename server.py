@@ -511,6 +511,7 @@ WRITE_THRESHOLDS: dict[str, int] = {
     "set_order_status":               25,   # lock/unlock/paid/unpaid — reversible order-state changes
     "create_order":                   10,   # CREATES a real, pickable, dispatchable customer order
     "generate_pick_waves":            25,   # creates live pickwaves the warehouse will pick from
+    "remove_orders_from_pick_waves":  25,   # pulls orders out of waves — a picker may already hold the items
     "default":                        25,   # fallback for any unlisted operation
 }
 
@@ -8492,6 +8493,153 @@ def update_pick_wave(
     check_user = not (target_state == "Abandoned" and user_id is None and not unassign)
     return {"dry_run": False, "plan": plan,
             **_read_back_updated_wave(picking_wave_id, target_state, expected_user, check_user, location)}
+
+
+def _locate_orders_in_open_waves(num_ids: list[int], location_id: str) -> dict[int, dict]:
+    """
+    NumOrderId -> {"picking_wave_id", "wave_state"} for each order found in a
+    non-finished wave at this location. One header call per open state plus
+    one detail call per open wave — a handful, since only a few waves are live
+    at once. Lets RateLimitError propagate.
+    """
+    wanted = set(num_ids)
+    found: dict[int, dict] = {}
+    for state in _PICK_WAVE_OPEN_STATES:
+        resp = call_linnworks_get(
+            "Picking/GetAllPickingWaveHeaders", {"state": state, "locationId": location_id}
+        )
+        for header in (resp.get("PickwaveHeaders") or []) if isinstance(resp, dict) else []:
+            wave_id = header.get("PickingWaveId")
+            detail = _format_pick_wave_detail(_fetch_pick_wave(wave_id))
+            if detail is None:
+                continue
+            for o in detail["orders"]:
+                if o["order_id"] in wanted and o["order_id"] not in found:
+                    found[o["order_id"]] = {"picking_wave_id": wave_id, "wave_state": detail["state"]}
+    return found
+
+
+@mcp.tool()
+def remove_orders_from_pick_waves(
+    order_ids: list,
+    location_id: str = DEFAULT_LOCATION_ID,
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Take orders out of whatever pickwave holds them
+    (Picking/DeleteOrdersFromPickingWaves). The orders themselves are not
+    changed — they just stop being in a wave, and can go into a new one.
+
+    The manifest shows which wave holds each order, and warns when that wave
+    is InProgress (a picker may already have the items on the trolley).
+    Orders can be GUIDs or order numbers; an unresolvable id is reported, not
+    raised. Staged above 25 orders. dry_run=True by default.
+
+    Needs the DeletePickingWavesNode permission, which no read tool exercises
+    — a missing permission comes back as outcome "error" with Linnworks'
+    message verbatim.
+
+    Each affected wave is re-read afterwards. Per-order outcome: removed,
+    not_in_a_wave (Linnworks' NoPickwaves list), still_present (the read-back
+    still finds it), or unconfirmed (the read-back failed).
+
+    There is no endpoint to delete a wave itself: to retire an emptied wave,
+    use update_pick_wave(state="Abandoned").
+    """
+    if not order_ids:
+        return {"success": False, "error": "order_ids is empty."}
+
+    resolved, resolve_errors, rate_limited = _resolve_order_numbers(order_ids)
+    if rate_limited:
+        return _pick_wave_preflight_throttled(rate_limited)
+    nums = [r[1] for r in resolved]
+    try:
+        holding = _locate_orders_in_open_waves(nums, location_id) if nums else {}
+    except RateLimitError as exc:
+        return _pick_wave_preflight_throttled([{"step": "locating waves", "reason": str(exc)}])
+    except RuntimeError as exc:
+        return {"success": False, "error": f"Locating the orders' waves failed — nothing was written: {exc}"}
+
+    manifest: list[dict] = []
+    for input_id, num, guid in resolved:
+        where = holding.get(num)
+        row = {
+            "order_id": input_id,
+            "num_order_id": num,
+            "order_guid": guid,
+            "picking_wave_id": where["picking_wave_id"] if where else None,
+            "wave_state": where["wave_state"] if where else None,
+        }
+        if where and where["wave_state"] == "InProgress":
+            row["warning"] = (f"Wave {where['picking_wave_id']} is InProgress — a picker may "
+                              "already have this order's items on the trolley.")
+        if not where:
+            row["note"] = "Not found in any open wave at this location."
+        manifest.append(row)
+
+    guard = _write_guard("remove_orders_from_pick_waves", resolved, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, "manifest": manifest, "resolve_errors": resolve_errors}
+    if dry_run:
+        in_waves = sum(1 for m in manifest if m["picking_wave_id"])
+        return {
+            "dry_run": True,
+            "order_count": len(order_ids),
+            "manifest": manifest,
+            "resolve_errors": resolve_errors,
+            "message": f"Dry run — {in_waves} order(s) found in open waves. Nothing was removed.",
+        }
+    if not nums:
+        return {"dry_run": False, "results": [], "resolve_errors": resolve_errors,
+                "complete": False, "message": "No order resolved; nothing was sent."}
+
+    try:
+        resp = _picking_write("Picking/DeleteOrdersFromPickingWaves", {"OrderIds": nums})
+    except RateLimitError as exc:
+        return {"dry_run": False, "manifest": manifest, "outcome": "rate_limited",
+                "complete": False, "error": str(exc)}
+    except RuntimeError as exc:
+        return {"dry_run": False, "manifest": manifest, "outcome": "error",
+                "complete": False, "error": str(exc)}
+
+    processed = {_as_int(x) for x in (resp.get("ProcessedOrderIds") or [])}
+    no_wave = {_as_int(x) for x in (resp.get("NoPickwaves") or [])}
+
+    still_in: set[int] = set()
+    readback_failed: set[int] = set()
+    for wave_id in sorted({m["picking_wave_id"] for m in manifest if m["picking_wave_id"]}):
+        try:
+            detail = _format_pick_wave_detail(_fetch_pick_wave(wave_id))
+        except (RateLimitError, RuntimeError):
+            readback_failed.add(wave_id)
+            continue
+        if detail is not None:
+            still_in.update(o["order_id"] for o in detail["orders"])
+
+    results: list[dict] = []
+    for m in manifest:
+        num = m["num_order_id"]
+        if num in still_in:
+            outcome = "still_present"
+        elif m["picking_wave_id"] in readback_failed:
+            outcome = "unconfirmed"
+        elif num in processed:
+            outcome = "removed"
+        elif num in no_wave:
+            outcome = "not_in_a_wave"
+        else:
+            outcome = "unconfirmed"
+        results.append({**m, "outcome": outcome})
+
+    complete = not resolve_errors and all(r["outcome"] in ("removed", "not_in_a_wave") for r in results)
+    return {
+        "dry_run": False,
+        "results": results,
+        "resolve_errors": resolve_errors,
+        "complete": complete,
+        "message": f"{sum(r['outcome'] == 'removed' for r in results)} order(s) removed from waves.",
+    }
 
 
 @mcp.tool()
