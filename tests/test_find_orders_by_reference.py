@@ -112,7 +112,8 @@ class TestFindOrdersByReference:
 
         def side_effect(path, payload, **kwargs):
             if "SearchOrders" in path:
-                captured["term"] = payload.get("request", {}).get("SearchTerm")
+                captured["payload"] = payload
+                captured["term"] = payload.get("SearchTerm")
                 return SEARCH_RESPONSE_EMPTY
             return []
 
@@ -120,6 +121,9 @@ class TestFindOrdersByReference:
             server.find_orders_by_reference("#11177274")
 
         assert captured["term"] == "11177274"
+        # SearchOrders takes a FLAT body: wrapped in {"request": {...}} the live API
+        # answers 400 "Must provide a search term" (checked against the tenant 2026-09-22).
+        assert "request" not in captured["payload"]
 
     def test_empty_reference_returns_error(self):
         import server
@@ -196,7 +200,7 @@ class TestFindOrdersByReference:
 
         def side_effect(path, payload, **kwargs):
             if "SearchOrders" in path:
-                captured["inc"] = payload.get("request", {}).get("IncludeProcessed")
+                captured["inc"] = payload.get("IncludeProcessed")
                 return SEARCH_RESPONSE_EMPTY
             return []
 
@@ -224,8 +228,14 @@ class TestFindOrdersByReference:
 
         assert batch_guids.count(GUID_1) == 1, "GUID_1 should only be fetched once"
 
-    def test_search_orders_payload_uses_request_wrapper(self):
-        """SearchOrders must use the {'request': {...}} wrapper (OpenOrders convention)."""
+    def test_search_orders_payload_is_flat(self):
+        """SearchOrders takes a FLAT body, not the OpenOrders {'request': {...}} wrapper.
+
+        Measured against the live tenant on 2026-09-22: flat JSON returns 200 and the
+        matching GUIDs, while the wrapped form returns HTTP 400 "Must provide a search
+        term" for every reference. The wrapper made this tool look broken while the
+        error blamed the caller, so the shape is locked down here.
+        """
         import server
 
         captured = {}
@@ -239,10 +249,11 @@ class TestFindOrdersByReference:
         with patch("server.call_linnworks", side_effect=side_effect):
             server.find_orders_by_reference("123")
 
-        assert "request" in captured["payload"], (
-            "SearchOrders payload must use {'request': {...}} wrapper"
+        assert "request" not in captured["payload"], (
+            "SearchOrders must NOT be wrapped: the API answers 400 'Must provide a "
+            "search term' when it is"
         )
-        assert "SearchTerm" in captured["payload"]["request"]
+        assert captured["payload"]["SearchTerm"] == "123"
 
     def test_result_includes_expected_fields(self):
         """Each order in results must include the documented fields."""

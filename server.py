@@ -1446,15 +1446,19 @@ def find_orders_by_reference(
 
     # --- Step 1: API-native search ---
     # SearchOrders returns GUIDs grouped into OpenOrders views and ProcessedOrders.
-    # Payload uses the {"request": {...}} wrapper consistent with other OpenOrders endpoints.
+    #
+    # ⚠️ This endpoint takes a FLAT body, unlike its OpenOrders neighbours. Wrapped in
+    # {"request": {...}} it answers HTTP 400 "Must provide a search term" — it never sees
+    # the term, so the error reads like a caller mistake and the tool looks broken for
+    # every reference. Measured against the live tenant 2026-09-22: flat JSON, form
+    # request=<json> and flat form all return 200 with the same GUIDs; only the wrapper
+    # fails. (The note below about SearchOrders being untested is now settled: it works.)
     resp = call_linnworks(
         "OpenOrders/SearchOrders",
         {
-            "request": {
-                "LocationId": location_id,
-                "SearchTerm": reference,
-                "IncludeProcessed": include_processed,
-            }
+            "LocationId": location_id,
+            "SearchTerm": reference,
+            "IncludeProcessed": include_processed,
         },
     )
 
