@@ -9,8 +9,11 @@ deliberately invalid payload against the zero GUID (issue #52). It has never
 been called against a real order. These tests prove the tool's own logic —
 resolution, refusals, payload construction and integrity, and read-back
 classification — and nothing about whether Linnworks actually restores the
-channel link. See CLAUDE.md's post_merge_verification checklist for the
-owner-run live proof.
+channel link. That is two unknowns, not one (issue #78): whether the values
+persist on Linnworks' own record, which the tool's read-back reports on a
+live run, and whether despatch then maps the line back to the storefront,
+which no read of Linnworks can show. See CLAUDE.md's post_merge_verification
+checklist for the owner-run live proof.
 """
 import sys
 import os
@@ -925,3 +928,63 @@ class TestLiveWritePayloadShape:
             )
 
         assert payload_sent["fulfilmentCenter"] == server.DEFAULT_LOCATION_ID
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Issue #78 — the unproven warning's wording, pinned
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestRelinkUnprovenWarningWording:
+    W = server._RELINK_ORDER_LINE_UNPROVEN_WARNING
+
+    def test_no_amazon_ebay_analogy(self):
+        """Those are channel-push endpoints; UpdateOrderItem writes to
+        Linnworks' own order record, which the tool already re-reads."""
+        assert "Amazon" not in self.W
+        assert "eBay" not in self.W
+
+    def test_still_states_persistence_is_not_established(self):
+        assert "UNPROVEN" in self.W
+        assert "persistence is not established" in self.W
+        assert "not proof" in self.W.lower()
+        assert "find_unlinked_order_lines" in self.W
+
+    def test_separates_persistence_from_despatch_mapping(self):
+        assert "persist" in self.W
+        assert "despatch" in self.W
+        assert "Two separate things are unknown" in self.W
+
+    def test_names_no_external_repository(self):
+        """AC11 — no second-hand evidence from another repo in runtime text."""
+        for name in ("order-sync-service", "ordersync"):
+            assert name not in self.W
+            assert name not in (server.relink_order_line.__doc__ or "")
+
+    def test_docstring_separates_the_two_unknowns(self):
+        doc = server.relink_order_line.__doc__ or ""
+        assert "Amazon" not in doc and "eBay" not in doc
+        assert "despatch then maps the line back" in doc
+
+    def test_payload_site_records_why_fulfilment_centre_is_derived(self):
+        import inspect
+        src = inspect.getsource(server.relink_order_line)
+        idx = src.index("fulfilment_centre = (")
+        comment = src[max(0, idx - 800):idx]
+        assert "never hard-coded" in comment
+        assert "remove_order_item" in comment and "cancel_order" in comment
+
+
+class TestRemoveOrderItemWarningUntouched:
+    def test_remove_order_item_warning_is_character_for_character_unchanged(self):
+        """Orders/RemoveOrderItem genuinely has never been fired — an
+        over-broad edit to the neighbouring relink constant must fail here."""
+        assert server._REMOVE_ORDER_ITEM_UNPROVEN_WARNING == (
+            "⚠️ Orders/RemoveOrderItem is UNPROVEN on this tenant — it has only ever "
+            "been probed with a deliberately invalid payload (issue #52); this build "
+            "never fired it against a real order. A 2xx response here is NOT proof "
+            "the line was removed. Verify this order in the Linnworks UI, and "
+            "re-run find_unlinked_order_lines on this SAME order to confirm the "
+            "lines you did NOT touch still have a healthy channel-side reference — "
+            "a related order-item write has been observed to orphan surviving "
+            "lines (issue #52)."
+        )

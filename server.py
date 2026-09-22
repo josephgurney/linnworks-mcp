@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.55.7"
+__version__ = "1.55.8"
 
 import json
 import os
@@ -3626,19 +3626,35 @@ def remove_order_item(
 # Orders/UpdateOrderItem has been probed for existence only (issue #52, 9 Sep
 # 2026 — a deliberately invalid payload against the zero GUID returned the
 # same "reached real validation code" 400 this repo treats as evidence a
-# route exists). It has never been called with a payload that could touch a
-# real order. This warning is carried on every relink_order_line live-run
-# response until an owner-run live proof (see CLAUDE.md's
-# post_merge_verification) updates it.
+# route exists). It has never been called from this repo with a payload that
+# could touch a real order. This warning is carried on every
+# relink_order_line live-run response until an owner-run live proof (issue
+# #59, CLAUDE.md's post_merge_verification) updates it.
+#
+# It deliberately separates two unknowns (issue #78). The first — do
+# ItemNumber/ItemSource persist on Linnworks' own order record? — is one this
+# tool answers for itself on every live run, by re-reading the order and
+# reporting relinked/not_persisted rather than trusting the 2xx. The second —
+# does despatch then map the line back to its storefront line? — no read of
+# Linnworks can answer. An earlier wording justified the caution by analogy
+# to the Amazon/eBay channel pushes; that did not hold, because those are
+# channel-push endpoints whose effect lands on the storefront, whereas this
+# endpoint writes to Linnworks' own order record, which the read-back checks.
 _RELINK_ORDER_LINE_UNPROVEN_WARNING = (
     "⚠️ Orders/UpdateOrderItem is UNPROVEN on this tenant — it has only ever "
     "been probed for existence with a deliberately invalid payload against "
-    "the zero GUID (issue #52); this build has never fired it against a "
-    "real order. A 2xx response here is NOT proof the channel link was "
-    "restored — Linnworks accepting a push has, on other channels (Amazon, "
-    "eBay), meant nothing reached the storefront. Re-run "
+    "the zero GUID (issue #52); this repo has never fired it against a "
+    "real order, so ItemNumber/ItemSource persistence is not established "
+    "here. Two separate things are unknown. First, whether the values "
+    "persist on Linnworks' own order record — this tool re-reads the order "
+    "after the write and reports that as the outcome, so check it is "
+    "'relinked', not 'not_persisted' or 'unconfirmed'. Second, even when they "
+    "do persist, whether despatch then maps this line back to its storefront "
+    "line — a read-back of Linnworks' record is not proof of that. A 2xx "
+    "response here is NOT proof the channel link was restored. Re-run "
     "find_unlinked_order_lines on this SAME order afterwards to confirm the "
-    "line now reads as linked."
+    "line now reads as linked, and after despatch check the storefront order "
+    "shows this line fulfilled."
 )
 
 
@@ -3707,7 +3723,11 @@ def relink_order_line(
     Every response from a live run (dry_run=False) carries an explicit
     unproven warning telling you that a 2xx here is NOT proof the channel
     link was restored, and to re-run find_unlinked_order_lines on the SAME
-    order afterwards. The first live call against a real order is a
+    order afterwards. It separates two unknowns: whether ItemNumber/
+    ItemSource persist on Linnworks' own order record (which this tool's
+    fresh read-back answers on every live run — see the outcomes below), and
+    whether despatch then maps the line back to its storefront line (which
+    no read of Linnworks can answer). The first live call against a real order is a
     deliberate, owner-run step — see CLAUDE.md's post_merge_verification
     section for the checklist.
 
@@ -3945,6 +3965,13 @@ def relink_order_line(
             **manifest,
         })
 
+    # fulfilmentCenter is DERIVED from the order (caller override, then the
+    # order's own FulfilmentLocationId, then Default), never hard-coded to the
+    # Default/zero GUID — the same resolution remove_order_item and
+    # cancel_order use. Every open order today sits on Default, so a
+    # hard-coded value would pass every test and every live run until the
+    # first order on another location, then send the wrong fulfilment centre
+    # (issue #78). Three tests pin this order of resolution.
     fulfilment_centre = (
         location_id or raw.get("FulfilmentLocationId") or DEFAULT_LOCATION_ID
     )
