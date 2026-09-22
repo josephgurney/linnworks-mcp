@@ -7776,6 +7776,159 @@ def check_orders_pickable(order_ids: list[str]) -> dict:
     }
 
 
+# ── Pickwave detail + writes (issue #67) ────────────────────────────────────
+#
+# Live facts this section relies on (confirmed read-only, 22 Sep 2026 — see
+# docs/superpowers/specs/2026-09-22-pickwave-write-tools-design.md):
+#   - Picking/GetPickingWave returns full order + item detail for a LIVE wave,
+#     and NOTHING for a finished (Shipped/Abandoned) wave. The v1.54.0 note
+#     that it "returns zero waves" was only ever tested on finished waves.
+#   - The wave row carries UserId/EmailAddress only while the wave is assigned
+#     (the keys are ABSENT, not null, when unassigned).
+#   - Bins[] on that response carries real bin codes (e.g. "10-A-03"), even
+#     though GetItemBinracks errors on every item here (non-WMS locations).
+
+_PICK_WAVE_EMPTY_DETAIL_NOTE = (
+    "Linnworks returned no wave for this id. It does this for a FINISHED wave "
+    "(Shipped or Abandoned) — confirmed live 22 Sep 2026 — and for an id that "
+    "doesn't exist. It does NOT mean the wave has no orders. Use "
+    "get_pick_waves(state='Shipped' or 'Abandoned') to see a finished wave's "
+    "header counts."
+)
+
+# (output name, Linnworks order flag) — an order with any of these set can't
+# be picked as planned, so get_pick_wave_detail lists it under `blockers`.
+_PICK_WAVE_BLOCKER_FLAGS = (
+    ("locked", "IsLocked"),
+    ("on_hold", "IsOnHold"),
+    ("cancelled", "IsCancelled"),
+    ("processed", "IsProcessed"),
+)
+
+
+def _fetch_pick_wave(picking_wave_id: int) -> dict:
+    """
+    Raw Picking/GetPickingWave response for one wave (GET ?pickingWaveId=).
+    Returns {} if the body isn't a dict. Lets RateLimitError propagate: the
+    caller decides how to report a throttle, and it is never "no such wave".
+    """
+    resp = call_linnworks_get("Picking/GetPickingWave", {"pickingWaveId": picking_wave_id})
+    return resp if isinstance(resp, dict) else {}
+
+
+def _format_pick_wave_detail(resp: dict) -> dict | None:
+    """
+    Normalise a GetPickingWave response into header + orders + blockers.
+
+    Returns None when the response holds no wave (a finished wave, or an
+    unknown id — see _PICK_WAVE_EMPTY_DETAIL_NOTE). The header comes from
+    _format_pick_wave, so there is exactly one pickwave state map (#64 AC7).
+    No weight or volume figure is produced (#67 defers those).
+    """
+    waves = resp.get("PickingWaves") or []
+    if not waves:
+        return None
+    wave = waves[0]
+
+    skus = {str(s.get("StockItemId") or "").lower(): s for s in (resp.get("Skus") or [])}
+    bins: dict[str, list[str]] = {}
+    for b in resp.get("Bins") or []:
+        sid = str(b.get("StockItemId") or "").lower()
+        rack = b.get("BinRack")
+        if rack and rack not in bins.setdefault(sid, []):
+            bins[sid].append(rack)
+
+    orders: list[dict] = []
+    blockers: list[dict] = []
+    for o in wave.get("Orders") or []:
+        items = []
+        for it in o.get("Items") or []:
+            sid = str(it.get("StockItemId") or "").lower()
+            sku = skus.get(sid, {})
+            items.append({
+                "picking_wave_item_row_id": it.get("PickingWaveItemsRowId"),
+                "order_item_row_id": it.get("OrderItemRowId"),
+                "stock_item_id": it.get("StockItemId"),
+                "sku": sku.get("SKU"),
+                "title": sku.get("ItemTitle"),
+                "to_pick": it.get("ToPickQuantity"),
+                "picked": it.get("PickedQuantity"),
+                "item_state": it.get("ItemState"),
+                "bins": bins.get(sid, []),
+            })
+        flags = {name: bool(o.get(key)) for name, key in _PICK_WAVE_BLOCKER_FLAGS}
+        row = {
+            "order_id": o.get("OrderId"),
+            "order_guid": o.get("OrderId_Guid"),
+            "pick_state": o.get("PickState"),
+            "sort_order": o.get("SortOrder"),
+            **{f"is_{name}": value for name, value in flags.items()},
+            "is_paid": bool(o.get("IsPaid")),
+            "items": items,
+        }
+        orders.append(row)
+        reasons = [name for name, value in flags.items() if value]
+        if reasons:
+            blockers.append({
+                "order_id": row["order_id"],
+                "order_guid": row["order_guid"],
+                "reasons": reasons,
+            })
+
+    return {**_format_pick_wave(wave), "orders": orders, "blockers": blockers}
+
+
+@mcp.tool()
+def get_pick_wave_detail(picking_wave_id: int) -> dict:
+    """
+    Read one pickwave in full (Picking/GetPickingWave): its header, every
+    order with its pick state and locked / on-hold / cancelled / processed /
+    paid flags, and every item with SKU, title, quantity to pick, quantity
+    picked and bin codes.
+
+    Read-only. A point-in-time snapshot: pickers change waves while they work.
+
+    `blockers` lists orders in the wave that are now locked, on hold,
+    cancelled or processed — the candidates for remove_orders_from_pick_waves.
+
+    ⚠️  Linnworks returns NOTHING for a finished wave (Shipped or Abandoned),
+    or for an unknown id. That comes back as found=False with a note, never as
+    "this wave has no orders". An unassigned wave has user_id None.
+
+    Bin codes come from the wave's own Bins data. That works on this tenant
+    even though get_item_bins can't (there are no WMS-managed locations).
+
+    Args:
+        picking_wave_id: The wave's id, from get_pick_waves or generate_pick_waves.
+
+    Returns:
+        found (True / False, or None when rate limited). For a found wave:
+        the same header fields as get_pick_waves (picking_wave_id, state,
+        state_label, user_id, email_address, counts, group_type, sort_type)
+        plus orders[] and blockers[]. Always: rate_limited, complete.
+    """
+    try:
+        resp = _fetch_pick_wave(picking_wave_id)
+    except RateLimitError as exc:
+        return {
+            "picking_wave_id": picking_wave_id,
+            "found": None,
+            "rate_limited": True,
+            "complete": False,
+            "error": str(exc),
+        }
+    detail = _format_pick_wave_detail(resp)
+    if detail is None:
+        return {
+            "picking_wave_id": picking_wave_id,
+            "found": False,
+            "note": _PICK_WAVE_EMPTY_DETAIL_NOTE,
+            "rate_limited": False,
+            "complete": True,
+        }
+    return {**detail, "found": True, "rate_limited": False, "complete": True}
+
+
 @mcp.tool()
 def get_category_report(
     from_date: str,

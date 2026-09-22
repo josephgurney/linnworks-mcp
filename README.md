@@ -1,7 +1,7 @@
 # Linnworks MCP Server
 
 ![Version](https://img.shields.io/badge/version-1.55.11-blue)
-![Tools](https://img.shields.io/badge/tools-94-blue)
+![Tools](https://img.shields.io/badge/tools-95-blue)
 
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
 
@@ -91,6 +91,7 @@ Once installed, Claude gets access to these tools:
 | `get_pick_wave_users` | Warehouse users (pickers) with their current pickwave summary. On this tenant, `state` didn't discriminate between any of the six non-terminal states during live testing (always the same idle-picker roster) — treat that as unverified rather than proven either way |
 | `get_item_bins` | Bin/binrack locations for a SKU. Distinguishes bins found, no bin configured (clean empty result), bin tracking unavailable (this tenant has no WMS-managed locations at all), lookup failed, and rate limited — never collapses one into another |
 | `check_orders_pickable` | Feasibility check only (Picking/CheckAllocatableToPickwave) — proven side-effect free during the build that added it: no new wave, no order state change, no stock level change, byte-identical on repeat calls. Accepts GUID or numeric order ids; an id that can't be resolved is reported per-order, not raised |
+| `get_pick_wave_detail` | Full detail for one wave: every order with its pick state and locked/on-hold/cancelled/processed flags, every item with SKU, quantities and bin codes, plus a `blockers` list. Returns nothing for a finished (Shipped/Abandoned) wave — reported as `found: False`, never as an empty wave |
 
 **Categories (writes default to dry_run=True)**
 
