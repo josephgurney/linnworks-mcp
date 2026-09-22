@@ -330,3 +330,43 @@ def test_get_refund_headers_row_documents_the_readback_use():
 def test_cancel_and_refund_test_header_no_longer_claims_never_live_tested():
     header = (ROOT / "tests" / "test_cancel_and_refund.py").read_text()
     assert "have not been live-tested" not in header.split('"""')[1]
+
+
+# --- delete_extended_properties live proof (issue #90) -----------------------
+# The proof succeeded (22 Sep 2026) -- dry run, expected_value block, a real
+# delete, one call per distinct stock item, and the wrong-parameter-name probe
+# were all fired against a throwaway SKU and read back. These guards exist so
+# the docs cannot silently regress to "spec-based, not yet live-run" the way
+# cancel_order sat unproven for months behind that exact phrase.
+
+def _delete_extended_properties_confirmed_endpoint_row() -> str:
+    match = re.search(
+        r"^\| `Inventory/DeleteInventoryItemExtendedProperties` \|.*$", CLAUDE_MD, re.M
+    )
+    assert match, (
+        "CLAUDE.md is missing the DeleteInventoryItemExtendedProperties "
+        "confirmed-endpoints row"
+    )
+    return match.group(0)
+
+
+def test_delete_extended_properties_tools_table_row_no_longer_claims_unproven():
+    row = _claude_md_tools_table_row("delete_extended_properties")
+    assert "Spec-based, not yet live-run" not in row, (
+        "CLAUDE.md's delete_extended_properties row still claims the delete "
+        "flow was never fired live, but it was proven 22 Sep 2026 (issue #90)"
+    )
+    assert "LIVE-PROVEN" in row
+
+
+def test_delete_extended_properties_confirmed_endpoint_row_states_the_observed_status():
+    row = _delete_extended_properties_confirmed_endpoint_row()
+    assert "has not itself been fired live from this build" not in row, (
+        "CLAUDE.md's DeleteInventoryItemExtendedProperties row still claims "
+        "the delete was never fired live, but it was proven 22 Sep 2026 (issue #90)"
+    )
+    # The 204 was inferred before this proof; it must now read as an
+    # observation, with the discarded-status-code caveat explaining why
+    # instrumentation (not the tool itself) was needed to see it.
+    assert "204" in row
+    assert "CONFIRMED LIVE" in row
