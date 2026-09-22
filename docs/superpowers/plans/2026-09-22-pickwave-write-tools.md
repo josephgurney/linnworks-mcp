@@ -2249,9 +2249,14 @@ These parameter names and the JSON item fields (`sku`, `quantity`, `price`) and 
 
 Check the manifest: the order resolves; `pickable` should be True (it was just created and paid); FIFO_READY will most likely be False (a warning, as intended). After approval, run with `dry_run=False`.
 
+The first live Generate is sent **UNWRAPPED** (`_PICKING_WRITE_WRAPPED["Picking/GeneratePickingWave"]` is False; the comment above that dict says why unwrapped goes first).
+
 - **Success:** outcome `created` with `readback_matches: true`. Record the wave id (`WAVE`).
-- **HTTP 400 that mentions a missing or empty request/parameter:** the wrapper setting is wrong, and nothing was created. Confirm with `get_pick_waves(state="Unallocated")` that no new wave appeared. Flip `_PICKING_WRITE_WRAPPED["Picking/GeneratePickingWave"]`, rerun the tests, and retry once (with approval again). Record which shape worked.
+- **HTTP 400 that mentions a missing or empty request/parameter:** the endpoint wants the wrapper, and nothing was created. Confirm with `get_pick_waves(state="Unallocated")` that no new wave appeared. Flip `_PICKING_WRITE_WRAPPED["Picking/GeneratePickingWave"]` to True, rerun the tests, and retry once (with approval again). Record which shape worked.
+- **Other wrong-shape symptoms:** `refused` with empty or unrelated ValidationResults; `unconfirmed` with no reason; or `created` with `readback_matches: false` or an empty wave. On any of these, **STOP**: abandon any stray wave (check `get_pick_waves(state="Unallocated")`), then clean up (the stop rule).
 - **Anything else:** stop and clean up (the stop rule).
+
+**Second generate of the same order (I6, owner approval).** After `WAVE` is created, dry-run and then run live a second `generate_pick_waves([{"order_ids": ["NUM"]}])`. Expected: outcome `refused` (ValidationResults saying the order is already in a pickwave), and wave `WAVE` unchanged (check with `get_pick_wave_detail(WAVE)`). If Linnworks instead moves the order into a new wave, record it: the tool must then block unpickable orders by default rather than only warning. Abandon any stray wave before continuing.
 
 - [ ] **Step 4: Update the wave, reading back after each call (owner approval for the batch of four)**
 
@@ -2259,19 +2264,26 @@ Check the manifest: the order resolves; `pickable` should be True (it was just c
 .venv/bin/python3 - <<'PY' 2>/dev/null
 import json, server as s
 W = WAVE
-for kw in ({"unassign": True}, {"user_id": 19}, {"state": "Paused"}, {"state": "Unallocated"}):
+for kw in ({"unassign": True}, {"user_id": 19}, {"state": "Paused"},
+           {"state": "Unallocated", "allow_in_progress": True}):
     out = s.update_pick_wave(W, dry_run=False, **kw)
-    print(kw, "->", out.get("outcome"), out.get("after_state"), out.get("after_user_id"), out.get("error", ""))
+    print(kw, "->", out.get("outcome"), out.get("after_state"), out.get("after_user_id"),
+          "state_changed_by_server:", out.get("state_changed_by_server"),
+          "user_changed_by_server:", out.get("user_changed_by_server"), out.get("error", ""))
 PY
 ```
 
-Expected, in order:
-1. unassign → `updated`, user None
-2. `user_id=19` → `updated`, user 19
-3. Paused → `updated`, **user still 19** (this proves a missing `UserId` keeps the picker)
-4. Unallocated → `updated`
+The body is sent **UNWRAPPED** first, as in Step 3. The fourth call needs `allow_in_progress=True`, because a Paused wave counts as started.
 
-If the first call returns a 400 mentioning a missing request, fix `_PICKING_WRITE_WRAPPED["Picking/UpdatePickingWaveHeader"]` exactly as in Step 3. If the Paused step loses the user, record it: the "null keeps the user" promise doesn't hold, and the tool must then send the current `UserId` explicitly. Change the code, add a test, then continue.
+Expected, in order. Either server behaviour is acceptable for the field a call didn't ask to change; record which one happens:
+1. unassign → `updated`, and the user reads back as no user. Record whether the key is absent, 0 or -1. `state_changed_by_server` says whether the server moved the state.
+2. `user_id=19` → `updated`, user 19. The server may move the state to Allocated (`state_changed_by_server: true`) or leave it.
+3. Paused → `updated`. `user_changed_by_server: false` proves a missing `UserId` keeps the picker.
+4. Unallocated → `updated`, with `user_changed_by_server` recorded the same way.
+
+For every call, record `after_state`, `after_user_id` and both `*_changed_by_server` flags. Also record whether `SortOrder` in the wave detail is 0- or 1-based (the tool sends 0-based positions).
+
+If the first call returns a 400 mentioning a missing request, flip `_PICKING_WRITE_WRAPPED["Picking/UpdatePickingWaveHeader"]` to True exactly as in Step 3. If the Paused step loses the user (`user_changed_by_server: true`), record it: the "null keeps the user" promise doesn't hold, and the tool must then send the current `UserId` explicitly. Change the code, add a test, then continue.
 
 - [ ] **Step 5: Owner confirms state labels against the Linnworks screen**
 
