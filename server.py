@@ -7116,15 +7116,14 @@ def find_unlinked_order_lines(
 #     byte-identical and neither level guarantees a stable ordering. Exposed
 #     anyway because it is a real, documented, harmless parameter.
 #
-#   - GetAllPickingWaves / GetPickingWave (the "detailed", order-level variant)
-#     returned ZERO wave rows for every state tried, including a wave created
-#     hours before this build ran (id 3520) and a wave fetched directly by id
-#     (id 5) that GetAllPickingWaveHeaders confirms exists. Full per-order pick
-#     detail appears not to be retrievable via this API once a wave has
-#     shipped, at least on this tenant — so get_pick_waves wraps
-#     GetAllPickingWaveHeaders (which reliably returns real data, including
-#     OrderCount, enough to satisfy the post-merge "compare order count and
-#     state label" check) rather than the richer-sounding but empty endpoint.
+#   - GetPickingWave (the "detailed", order-level variant) returns full detail
+#     for a LIVE wave (confirmed 22 Sep 2026, wave 3549, 8 orders) and nothing
+#     for a finished one. The v1.54.0 probes (wave 3520, wave 5) only ever hit
+#     finished waves, which is why they came back empty. get_pick_wave_detail
+#     (#67) wraps it. GetAllPickingWaves is still unused. get_pick_waves wraps
+#     GetAllPickingWaveHeaders, which returns finished waves too and carries
+#     OrderCount, enough for the post-merge "compare order count and state
+#     label" check.
 #
 #   - Every location on this tenant reads IsWarehouseManaged: False (confirmed
 #     via Inventory/GetStockLocations), and GetItemBinracks refuses a real item
