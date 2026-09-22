@@ -1,6 +1,6 @@
 # Linnworks MCP Server
 
-![Version](https://img.shields.io/badge/version-1.55.6-blue)
+![Version](https://img.shields.io/badge/version-1.55.7-blue)
 ![Tools](https://img.shields.io/badge/tools-94-blue)
 
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
@@ -24,7 +24,7 @@ Once installed, Claude gets access to these tools:
 | `get_order_notes` | Fetch all notes on an order |
 | `find_open_orders_for_sku` | Find all open orders containing a specific SKU — customer name, email, dispatch deadline |
 | `find_orders_by_reference` | Look up orders by channel reference number (Shopify, Amazon, eBay) |
-| `find_unlinked_order_lines` | Report lines that have lost their channel-side reference (ItemNumber/ItemSource/ChannelSKU) — linked / unlinked / unknown / not_expected, across open orders and/or a processed-order date range. Read-only report; pair with `relink_order_line` to attempt a repair |
+| `find_unlinked_order_lines` | Report lines that have lost their channel-side reference (ItemNumber/ItemSource/ChannelSKU) — linked / unlinked / unknown / not_expected (composite child, manual order, or internal marker/service SKU such as Check-notes — counted in `internal_sku_suppressed`), across open orders and/or a processed-order date range. Read-only report; pair with `relink_order_line` to attempt a repair |
 
 **Orders (write — all default to dry_run=True)**
 
