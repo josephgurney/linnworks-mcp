@@ -1,6 +1,6 @@
 # Linnworks MCP Server — Claude context
 
-**Current version: 1.55.10** — 94 tools. See `pyproject.toml` for full metadata.
+**Current version: 1.55.11** — 94 tools. See `pyproject.toml` for full metadata.
 
 ---
 
@@ -366,6 +366,8 @@ def set_stock_levels(updates: list[dict], confirmed_count: int | None = None, dr
 ## Tools
 
 94 tools. `python server.py --list-tools` is the authoritative count; see `server.py` for full docstrings and parameter details.
+
+> **v1.55.11 — `unpublish_channel_listing`'s docstring stops saying Amazon and TikTok deletes are unproven (22 Sep 2026):** Text-only; no behaviour change. The docstring still said Delete was "live-proven on SHOPIFY only (v1.25.0)" and told the reader to prove Amazon on a throwaway listing first, though Amazon was proven in v1.32.0 (5 Aug 2026) and TikTok in v1.42.0 (7 Aug 2026). The runtime warnings were already right, because they come from `GLT_CHANNELS` through `_proven_delete_channels()`. Only the docstring, which Claude reads when choosing and using the tool, had been left behind: the same drift the hard-coded "only Shopify is" string caused before v1.42.0. It now names the three proven channels with their dates and templates, says neither `NextSuggestedAction` nor `Status` gates a Delete, and says Magento and Walmart are unproven. A new `test_docs_consistency.py` guard reads `GLT_CHANNELS` and fails if the docstring calls a proven channel unproven, or leaves one out.
 
 > **v1.55.10 — `create_order`'s own text stops saying `Orders/CreateOrders` has never been fired (22 Sep 2026):** Text-only; no behaviour change. The module note, the docstring and the `unproven_endpoint_warning` text all still claimed the endpoint had never been fired, and the tax notes said `TaxCostInclusive` was unverified. v1.55.1/v1.55.2 proved paid, resend and unpaid on real orders (611394/611397/611398) and the tax-inclusive default (£1.95 → 1.625 + 0.325). All of these now say what was proven. They still say a 2xx is not proof that a particular order is right, which is why live results stay `unconfirmed`. The one thing still unproven is flagged per call: `prices_include_tax=False` has never been sent live, and the manifest's `tax_note` now differs by value. The response key is still named `unproven_endpoint_warning` for compatibility; only its text changed.
 

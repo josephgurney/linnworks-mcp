@@ -236,6 +236,22 @@ def test_docstring_no_longer_claims_amazon_variation_shape_is_unobserved():
     assert "one observation, not a rule" in doc
 
 
+def test_unpublish_docstring_agrees_with_the_delete_proven_flags():
+    """The runtime warnings read GLT_CHANNELS, but the docstring is hand-written
+    and said "live-proven on SHOPIFY only" for weeks after Amazon (v1.32.0) and
+    TikTok (v1.42.0) were proven. Claude reads the docstring when choosing and
+    using the tool, so it must not call a proven channel unproven."""
+    doc = server.unpublish_channel_listing.__doc__
+    assert "SHOPIFY only" not in doc
+    assert "NOT YET LIVE-PROVEN" not in doc
+    for cfg in server.GLT_CHANNELS.values():
+        if cfg["delete_proven"]:
+            assert cfg["channel_type"].upper() in doc, (
+                f"unpublish_channel_listing's docstring doesn't name "
+                f"{cfg['channel_type']} as a live-proven Delete channel"
+            )
+
+
 # --- refund channel-push proof state (issue #79) -----------------------------
 # server.REFUND_CHANNEL_PUSH_PROVEN is the single source of truth for whether
 # ReturnsRefunds/ActionRefund (the push to a sales channel) has been shown to

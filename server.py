@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.55.10"
+__version__ = "1.55.11"
 
 import json
 import os
@@ -16988,12 +16988,16 @@ def unpublish_channel_listing(
     retire — NOT the good listing you want to keep. Re-listing later is possible,
     but the original listing's channel history (reviews / SEO) is not recoverable.
 
-    ⚠️  AMAZON / TIKTOK ARE NOT YET LIVE-PROVEN. `ProcessTemplates` Delete is
-    live-proven on SHOPIFY only (v1.25.0). The Amazon read/selection path is
-    live-probed and the delete payload is identical bar ChannelType/ChannelName,
-    but the delete SEMANTICS on Amazon are unverified — prove it on ONE throwaway
-    Amazon listing before any bulk run, exactly as Shopify was proven. Each plan
-    row carries `delete_proven` so an unproven channel is never silently assumed.
+    ✅  `ProcessTemplates` Delete is LIVE-PROVEN on SHOPIFY (v1.25.0, 8 Jul
+    2026), AMAZON (v1.32.0, 5 Aug 2026, template 31703) and TIKTOK (v1.42.0,
+    7 Aug 2026, template 30006). Each proof was checked on three surfaces: the
+    channel-SKU row gone, the template gone, other channels and stock untouched.
+    On Amazon the Delete worked even though the template read
+    `NextSuggestedAction: "NotAllowed"`; on TikTok it worked on a template at
+    `Status: "Errors while updating"`. Neither field gates a Delete. MAGENTO and
+    WALMART are NOT proven, and this tenant has no configurators on either.
+    Each plan row carries `delete_proven`, read from `GLT_CHANNELS`, so an
+    unproven channel is never silently assumed.
 
     ⚠️  eBay, Etsy, Mirakl and CDiscount are NOT GLT channels — they have no
     templates, so this tool cannot END a listing on any of them; that must be
