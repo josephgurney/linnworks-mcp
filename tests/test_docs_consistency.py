@@ -370,3 +370,35 @@ def test_delete_extended_properties_confirmed_endpoint_row_states_the_observed_s
     # instrumentation (not the tool itself) was needed to see it.
     assert "204" in row
     assert "CONFIRMED LIVE" in row
+
+
+
+CLAIM = "Spec-based, not yet live-run"
+
+
+def test_no_version_note_still_calls_delete_extended_properties_unproven():
+    """Every surviving 'not yet live-run' claim for this tool must be struck.
+
+    The tools-table and confirmed-endpoints rows were corrected by #90, but the
+    v1.49.0 note kept the original claim un-struck -- the first place a reader
+    tracing the tool's history meets it. A note may only still contain the
+    phrase inside a ``~~...~~`` strike-through carrying a SUPERSEDED pointer,
+    or inside quotes (a later note describing the correction, as v1.56.2 does).
+    """
+    for note in re.findall(r"^> \*\*v[\d.]+.*$", CLAUDE_MD, re.M):
+        if CLAIM not in note:
+            continue
+        struck = re.findall(r"~~.*?~~", note)
+        if any(CLAIM in s for s in struck):
+            assert "SUPERSEDED" in note, (
+                "the struck claim needs a '<- SUPERSEDED' pointer to the entry "
+                "that disproved it: " + note[:120]
+            )
+            continue
+        # Not struck -- the only other allowed form is a quoted mention.
+        asserted = re.sub(r"~~.*?~~", "", note)
+        asserted = re.sub(r'"[^"]*"', "", asserted)
+        assert CLAIM not in asserted, (
+            "a version note still claims delete_extended_properties was never "
+            "fired live, outside a strike-through: " + note[:120]
+        )
