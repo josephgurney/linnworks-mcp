@@ -1,6 +1,6 @@
 # Linnworks MCP Server — Claude context
 
-**Current version: 1.55.11** — 96 tools. See `pyproject.toml` for full metadata.
+**Current version: 1.55.11** — 97 tools. See `pyproject.toml` for full metadata.
 
 ---
 
@@ -366,7 +366,7 @@ def set_stock_levels(updates: list[dict], confirmed_count: int | None = None, dr
 
 ## Tools
 
-96 tools. `python server.py --list-tools` is the authoritative count; see `server.py` for full docstrings and parameter details.
+97 tools. `python server.py --list-tools` is the authoritative count; see `server.py` for full docstrings and parameter details.
 
 > **v1.55.11 — `unpublish_channel_listing`'s docstring stops saying Amazon and TikTok deletes are unproven (22 Sep 2026):** Text-only; no behaviour change. The docstring still said Delete was "live-proven on SHOPIFY only (v1.25.0)" and told the reader to prove Amazon on a throwaway listing first, though Amazon was proven in v1.32.0 (5 Aug 2026) and TikTok in v1.42.0 (7 Aug 2026). The runtime warnings were already right, because they come from `GLT_CHANNELS` through `_proven_delete_channels()`. Only the docstring, which Claude reads when choosing and using the tool, had been left behind: the same drift the hard-coded "only Shopify is" string caused before v1.42.0. It now names the three proven channels with their dates and templates, says neither `NextSuggestedAction` nor `Status` gates a Delete, and says Magento and Walmart are unproven. A new `test_docs_consistency.py` guard reads `GLT_CHANNELS` and fails if the docstring calls a proven channel unproven, or leaves one out.
 
@@ -503,6 +503,7 @@ Built in v1.56.0 from `docs/superpowers/specs/2026-09-22-pickwave-write-tools-de
 | Tool | Endpoint(s) | Threshold | Key notes |
 |---|---|---|---|
 | `generate_pick_waves(waves, location_id, confirmed_count, dry_run=True)` | `Picking/GeneratePickingWave` (one POST per wave) + `CheckAllocatableToPickwave` + `OpenOrders/GetIdentifiersByOrderIds` + `GetPickwaveUsersWithSummary` | 25 orders | Each wave `{order_ids, user_id?, sorting_type=BinPriority, group_type=Items}`. Refused before any write: an order appearing twice (including once by GUID and once by number), or a `user_id` not on the live picker roster. An unresolved order blocks its own wave only. Linnworks' pickability check and a FIFO_READY check feed the manifest; missing FIFO_READY is a **warning, not a block**. A throttle during the checks stops with nothing written. Per-wave outcome: `created` / `refused` (ValidationResults verbatim) / `rate_limited` / `error` / `unconfirmed` / `blocked`. **Not atomic across waves**: a partial run names the created waves and says not to re-run the batch. Whether the body is wrapped is set by `_PICKING_WRITE_WRAPPED`. |
+| `update_pick_wave(picking_wave_id, user_id, unassign, state, allow_in_progress, dry_run=True)` | `Picking/UpdatePickingWaveHeader` (POST) | — (single wave) | Reassign (`user_id`, validated against the roster), unassign (`UserId: -1`), or set `state` to **Abandoned / Paused / Unallocated only**. Abandoning an InProgress wave, or setting it back to Unallocated, needs `allow_in_progress=True`; pausing it doesn't. **`State` is always sent**, even for a reassign, and StartTime/EndTime are carried through — the spec says only that a null `UserId` keeps the user, so a missing `State` could reset to the enum default. The read-back uses the **Abandoned header list** for an abandon, because GetPickingWave drops finished waves. Outcome `updated` / `not_applied` / `unconfirmed` / `rate_limited` / `error`. |
 
 ### Reporting (read, autopaginating)
 

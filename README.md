@@ -1,7 +1,7 @@
 # Linnworks MCP Server
 
 ![Version](https://img.shields.io/badge/version-1.55.11-blue)
-![Tools](https://img.shields.io/badge/tools-96-blue)
+![Tools](https://img.shields.io/badge/tools-97-blue)
 
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
 
@@ -98,6 +98,7 @@ Once installed, Claude gets access to these tools:
 | Tool | What it does |
 |---|---|
 | `generate_pick_waves` | Create one or more pickwaves (one Linnworks call per wave). Checks every order first — resolves it, runs Linnworks' pickability check, warns if it isn't FIFO_READY — and validates the picker. Staged above 25 orders. Each new wave is read back; a partial multi-wave run says which waves exist and not to re-run the batch |
+| `update_pick_wave` | Reassign or unassign a wave's picker, or set it to Paused, Unallocated or Abandoned (progress states aren't settable). Abandoning or unallocating an InProgress wave needs `allow_in_progress=True`. Read back after every change |
 
 **Categories (writes default to dry_run=True)**
 

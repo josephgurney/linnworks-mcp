@@ -36,7 +36,7 @@ class TestRegistration:
 
     def test_total_tool_count(self):
         registered = asyncio.run(server.mcp.list_tools())
-        assert len(registered) == 96
+        assert len(registered) == 97
 
 
 # ── AC2: no write-tool machinery on any of the four ─────────────────────────

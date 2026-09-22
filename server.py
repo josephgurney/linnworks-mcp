@@ -8344,6 +8344,156 @@ def generate_pick_waves(
     }
 
 
+def _read_back_updated_wave(
+    picking_wave_id: int,
+    expected_state: str,
+    expected_user: int | None,
+    check_user: bool,
+    location_id: str,
+) -> dict:
+    """
+    Re-read a wave after UpdatePickingWaveHeader. An Abandoned wave drops out
+    of GetPickingWave, so it is looked up in the Abandoned header list instead.
+    `check_user` is False only for an abandon that didn't touch the user,
+    since the header list isn't relied on to carry the assignee.
+    """
+    try:
+        if expected_state == "Abandoned":
+            after = _find_wave_header(picking_wave_id, "Abandoned", location_id)
+        else:
+            after = _format_pick_wave_detail(_fetch_pick_wave(picking_wave_id))
+    except RateLimitError as exc:
+        return {"outcome": "unconfirmed", "complete": False, "readback_error": f"rate limited: {exc}"}
+    except RuntimeError as exc:
+        return {"outcome": "unconfirmed", "complete": False, "readback_error": str(exc)}
+    if after is None:
+        return {"outcome": "unconfirmed", "complete": False,
+                "readback_error": f"wave {picking_wave_id} could not be found after the update"}
+    state_ok = after["state"] == expected_state
+    user_ok = (after["user_id"] == expected_user) if check_user else True
+    applied = state_ok and user_ok
+    return {
+        "outcome": "updated" if applied else "not_applied",
+        "complete": applied,
+        "after_state": after["state"],
+        "after_user_id": after["user_id"],
+        "after_email": after["email_address"],
+    }
+
+
+@mcp.tool()
+def update_pick_wave(
+    picking_wave_id: int,
+    user_id: int | None = None,
+    unassign: bool = False,
+    state: str | None = None,
+    allow_in_progress: bool = False,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Reassign, unassign, pause, reset or abandon one pickwave
+    (Picking/UpdatePickingWaveHeader).
+
+    - user_id: assign the wave to this picker (see get_pick_wave_users).
+    - unassign=True: remove the picker (sends UserId -1). Not with user_id.
+    - state: "Paused", "Unallocated" or "Abandoned" only. Allocated is set by
+      assigning a user; InProgress, Complete, Packing and Shipped describe
+      physical work on the warehouse floor and are deliberately not settable.
+
+    Abandoning an InProgress wave, or setting it back to Unallocated, needs
+    allow_in_progress=True — a picker may be working it. Pausing doesn't.
+
+    The wave's current state is always sent, even when only the picker
+    changes, and its start/end times are carried through: leaving them out
+    could reset them on the server. Omitting UserId keeps the current picker
+    (per the API spec — verified by the #67 live proof).
+
+    Reads the wave back afterwards (from the Abandoned header list for an
+    abandon, because the detail endpoint drops finished waves) and reports
+    outcome updated / not_applied / unconfirmed / rate_limited / error.
+    dry_run=True by default.
+    """
+    if user_id is not None and unassign:
+        return {"success": False, "error": "Pass user_id OR unassign=True, not both."}
+    if user_id is None and not unassign and state is None:
+        return {"success": False, "error": "Nothing to change — pass user_id, unassign=True, or state."}
+    if state is not None and state not in _PICK_WAVE_SETTABLE_STATES:
+        return {"success": False, "error": (
+            f"state must be one of {list(_PICK_WAVE_SETTABLE_STATES)}. Allocated is set by "
+            "assigning a user_id; InProgress, Complete, Packing and Shipped describe physical "
+            "work on the warehouse floor and are deliberately not settable here.")}
+    if user_id is not None and (isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0):
+        return {"success": False, "error": "user_id must be a positive integer (see get_pick_wave_users)."}
+
+    try:
+        current = _format_pick_wave_detail(_fetch_pick_wave(picking_wave_id))
+    except RateLimitError as exc:
+        return {"success": False, "picking_wave_id": picking_wave_id,
+                "outcome": "rate_limited", "complete": False, "error": str(exc)}
+    except RuntimeError as exc:
+        return {"success": False, "picking_wave_id": picking_wave_id,
+                "error": f"Reading the wave failed — nothing was written: {exc}"}
+    if current is None:
+        return {"success": False, "picking_wave_id": picking_wave_id,
+                "error": "No live wave with that id. " + _PICK_WAVE_EMPTY_DETAIL_NOTE}
+
+    current_state = current["state"]
+    if state in ("Abandoned", "Unallocated") and current_state == "InProgress" and not allow_in_progress:
+        return {"success": False, "picking_wave_id": picking_wave_id, "current_state": current_state,
+                "error": (f"Wave {picking_wave_id} is InProgress — a picker may be working it. "
+                          f"Setting it to {state} needs allow_in_progress=True. Pausing is allowed "
+                          "without it.")}
+
+    if user_id is not None:
+        try:
+            roster = _fetch_picker_roster()
+        except RateLimitError as exc:
+            return _pick_wave_preflight_throttled([{"step": "picker roster", "reason": str(exc)}])
+        except RuntimeError as exc:
+            return {"success": False,
+                    "error": f"Picker roster lookup failed — nothing was written: {exc}"}
+        if user_id not in roster:
+            return _pick_wave_unknown_user(user_id, roster)
+
+    target_state = state or current_state
+    expected_user = None if unassign else (user_id if user_id is not None else current["user_id"])
+    location = current.get("location_id") or DEFAULT_LOCATION_ID
+
+    body: dict = {"PickingWaveId": picking_wave_id, "State": target_state}
+    if unassign:
+        body["UserId"] = -1
+    elif user_id is not None:
+        body["UserId"] = user_id
+    for field, key in (("start_time", "StartTime"), ("end_time", "EndTime")):
+        if current.get(field):
+            body[key] = current[field]
+
+    plan = {
+        "picking_wave_id": picking_wave_id,
+        "current_state": current_state,
+        "current_user_id": current["user_id"],
+        "current_email": current["email_address"],
+        "new_state": target_state,
+        "new_user_id": expected_user,
+        "order_count": len(current["orders"]),
+    }
+    if dry_run:
+        return {"dry_run": True, "plan": plan, "message": "Dry run — nothing was changed."}
+
+    try:
+        _picking_write("Picking/UpdatePickingWaveHeader", body)
+    except RateLimitError as exc:
+        return {"dry_run": False, "plan": plan, "outcome": "rate_limited",
+                "complete": False, "error": str(exc)}
+    except RuntimeError as exc:
+        return {"dry_run": False, "plan": plan, "outcome": "error",
+                "complete": False, "error": str(exc)}
+
+    check_user = not (target_state == "Abandoned" and user_id is None and not unassign)
+    return {"dry_run": False, "plan": plan,
+            **_read_back_updated_wave(picking_wave_id, target_state, expected_user, check_user, location)}
+
+
 @mcp.tool()
 def get_category_report(
     from_date: str,
