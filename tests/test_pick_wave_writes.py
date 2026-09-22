@@ -816,6 +816,16 @@ class TestGenerateLive:
         assert out["outcome"] == "unconfirmed"
         assert out["readback_error"] == "HTTP 500 — boom"
 
+    # F — a plain exception (timeout, dropped connection) at the read-back
+    # must not escape; it is unconfirmed like every other read-back failure.
+    def test_generated_wave_readback_timeout_is_unconfirmed(self):
+        fake = FakeLinnworks(raise_on={
+            "Picking/GetPickingWave": requests.exceptions.Timeout("read timed out")})
+        with fake.active():
+            out = server._read_back_generated_wave([9001], [611385])
+        assert out["outcome"] == "unconfirmed"
+        assert out["readback_error"] == "Timeout: read timed out"
+
 
 # ── update_pick_wave ────────────────────────────────────────────────────────
 
@@ -1063,6 +1073,19 @@ class TestUpdateLive:
             out = server.update_pick_wave(9001, state="Paused", dry_run=False)
         assert out["outcome"] == "unconfirmed"
 
+    # F — a timeout at the read-back must not escape either.
+    def test_readback_timeout_is_unconfirmed(self):
+        fake = FakeLinnworks(waves={9001: _assigned_wave()})
+
+        def handler(body):
+            fake.raise_on["Picking/GetPickingWave"] = requests.exceptions.Timeout("read timed out")
+            return {}
+        fake.on_write["Picking/UpdatePickingWaveHeader"] = handler
+        with fake.active():
+            out = server.update_pick_wave(9001, state="Paused", dry_run=False)
+        assert out["outcome"] == "unconfirmed"
+        assert out["readback_error"] == "Timeout: read timed out"
+
     def test_body_wrapping_follows_the_flag(self):
         fake = FakeLinnworks(waves={9001: _assigned_wave()})
         fake.on_write["Picking/UpdatePickingWaveHeader"] = _update_applies(fake)
@@ -1080,6 +1103,18 @@ class TestUpdateLive:
         assert out["outcome"] == "error"
         assert out["complete"] is False
         assert "HTTP 500 — boom" in out["error"]
+
+    # F — a timeout on the write itself must not escape; it is unconfirmed
+    # (the change may have gone through), not a plain error.
+    def test_write_timeout_is_unconfirmed(self):
+        fake = FakeLinnworks(waves={9001: _assigned_wave()}, raise_on={
+            "Picking/UpdatePickingWaveHeader": OSError("connection reset")})
+        with fake.active():
+            out = server.update_pick_wave(9001, state="Paused", dry_run=False)
+        assert out["outcome"] == "unconfirmed"
+        assert out["complete"] is False
+        assert out["error"] == "OSError: connection reset"
+        assert "get_pick_wave_detail" in out["note"]
 
     # I4 — judge only what the caller asked to change; report the rest.
     def test_reassign_where_the_server_also_moves_the_state(self):
@@ -1187,6 +1222,48 @@ class TestUpdateLive:
         assert "user_changed_by_server" not in out
 
 
+# ── update_pick_wave: abandoning does NOT release the wave's orders ────────
+# Live-confirmed 22 Sep 2026 (#67 contained test) — see CLAUDE.md.
+
+class TestUpdateAbandonWarning:
+
+    def test_abandoning_a_wave_with_orders_warns_on_dry_run(self):
+        fake = FakeLinnworks(waves={9001: _assigned_wave()})
+        with fake.active():
+            out = server.update_pick_wave(9001, state="Abandoned")
+        assert out["dry_run"] is True
+        assert out["warning"] == server._PICK_WAVE_ABANDON_WARNING
+
+    def test_abandoning_a_wave_with_orders_warns_live(self):
+        fake = FakeLinnworks(waves={9001: _assigned_wave()})
+        fake.on_write["Picking/UpdatePickingWaveHeader"] = _update_applies(fake)
+        with fake.active():
+            out = server.update_pick_wave(9001, state="Abandoned", dry_run=False)
+        assert out["outcome"] == "updated"
+        assert out["warning"] == server._PICK_WAVE_ABANDON_WARNING
+
+    def test_abandoning_an_empty_wave_carries_no_warning_on_dry_run(self):
+        fake = FakeLinnworks(waves={9001: _wave_resp(wave_id=9001, user_id=19, email=JO)})
+        with fake.active():
+            out = server.update_pick_wave(9001, state="Abandoned")
+        assert out["dry_run"] is True
+        assert "warning" not in out
+
+    def test_abandoning_an_empty_wave_carries_no_warning_live(self):
+        fake = FakeLinnworks(waves={9001: _wave_resp(wave_id=9001, user_id=19, email=JO)})
+        fake.on_write["Picking/UpdatePickingWaveHeader"] = _update_applies(fake)
+        with fake.active():
+            out = server.update_pick_wave(9001, state="Abandoned", dry_run=False)
+        assert out["outcome"] == "updated"
+        assert "warning" not in out
+
+    def test_non_abandon_change_carries_no_warning(self):
+        fake = FakeLinnworks(waves={9001: _assigned_wave()})
+        with fake.active():
+            out = server.update_pick_wave(9001, user_id=68)
+        assert "warning" not in out
+
+
 # ── remove_orders_from_pick_waves ───────────────────────────────────────────
 
 def _two_open_waves():
@@ -1276,6 +1353,19 @@ class TestRemoveOrders:
         assert out["outcome"] == "error"
         assert msg in out["error"]
 
+    # F — a timeout on the delete itself must not escape; it is unconfirmed
+    # (the removal may have gone through), not a plain error.
+    def test_write_timeout_is_unconfirmed(self):
+        fake = FakeLinnworks(orders=ORDERS, raise_on={
+            "Picking/DeleteOrdersFromPickingWaves": requests.exceptions.Timeout("read timed out")},
+            **_two_open_waves())
+        with fake.active():
+            out = server.remove_orders_from_pick_waves(["611385"], dry_run=False)
+        assert out["outcome"] == "unconfirmed"
+        assert out["complete"] is False
+        assert out["error"] == "Timeout: read timed out"
+        assert "get_pick_wave_detail" in out["note"]
+
     def test_rate_limit_while_locating_writes_nothing(self):
         fake = FakeLinnworks(orders=ORDERS, raise_on={
             "Picking/GetAllPickingWaveHeaders": server.RateLimitError("quota exceeded")})
@@ -1326,14 +1416,16 @@ class TestRemoveOrders:
         assert {r["outcome"] for r in out["results"]} == {"removed"}
         assert out["complete"] is True
 
-    # M5 — Linnworks' delete is not location-scoped.
+    # M5 — Linnworks' delete is neither state- nor location-scoped; live-
+    # confirmed 22 Sep 2026 for an order held by an ABANDONED wave.
     def test_not_found_note_says_the_delete_is_not_location_scoped(self):
         fake = FakeLinnworks(orders=ORDERS, **_two_open_waves())
         with fake.active():
             out = server.remove_orders_from_pick_waves(["611387"])
         note = out["manifest"][0]["note"]
         assert note.startswith("Not found in any open wave at this location.")
-        assert "not location-scoped" in note
+        assert "neither state- nor location-scoped" in note
+        assert "ABANDONED" in note
 
     # I5 — the warning covers any started wave.
     @pytest.mark.parametrize("state", ["InProgress", "Paused", "Complete", "Packing"])
@@ -1393,6 +1485,22 @@ class TestRemoveOrders:
             out = server.remove_orders_from_pick_waves(["611385"], dry_run=False)
         assert out["results"][0]["outcome"] == "unconfirmed"
         assert out["results"][0]["readback_error"] == "HTTP 500 — boom"
+
+    # F — a timeout at the per-wave read-back is broadened to Exception, not
+    # just RuntimeError, and must not escape.
+    def test_readback_timeout_is_kept_verbatim(self):
+        fake = FakeLinnworks(orders=ORDERS, **_two_open_waves())
+        remove = _delete_removes(fake)
+
+        def handler(body):
+            reply = remove(body)
+            fake.raise_on["Picking/GetPickingWave"] = requests.exceptions.Timeout("read timed out")
+            return reply
+        fake.on_write["Picking/DeleteOrdersFromPickingWaves"] = handler
+        with fake.active():
+            out = server.remove_orders_from_pick_waves(["611385"], dry_run=False)
+        assert out["results"][0]["outcome"] == "unconfirmed"
+        assert out["results"][0]["readback_error"] == "read timed out"
 
     def test_removed_order_carries_no_readback_error(self):
         fake = FakeLinnworks(orders=ORDERS, **_two_open_waves())

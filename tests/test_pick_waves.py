@@ -68,10 +68,13 @@ class TestModuleLevelSymbols:
         assert len(server._PICK_WAVE_STATE_LABELS) > 0
 
     def test_state_label_mapping_only_contains_live_observed_states(self):
-        # Only Abandoned and Shipped were actually seen on a real wave live
-        # during this build (see CLAUDE.md) — the other six documented enum
-        # values must NOT be pre-guessed into the map.
-        assert set(server._PICK_WAVE_STATE_LABELS) == {"Abandoned", "Shipped"}
+        # Abandoned and Shipped were seen during #64; Unallocated, Allocated
+        # and InProgress were confirmed live during the #67 contained test on
+        # 22 Sep 2026 (waves 3552/3553/3531). Complete, Packing and Paused
+        # must NOT be pre-guessed into the map.
+        assert set(server._PICK_WAVE_STATE_LABELS) == {
+            "Abandoned", "Shipped", "Unallocated", "Allocated", "InProgress",
+        }
 
     def test_formatters_are_module_level_functions(self):
         assert inspect.isfunction(server._format_pick_wave)
@@ -93,15 +96,16 @@ class TestStateLabelling:
         assert out["state_confirmed"] is True
 
     def test_unconfirmed_but_documented_state_is_explicit_unknown_not_guessed(self):
-        # "InProgress" is a real, spec-documented state, but was never
-        # observed on a genuine wave live during this build.
-        row = {"PickingWaveId": 42, "State": "InProgress"}
+        # "Packing" is a real, spec-documented state, but was never observed
+        # on a genuine wave live during this build (unlike Unallocated,
+        # Allocated and InProgress, confirmed live 22 Sep 2026 — see #67).
+        row = {"PickingWaveId": 42, "State": "Packing"}
         out = server._format_pick_wave(row)
-        assert out["state"] == "InProgress"
+        assert out["state"] == "Packing"
         assert out["state_confirmed"] is False
         assert out["state_label"] is not None
         assert "unknown" in out["state_label"].lower()
-        assert "InProgress" in out["state_label"]
+        assert "Packing" in out["state_label"]
 
     def test_unmapped_state_label_is_never_null(self):
         row = {"PickingWaveId": 1, "State": "SomethingNeverSeenBefore"}

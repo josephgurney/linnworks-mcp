@@ -7072,9 +7072,11 @@ def find_unlinked_order_lines(
 #
 # Four READ-ONLY tools over the /api/Picking/ endpoint family, which this repo
 # has never called before this build. The write half (generate a wave, remove
-# orders from one, update/abandon it) is issue #67, deliberately held — see
-# CLAUDE.md's Conflicts note. Nothing in this section writes to Linnworks:
-# no dry_run parameter, no WRITE_THRESHOLDS entry, no call_linnworks_void.
+# orders from one, update/abandon it) is issue #67 — those writes now exist as
+# generate_pick_waves, update_pick_wave and remove_orders_from_pick_waves (see
+# the "Pickwave detail + writes (issue #67)" section below). Nothing in THIS
+# section writes to Linnworks: no dry_run parameter, no WRITE_THRESHOLDS
+# entry, no call_linnworks_void.
 #
 # Everything below was live-probed against the real tenant during this build
 # (see CLAUDE.md's confirmed-endpoints table for the exact request shapes and
@@ -7148,24 +7150,33 @@ def find_unlinked_order_lines(
 #     PickingWaveId to target an existing wave — it can only create new ones.
 #     The only routes that touch wave membership at all are
 #     DeleteOrdersFromPickingWaves (removal) and GeneratePickingWave (create/
-#     regenerate) — both are write endpoints held for #67.
+#     regenerate) — both are #67 write endpoints, now wrapped as
+#     remove_orders_from_pick_waves and generate_pick_waves respectively.
 
 # Raw `State` values from the live Picking API (GetAllPickingWaveHeaders,
-# GetPickwaveUsersWithSummary) that have actually been observed on a REAL wave
-# during this build, each cross-checked against a genuine PickingWaveId/
-# CreatedDate row — not merely present in the API's documented enum. The
-# documented enum also lists Unallocated, Allocated, InProgress, Paused,
-# Complete and Packing (confirmed live as valid FILTER values — they just
-# never matched a real wave here, because nothing was actively being picked
-# during this build), but none of those has been seen on a genuine wave row,
-# so none is mapped here. A human confirming one of those states against the
-# Linnworks UI screen (per CLAUDE.md's post-merge verification steps) is what
-# would extend this dict — never a guess from the enum name alone. This is
-# deliberately module-level, not nested in a tool, so #67's write tools import
-# it rather than minting a second, possibly-divergent state map (the mistake
-# this repo already made once with _ORDER_STATUS_LABELS vs
-# _PAYMENT_STATUS_LABELS, and does not want to repeat a third time).
+# GetPickwaveUsersWithSummary) that have actually been observed on a REAL wave,
+# each cross-checked against a genuine PickingWaveId/CreatedDate row — not
+# merely present in the API's documented enum. Confirmed so far:
+#   - Unallocated: confirmed ON SCREEN by the owner (wave 3552, 22 Sep 2026).
+#   - Allocated: seen live on waves 3552/3553, matching the Linnworks UI
+#     column — generating a wave with a UserId sets it automatically.
+#   - InProgress: seen live on wave 3531 (22 Sep 2026), shown as "In Progress"
+#     in the UI.
+#   - Abandoned / Shipped: confirmed via the header list (see get_pick_waves).
+# Complete, Packing and Paused are valid per the documented enum (and valid
+# FILTER values — see get_pick_waves) but have never been seen on a real wave
+# row, so they are deliberately still unlabelled. A human confirming one of
+# those against the Linnworks UI screen (per CLAUDE.md's post-merge
+# verification steps) is what would extend this dict — never a guess from the
+# enum name alone. This is deliberately module-level, not nested in a tool,
+# so #67's write tools import it rather than minting a second, possibly-
+# divergent state map (the mistake this repo already made once with
+# _ORDER_STATUS_LABELS vs _PAYMENT_STATUS_LABELS, and does not want to repeat
+# a third time).
 _PICK_WAVE_STATE_LABELS: dict[str, str] = {
+    "Unallocated": "Unallocated",
+    "Allocated": "Allocated",
+    "InProgress": "In Progress",
     "Abandoned": "Abandoned",
     "Shipped": "Shipped",
 }
@@ -7342,8 +7353,9 @@ def get_pick_waves(
     a wave that already exists; GeneratePickingWave has no field to target an
     existing wave, so it only ever creates new ones. The only routes that
     touch wave membership at all are removing orders
-    (DeleteOrdersFromPickingWaves) or regenerating the wave — both are write
-    endpoints held for issue #67, not available here.
+    (remove_orders_from_pick_waves) or regenerating the wave
+    (generate_pick_waves) — see those tools, and get_pick_wave_detail for the
+    live order/item detail this tool's own header rows don't carry.
 
     This tool never computes or returns a summed weight or volume for a wave.
     The underlying payload carries no such field, and even if it did,
@@ -7759,18 +7771,23 @@ def check_orders_pickable(order_ids: list[str]) -> dict:
 #
 # Live facts this section relies on (confirmed read-only, 22 Sep 2026 — see
 # docs/superpowers/specs/2026-09-22-pickwave-write-tools-design.md):
-#   - Picking/GetPickingWave returns full order + item detail for a LIVE wave,
-#     and NOTHING for a finished (Shipped/Abandoned) wave. The v1.54.0 note
-#     that it "returns zero waves" was only ever tested on finished waves.
+#   - Picking/GetPickingWave returns full order + item detail for a LIVE wave.
+#     It returns NOTHING for a SHIPPED wave, or an EMPTIED wave (removing a
+#     wave's last order auto-abandons it — confirmed live 22 Sep 2026, see the
+#     #67 contained test). An ABANDONED wave that still holds orders IS
+#     returned by it. The v1.54.0 note that it "returns zero waves" was only
+#     ever tested on waves that were already shipped or emptied.
 #   - The wave row carries UserId/EmailAddress only while the wave is assigned
 #     (the keys are ABSENT, not null, when unassigned).
 #   - Bins[] on that response carries real bin codes (e.g. "10-A-03"), even
 #     though GetItemBinracks errors on every item here (non-WMS locations).
 
 _PICK_WAVE_EMPTY_DETAIL_NOTE = (
-    "Linnworks returned no wave for this id. It does this for a FINISHED wave "
-    "(Shipped or Abandoned) — confirmed live 22 Sep 2026 — and for an id that "
-    "doesn't exist. It does NOT mean the wave has no orders. Use "
+    "Linnworks returned no wave for this id. It does this for some FINISHED "
+    "waves: a SHIPPED wave, or an EMPTIED wave (removing a wave's last order "
+    "auto-abandons it) — confirmed live 22 Sep 2026 — or for an id that "
+    "doesn't exist. An ABANDONED wave that still holds orders IS returned. "
+    "An empty response here does NOT mean the wave has no orders. Use "
     "get_pick_waves(state='Shipped' or 'Abandoned') to see a finished wave's "
     "header counts."
 )
@@ -7877,9 +7894,11 @@ def get_pick_wave_detail(picking_wave_id: int) -> dict:
     `blockers` lists orders in the wave that are now locked, on hold,
     cancelled or processed — the candidates for remove_orders_from_pick_waves.
 
-    ⚠️  Linnworks returns NOTHING for a finished wave (Shipped or Abandoned),
-    or for an unknown id. That comes back as found=False with a note, never as
-    "this wave has no orders". An unassigned wave has user_id None.
+    ⚠️  Linnworks returns NOTHING for a SHIPPED wave or an EMPTIED wave
+    (removing a wave's last order auto-abandons it — confirmed live 22 Sep
+    2026), or for an unknown id. That comes back as found=False with a note,
+    never as "this wave has no orders". An ABANDONED wave that still holds
+    orders IS returned here. An unassigned wave has user_id None.
 
     Bin codes come from the wave's own Bins data. That works on this tenant
     even though get_item_bins can't (there are no WMS-managed locations).
@@ -7916,6 +7935,16 @@ def get_pick_wave_detail(picking_wave_id: int) -> dict:
 
 
 _PICK_WAVE_SETTABLE_STATES = ("Abandoned", "Paused", "Unallocated")
+# Live-confirmed 22 Sep 2026 (#67 contained test): abandoning a wave does NOT
+# free the orders still in it — Linnworks keeps them attached to the
+# abandoned wave, so remove_orders_from_pick_waves is still required before
+# they can go into a new one. update_pick_wave surfaces this on both the
+# dry-run plan and the live result whenever the wave still holds orders.
+_PICK_WAVE_ABANDON_WARNING = (
+    "Abandoning does NOT release its orders — Linnworks keeps them in the "
+    "abandoned wave, so they can't go into a new wave until removed with "
+    "remove_orders_from_pick_waves (live-confirmed 22 Sep 2026)."
+)
 _PICK_WAVE_OPEN_STATES = ("Unallocated", "Allocated", "InProgress", "Paused", "Complete", "Packing")
 # Every State value in picking.json's enum. update_pick_wave refuses a wave
 # whose current state isn't one of these, because it sends that state back.
@@ -7940,12 +7969,9 @@ _FIFO_READY_TAG = "FIFO_READY"
 #     Of the 8 style-A endpoints with a live answer, 6 are unwrapped
 #     (SearchOrders, Search_PurchaseOrders2, GetIdentifiersByOrderIds,
 #     UpdateStockLevelsBulk, GetStockItemsByIds, GetOpenOrdersDetails).
-# The two ways of getting it wrong are not equal. A wrapped body sent to an
-# unwrapped endpoint can be accepted with every field defaulted, silently (a
-# stray wave, or a header reset). An unwrapped body sent to a wrapped endpoint
-# 400s loudly ("'request' parameter is missing") and nothing is created. So the
-# first live call goes UNWRAPPED, and the entry flips to True only on that
-# loud 400. The #67 live proof (plan Task 7) records the answer in CLAUDE.md.
+# Live-confirmed 22 Sep 2026 (#67 contained test, waves 3552/3553): Generate
+# and UpdateHeader take the UNWRAPPED body; DeleteOrdersFromPickingWaves takes
+# the WRAPPED body.
 _PICKING_WRITE_WRAPPED: dict[str, bool] = {
     "Picking/GeneratePickingWave": False,
     "Picking/UpdatePickingWaveHeader": False,
@@ -8124,6 +8150,9 @@ def _read_back_generated_wave(wave_ids: list[int], requested: list[int]) -> dict
     except RuntimeError as exc:
         return {"outcome": "unconfirmed", "picking_wave_ids": wave_ids,
                 "readback_error": str(exc)}
+    except Exception as exc:
+        return {"outcome": "unconfirmed", "picking_wave_ids": wave_ids,
+                "readback_error": f"{type(exc).__name__}: {exc}"}
     return {
         "outcome": "created",
         "picking_wave_ids": wave_ids,
@@ -8470,6 +8499,9 @@ def _read_back_updated_wave(
         return {"outcome": "unconfirmed", "complete": False, "readback_error": f"rate limited: {exc}"}
     except RuntimeError as exc:
         return {"outcome": "unconfirmed", "complete": False, "readback_error": str(exc)}
+    except Exception as exc:
+        return {"outcome": "unconfirmed", "complete": False,
+                "readback_error": f"{type(exc).__name__}: {exc}"}
     if after is None:
         return {"outcome": "unconfirmed", "complete": False,
                 "readback_error": f"wave {picking_wave_id} could not be found after the update"}
@@ -8507,14 +8539,23 @@ def update_pick_wave(
 
     - user_id: assign the wave to this picker (see get_pick_wave_users).
     - unassign=True: remove the picker (sends UserId -1). Not with user_id.
-    - state: "Paused", "Unallocated" or "Abandoned" only. Allocated is set by
-      assigning a user; InProgress, Complete, Packing and Shipped describe
-      physical work on the warehouse floor and are deliberately not settable.
+    - state: "Paused", "Unallocated" or "Abandoned" only.
+      generate_pick_waves with a user_id creates the wave Allocated;
+      update_pick_wave doesn't change state when you reassign. InProgress,
+      Complete, Packing and Shipped describe physical work on the warehouse
+      floor and are deliberately not settable here.
 
     Abandoning a STARTED wave, or setting it back to Unallocated, needs
     allow_in_progress=True — a picker may have items on a trolley. Started
     means the wave is InProgress, Paused, Complete or Packing, or has any item
     picked. Pausing doesn't need the flag.
+
+    ⚠️  Abandoning a wave that still holds orders does NOT release them —
+    Linnworks keeps them in the abandoned wave, so they can't go into a new
+    wave until removed with remove_orders_from_pick_waves (live-confirmed 22
+    Sep 2026). Both the dry-run plan and the live result carry a `warning`
+    saying exactly that whenever the wave still has orders; an empty wave
+    carries none.
 
     A wave whose current state isn't a documented pickwave state (including a
     missing state) is refused before any write, because the current state is
@@ -8523,17 +8564,22 @@ def update_pick_wave(
     The wave's current state is always sent, even when only the picker
     changes, and its start/end times are carried through: leaving them out
     could reset them on the server. Omitting UserId keeps the current picker
-    (per the API spec — to be verified by the #67 live proof).
+    — verified live 22 Sep 2026. Linnworks applies State literally: it does
+    NOT couple state to assignment. Reassigning or unassigning a wave never
+    changes its state, and setting state never changes who is assigned — a
+    wave can be Allocated with no picker, or Unallocated with a picker still
+    on it (both live-confirmed the same day).
 
     Reads the wave back afterwards (from the Abandoned header list for an
-    abandon, because the detail endpoint drops finished waves) and reports
-    outcome updated / not_applied / unconfirmed / rate_limited / error. The
-    outcome is judged only on what the call asked to change: a user change on
-    the user, a state change on the state, both when both were asked. If the
-    server changed the other field anyway, that is reported as
-    state_changed_by_server / user_changed_by_server rather than as a
-    failure. after_state and after_user_id are always the raw read-back
-    values; "no user" reads back as absent, 0 or -1. dry_run=True by default.
+    abandon, because an abandoned wave drops out of the detail endpoint once
+    it is empty) and reports outcome updated / not_applied / unconfirmed /
+    rate_limited / error. The outcome is judged only on what the call asked
+    to change: a user change on the user, a state change on the state, both
+    when both were asked. If the server changed the other field anyway, that
+    is reported as state_changed_by_server / user_changed_by_server rather
+    than as a failure. after_state and after_user_id are always the raw
+    read-back values; "no user" reads back as absent, 0 or -1. dry_run=True
+    by default.
     """
     if user_id is not None and unassign:
         return {"success": False, "error": "Pass user_id OR unassign=True, not both."}
@@ -8609,19 +8655,32 @@ def update_pick_wave(
         "new_user_id": expected_user,
         "order_count": len(current["orders"]),
     }
+    # Abandoning a wave that still holds orders doesn't free them — surface
+    # that on every response for this call, dry-run or live (live-confirmed
+    # 22 Sep 2026). An empty wave carries no warning.
+    abandon_warning = (
+        {"warning": _PICK_WAVE_ABANDON_WARNING}
+        if state == "Abandoned" and plan["order_count"] > 0 else {}
+    )
     if dry_run:
-        return {"dry_run": True, "plan": plan, "message": "Dry run — nothing was changed."}
+        return {"dry_run": True, "plan": plan, **abandon_warning,
+                "message": "Dry run — nothing was changed."}
 
     try:
         _picking_write("Picking/UpdatePickingWaveHeader", body)
     except RateLimitError as exc:
-        return {"dry_run": False, "plan": plan, "outcome": "rate_limited",
+        return {"dry_run": False, "plan": plan, **abandon_warning, "outcome": "rate_limited",
                 "complete": False, "error": str(exc)}
     except RuntimeError as exc:
-        return {"dry_run": False, "plan": plan, "outcome": "error",
+        return {"dry_run": False, "plan": plan, **abandon_warning, "outcome": "error",
                 "complete": False, "error": str(exc)}
+    except Exception as exc:  # a timeout or dropped connection, after sending
+        return {"dry_run": False, "plan": plan, **abandon_warning, "outcome": "unconfirmed",
+                "complete": False, "error": f"{type(exc).__name__}: {exc}",
+                "note": ("The request may have reached Linnworks and the change may have been "
+                         "applied. Check get_pick_wave_detail before trying again.")}
 
-    return {"dry_run": False, "plan": plan,
+    return {"dry_run": False, "plan": plan, **abandon_warning,
             **_read_back_updated_wave(
                 picking_wave_id, target_state, expected_user, current["user_id"],
                 judge_state=state is not None,
@@ -8672,9 +8731,11 @@ def remove_orders_from_pick_waves(
     numbers; an unresolvable id is reported, not raised. Staged above 25
     orders. dry_run=True by default.
 
-    ⚠️  Linnworks' delete is not location-scoped. An order the manifest
-    didn't find at this location may still be removed from a wave at another
-    location.
+    ⚠️  Linnworks' delete is neither location- nor state-scoped. An order the
+    manifest didn't find in an open wave at this location may still be held
+    by an ABANDONED wave (abandoning doesn't release orders — see
+    update_pick_wave) or a wave at another location, and this call frees it
+    either way — live-confirmed for an abandoned wave, 22 Sep 2026.
 
     Needs the DeletePickingWavesNode permission, which no read tool exercises
     — a missing permission comes back as outcome "error" with Linnworks'
@@ -8685,8 +8746,9 @@ def remove_orders_from_pick_waves(
     still finds it), or unconfirmed (the read-back failed — the row carries
     readback_error — or Linnworks' reply didn't say).
 
-    There is no endpoint to delete a wave itself: to retire an emptied wave,
-    use update_pick_wave(state="Abandoned").
+    There is no endpoint to delete a wave itself. Removing a wave's last
+    order makes Linnworks abandon the wave automatically (live-confirmed 22
+    Sep 2026) — there is nothing more to do to retire it.
     """
     if not order_ids:
         return {"success": False, "error": "order_ids is empty."}
@@ -8716,9 +8778,12 @@ def remove_orders_from_pick_waves(
             row["warning"] = (f"Wave {where['picking_wave_id']} has started ({where['wave_state']}) "
                               "— a picker may already have this order's items on a trolley.")
         if not where:
-            row["note"] = ("Not found in any open wave at this location. Linnworks' delete is not "
-                           "location-scoped — if the order is in a wave at another location, it "
-                           "may be removed from that one.")
+            row["note"] = (
+                "Not found in any open wave at this location. It may still be held by an "
+                "ABANDONED wave (abandoning doesn't release orders) or a wave at another "
+                "location — Linnworks' delete is neither state- nor location-scoped and frees "
+                "it either way (live-confirmed for an abandoned wave, 22 Sep 2026)."
+            )
         manifest.append(row)
 
     guard = _write_guard("remove_orders_from_pick_waves", resolved, confirmed_count, dry_run)
@@ -8745,6 +8810,12 @@ def remove_orders_from_pick_waves(
     except RuntimeError as exc:
         return {"dry_run": False, "manifest": manifest, "outcome": "error",
                 "complete": False, "error": str(exc)}
+    except Exception as exc:  # a timeout or dropped connection, after sending
+        return {"dry_run": False, "manifest": manifest, "outcome": "unconfirmed",
+                "complete": False, "error": f"{type(exc).__name__}: {exc}",
+                "note": ("The request may have reached Linnworks and the removal may have "
+                         "happened. Check get_pick_wave_detail / check_orders_pickable before "
+                         "trying again.")}
 
     # A reply that isn't a dict says nothing: every order falls through to the
     # read-back (still_present) or to unconfirmed.
@@ -8761,7 +8832,7 @@ def remove_orders_from_pick_waves(
         except RateLimitError as exc:
             readback_errors[wave_id] = f"rate limited: {exc}"
             continue
-        except RuntimeError as exc:
+        except Exception as exc:
             readback_errors[wave_id] = str(exc)
             continue
         if detail is not None:
