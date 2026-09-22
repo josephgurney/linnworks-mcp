@@ -8587,9 +8587,10 @@ def update_pick_wave(
         return {"success": False, "error": "Nothing to change — pass user_id, unassign=True, or state."}
     if state is not None and state not in _PICK_WAVE_SETTABLE_STATES:
         return {"success": False, "error": (
-            f"state must be one of {list(_PICK_WAVE_SETTABLE_STATES)}. Allocated is set by "
-            "assigning a user_id; InProgress, Complete, Packing and Shipped describe physical "
-            "work on the warehouse floor and are deliberately not settable here.")}
+            f"state must be one of {list(_PICK_WAVE_SETTABLE_STATES)}. generate_pick_waves with a "
+            "user_id creates the wave Allocated; update_pick_wave never changes the state when you "
+            "reassign. InProgress, Complete, Packing and Shipped describe physical work on the "
+            "warehouse floor and are deliberately not settable here.")}
     if user_id is not None and (isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0):
         return {"success": False, "error": "user_id must be a positive integer (see get_pick_wave_users)."}
 

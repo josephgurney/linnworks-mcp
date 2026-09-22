@@ -878,6 +878,16 @@ class TestUpdateRefusesBeforeAnyCall:
         assert "physical work" in out["error"]
         assert fake.calls == []
 
+    # Fix round 1 — the retracted "Allocated is set by assigning a user_id"
+    # phrase (live fact 4: reassigning never moves the state) must not
+    # reappear in this refusal message.
+    def test_progress_state_refusal_does_not_claim_reassign_sets_allocated(self):
+        with FakeLinnworks().active() as fake:
+            out = server.update_pick_wave(9001, state="Shipped")
+        assert "Allocated is set by" not in out["error"]
+        assert "generate_pick_waves with a user_id creates the wave Allocated" in out["error"]
+        assert "update_pick_wave never changes the state when you reassign" in out["error"]
+
     def test_non_positive_user_id(self):
         with FakeLinnworks().active() as fake:
             out = server.update_pick_wave(9001, user_id=0)

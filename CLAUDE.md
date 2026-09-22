@@ -499,7 +499,7 @@ def set_stock_levels(updates: list[dict], confirmed_count: int | None = None, dr
 
 ### Picking (read) — issue #64
 
-Four read-only tools over `/api/Picking/`, an endpoint family this repo had never called before. The write half — `GeneratePickingWave`, `DeleteOrdersFromPickingWaves`, `UpdatePickingWaveHeader`, and the item-level `UpdatePickingWaveItem`/`UpdatePickingWaveItemWithNewBinrack`/`UpdatePickedItemDelta` — is issue #67, deliberately held. `_PICK_WAVE_STATE_LABELS`, `_format_pick_wave`, and `_format_bin_row` are module-level so #67 can import them instead of minting a second, possibly-divergent state map.
+Four read-only tools over `/api/Picking/`, an endpoint family this repo had never called before. The write half — `GeneratePickingWave`, `UpdatePickingWaveHeader` and `DeleteOrdersFromPickingWaves` — shipped in v1.56.0 as `generate_pick_waves`, `update_pick_wave` and `remove_orders_from_pick_waves` (see the `### Picking (write) — issue #67` section below); the item-level endpoints (`UpdatePickingWaveItem`/`UpdatePickingWaveItemWithNewBinrack`/`UpdatePickedItemDelta`) are still not wrapped. `_PICK_WAVE_STATE_LABELS`, `_format_pick_wave`, and `_format_bin_row` are module-level so #67 can import them instead of minting a second, possibly-divergent state map.
 
 | Tool | Endpoint(s) | Key notes |
 |---|---|---|
