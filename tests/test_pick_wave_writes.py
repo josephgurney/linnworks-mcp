@@ -319,3 +319,198 @@ class TestSharedHelpers:
         assert server._as_int("611385") == 611385
         assert server._as_int(None) is None
         assert server._as_int("x") is None
+
+
+# ── generate_pick_waves ─────────────────────────────────────────────────────
+
+ORDERS = {
+    "611385": (GUID_A, 611385),
+    "611386": (GUID_B, 611386),
+    "611387": (GUID_C, 611387),
+    GUID_C: (GUID_C, 611387),
+}
+
+
+def _generate_creates(fake, wave_ids):
+    """on_write handler: each call creates the next wave id and registers it for read-back."""
+    ids = list(wave_ids)
+
+    def handler(body):
+        wid = ids.pop(0)
+        orders = [_wave_order(o["OrderId"], f"guid-{o['OrderId']}") for o in body["Orders"]]
+        fake.waves[wid] = _wave_resp(wave_id=wid, orders=orders, user_id=body.get("UserId"))
+        return {"ValidationResults": [], "PickingWaves": [{"PickingWaveId": wid}],
+                "Skus": [], "Bins": []}
+    return handler
+
+
+class TestGenerateRefusesBeforeAnyCall:
+
+    def test_empty_waves(self):
+        with FakeLinnworks().active() as fake:
+            out = server.generate_pick_waves([])
+        assert out["success"] is False
+        assert fake.calls == []
+
+    def test_bad_sorting_type(self):
+        with FakeLinnworks(orders=ORDERS).active() as fake:
+            out = server.generate_pick_waves(
+                [{"order_ids": ["611385"], "sorting_type": "Alphabetical"}])
+        assert out["success"] is False
+        assert "sorting_type" in out["error"]
+        assert fake.calls == []
+
+    def test_non_integer_user_id(self):
+        with FakeLinnworks(orders=ORDERS).active() as fake:
+            out = server.generate_pick_waves([{"order_ids": ["611385"], "user_id": "19"}])
+        assert out["success"] is False
+        assert fake.calls == []
+
+    def test_order_in_two_waves(self):
+        with FakeLinnworks(orders=ORDERS).active() as fake:
+            out = server.generate_pick_waves(
+                [{"order_ids": ["611385"]}, {"order_ids": ["611385"]}])
+        assert out["success"] is False
+        assert "more than once" in out["error"]
+        assert fake.calls == []
+
+
+class TestGenerateRefusesBeforeAnyWrite:
+
+    def test_same_order_by_guid_and_by_number(self):
+        with FakeLinnworks(orders=ORDERS).active() as fake:
+            out = server.generate_pick_waves(
+                [{"order_ids": ["611387"]}, {"order_ids": [GUID_C]}])
+        assert out["success"] is False
+        assert "611387" in out["error"]
+        assert fake.writes() == []
+
+    def test_unknown_user_id(self):
+        with FakeLinnworks(orders=ORDERS).active() as fake:
+            out = server.generate_pick_waves([{"order_ids": ["611385"], "user_id": 999}])
+        assert out["success"] is False
+        assert "not a Linnworks picker" in out["error"]
+        assert fake.writes() == []
+
+    def test_preflight_rate_limit_writes_nothing(self):
+        fake = FakeLinnworks(orders=ORDERS, raise_on={
+            "Picking/CheckAllocatableToPickwave": server.RateLimitError("quota exceeded")})
+        with fake.active():
+            out = server.generate_pick_waves([{"order_ids": ["611385"]}], dry_run=False)
+        assert out["success"] is False
+        assert out["complete"] is False
+        assert out["rate_limited"]
+        assert fake.writes() == []
+
+
+class TestGenerateDryRun:
+
+    def test_unresolved_order_blocks_only_its_own_wave(self):
+        with FakeLinnworks(orders=ORDERS).active() as fake:
+            out = server.generate_pick_waves(
+                [{"order_ids": ["611385"]}, {"order_ids": ["nope"]}])
+        assert out["dry_run"] is True
+        assert out["manifest"][0]["blocked"] is False
+        assert out["manifest"][1]["blocked"] is True
+        assert fake.writes() == []
+
+    def test_flags_unpickable_and_missing_fifo_without_writing(self):
+        err = [{"Error": "Order is already in a pickwave"}]
+        fake = FakeLinnworks(orders=ORDERS, unpickable={611385: err}, fifo_ready=[GUID_B])
+        with fake.active():
+            out = server.generate_pick_waves([{"order_ids": ["611385", "611386"]}])
+        wave = out["manifest"][0]
+        joined = " | ".join(wave["warnings"])
+        assert "611385" in joined and "not pickable" in joined
+        assert "not tagged FIFO_READY" in joined
+        assert wave["blocked"] is False
+        assert wave["orders"][0]["pickable"] is False
+        assert wave["orders"][1]["fifo_ready"] is True
+        assert fake.writes() == []
+
+    def test_fifo_check_failure_is_skipped_not_passed(self):
+        fake = FakeLinnworks(orders=ORDERS, raise_on={
+            "OpenOrders/GetIdentifiersByOrderIds": RuntimeError("HTTP 500")})
+        with fake.active():
+            out = server.generate_pick_waves([{"order_ids": ["611385"]}])
+        assert any("SKIPPED" in w for w in out["warnings"])
+        assert out["manifest"][0]["orders"][0]["fifo_ready"] is None
+
+    def test_stages_above_25_orders(self):
+        many = {str(700000 + i): (f"{i:08d}-0000-0000-0000-000000000000", 700000 + i)
+                for i in range(26)}
+        with FakeLinnworks(orders=many).active() as fake:
+            out = server.generate_pick_waves(
+                [{"order_ids": list(many)}], dry_run=False)
+        assert out["staged"] is True
+        assert out["item_count"] == 26
+        assert "manifest" in out
+        assert fake.writes() == []
+
+
+class TestGenerateLive:
+
+    def test_sends_the_documented_body_and_reads_back(self):
+        fake = FakeLinnworks(orders=ORDERS, fifo_ready=[GUID_A, GUID_B])
+        fake.on_write["Picking/GeneratePickingWave"] = _generate_creates(fake, [9001])
+        with fake.active():
+            out = server.generate_pick_waves(
+                [{"order_ids": ["611385", "611386"], "user_id": 19}], dry_run=False)
+        result = out["results"][0]
+        assert result["outcome"] == "created"
+        assert result["picking_wave_ids"] == [9001]
+        assert result["readback_matches"] is True
+        assert out["complete"] is True
+        assert _body(fake.writes()[0][2]) == {
+            "LocationId": DEFAULT,
+            "SortingType": "BinPriority",
+            "GroupType": "Items",
+            "UserId": 19,
+            "Orders": [{"OrderId": 611385, "SortOrder": 0}, {"OrderId": 611386, "SortOrder": 1}],
+        }
+
+    def test_unassigned_wave_omits_user_id(self):
+        fake = FakeLinnworks(orders=ORDERS)
+        fake.on_write["Picking/GeneratePickingWave"] = _generate_creates(fake, [9001])
+        with fake.active():
+            server.generate_pick_waves([{"order_ids": ["611385"]}], dry_run=False)
+        assert "UserId" not in _body(fake.writes()[0][2])
+
+    def test_partial_run_says_not_to_rerun_the_batch(self):
+        fake = FakeLinnworks(orders=ORDERS)
+        creates = _generate_creates(fake, [9001])
+        responses = iter([
+            creates,
+            lambda body: {"ValidationResults": [{"OrderId": 611386, "HasErrors": True,
+                          "Errors": [{"Error": "Order is already in a pickwave"}]}],
+                          "PickingWaves": []},
+        ])
+        fake.on_write["Picking/GeneratePickingWave"] = lambda body: next(responses)(body)
+        with fake.active():
+            out = server.generate_pick_waves(
+                [{"order_ids": ["611385"]}, {"order_ids": ["611386"]}], dry_run=False)
+        assert out["results"][0]["outcome"] == "created"
+        assert out["results"][1]["outcome"] == "refused"
+        assert out["results"][1]["validation_results"][0]["OrderId"] == 611386
+        assert out["created_wave_ids"] == [9001]
+        assert "Do NOT re-run" in out["message"]
+        assert out["complete"] is False
+
+    def test_rate_limited_write_is_its_own_outcome(self):
+        fake = FakeLinnworks(orders=ORDERS, raise_on={
+            "Picking/GeneratePickingWave": server.RateLimitError("quota exceeded")})
+        with fake.active():
+            out = server.generate_pick_waves([{"order_ids": ["611385"]}], dry_run=False)
+        assert out["results"][0]["outcome"] == "rate_limited"
+        assert out["complete"] is False
+
+    def test_readback_failure_is_unconfirmed_not_created(self):
+        fake = FakeLinnworks(orders=ORDERS)
+        # Linnworks reports a new wave, but it never reads back.
+        fake.on_write["Picking/GeneratePickingWave"] = lambda body: {
+            "ValidationResults": [], "PickingWaves": [{"PickingWaveId": 9001}]}
+        with fake.active():
+            out = server.generate_pick_waves([{"order_ids": ["611385"]}], dry_run=False)
+        assert out["results"][0]["outcome"] == "unconfirmed"
+        assert out["created_wave_ids"] == [9001]
+        assert out["complete"] is False

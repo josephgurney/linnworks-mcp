@@ -1,6 +1,6 @@
 # Linnworks MCP Server — Claude context
 
-**Current version: 1.55.11** — 95 tools. See `pyproject.toml` for full metadata.
+**Current version: 1.55.11** — 96 tools. See `pyproject.toml` for full metadata.
 
 ---
 
@@ -301,6 +301,7 @@ Thresholds (defined in `WRITE_THRESHOLDS`):
 | `delete_empty_categories` | 10 | Irreversible bulk delete |
 | `set_order_status` | 25 | Reversible, but lock RELEASES allocated stock |
 | `create_order` | 10 | CREATES a real, pickable, dispatchable customer order |
+| `generate_pick_waves` | 25 | Creates live pickwaves the warehouse will pick from |
 | `archive_inventory_items` | 25 | Reversible (unarchive) |
 | `unarchive_inventory_items` | 25 | Reversible (archive) |
 | `list_to_shopify` | 25 | Creates live customer-facing channel listings |
@@ -365,7 +366,7 @@ def set_stock_levels(updates: list[dict], confirmed_count: int | None = None, dr
 
 ## Tools
 
-95 tools. `python server.py --list-tools` is the authoritative count; see `server.py` for full docstrings and parameter details.
+96 tools. `python server.py --list-tools` is the authoritative count; see `server.py` for full docstrings and parameter details.
 
 > **v1.55.11 — `unpublish_channel_listing`'s docstring stops saying Amazon and TikTok deletes are unproven (22 Sep 2026):** Text-only; no behaviour change. The docstring still said Delete was "live-proven on SHOPIFY only (v1.25.0)" and told the reader to prove Amazon on a throwaway listing first, though Amazon was proven in v1.32.0 (5 Aug 2026) and TikTok in v1.42.0 (7 Aug 2026). The runtime warnings were already right, because they come from `GLT_CHANNELS` through `_proven_delete_channels()`. Only the docstring, which Claude reads when choosing and using the tool, had been left behind: the same drift the hard-coded "only Shopify is" string caused before v1.42.0. It now names the three proven channels with their dates and templates, says neither `NextSuggestedAction` nor `Status` gates a Delete, and says Magento and Walmart are unproven. A new `test_docs_consistency.py` guard reads `GLT_CHANNELS` and fails if the docstring calls a proven channel unproven, or leaves one out.
 
@@ -494,6 +495,14 @@ Four read-only tools over `/api/Picking/`, an endpoint family this repo had neve
 | `get_item_bins(skus, location_id, include_non_pick_locations)` | `Picking/GetItemBinracks` (GET, one call per SKU — no bulk form) | Bin/binrack lookup. **This tenant has no WMS-managed locations at all** (`Inventory/GetStockLocations` → `IsWarehouseManaged: False` on every single location, confirmed live) — so a real item at any location here errors with `"Alternate locations aren't available for non batched items or items in a non WMS location"`, reported as its own `bin_tracking_unavailable` outcome, distinct from `no_bins_configured` (a genuine 200 with all three arrays empty) and from `lookup_failed`/`rate_limited`/`sku_not_found`. Answers the open question directly: this warehouse does not populate bins in Linnworks. |
 | `check_orders_pickable(order_ids)` | `Picking/CheckAllocatableToPickwave` (POST, wrapped `{"request":{"OrderIds":[...]}}`) | Feasibility check, not a write. **Proven side-effect free live during this build**: two consecutive identical calls returned byte-identical results; `get_pick_waves`' Unallocated/Shipped counts were identical before and after; the checked orders' `Processed`/`Status`/`IsParked` were unchanged; `Stock/GetStockLevel_Batch` for one of the orders' SKUs was byte-identical before and after. Accepts GUID or numeric order ids (`_resolve_order_guid`); an id that can't be resolved is reported in `resolve_errors`, never sinking the batch. `OrderIds` in the request body is a list of **integers** (`NumOrderId`), so a GUID input is resolved to its numeric id first. Linnworks itself reports a per-order `"Order doesn't exist"` inside an otherwise-successful response for an unrecognised numeric id — confirmed live and surfaced verbatim on `errors`/`has_errors`, separate from this tool's own `resolve_errors`. |
 | `get_pick_wave_detail(picking_wave_id)` | `Picking/GetPickingWave` (GET `?pickingWaveId=`) | Full detail for ONE wave, added for #67 (v1.56.0): header plus every order (pick state, sort order, `is_locked`/`is_on_hold`/`is_cancelled`/`is_processed`/`is_paid`) and every item (SKU and title joined from `Skus[]`, to_pick, picked, item_state, bin codes from `Bins[]`). `blockers[]` lists orders now locked, on hold, cancelled or processed. **Live-confirmed 22 Sep 2026: returns full detail for a LIVE wave (wave 3549, 8 orders) but NOTHING for a finished one** — the v1.54.0 "returns zero waves" note only ever tested finished waves. An empty response is reported as `found: False` with a note, never as an empty wave. `UserId`/`EmailAddress` are absent (not null) on an unassigned wave. |
+
+### Picking (write) — issue #67
+
+Built in v1.56.0 from `docs/superpowers/specs/2026-09-22-pickwave-write-tools-design.md`. There is no endpoint to delete a wave or to add an order to an existing one; cleanup means removing orders and/or abandoning the wave. Every write is read back through a fresh `get_pick_wave_detail`, or through the header list for an abandoned wave, since the detail endpoint no longer returns one.
+
+| Tool | Endpoint(s) | Threshold | Key notes |
+|---|---|---|---|
+| `generate_pick_waves(waves, location_id, confirmed_count, dry_run=True)` | `Picking/GeneratePickingWave` (one POST per wave) + `CheckAllocatableToPickwave` + `OpenOrders/GetIdentifiersByOrderIds` + `GetPickwaveUsersWithSummary` | 25 orders | Each wave `{order_ids, user_id?, sorting_type=BinPriority, group_type=Items}`. Refused before any write: an order appearing twice (including once by GUID and once by number), or a `user_id` not on the live picker roster. An unresolved order blocks its own wave only. Linnworks' pickability check and a FIFO_READY check feed the manifest; missing FIFO_READY is a **warning, not a block**. A throttle during the checks stops with nothing written. Per-wave outcome: `created` / `refused` (ValidationResults verbatim) / `rate_limited` / `error` / `unconfirmed` / `blocked`. **Not atomic across waves**: a partial run names the created waves and says not to re-run the batch. Whether the body is wrapped is set by `_PICKING_WRITE_WRAPPED`. |
 
 ### Reporting (read, autopaginating)
 

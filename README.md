@@ -1,7 +1,7 @@
 # Linnworks MCP Server
 
 ![Version](https://img.shields.io/badge/version-1.55.11-blue)
-![Tools](https://img.shields.io/badge/tools-95-blue)
+![Tools](https://img.shields.io/badge/tools-96-blue)
 
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
 
@@ -92,6 +92,12 @@ Once installed, Claude gets access to these tools:
 | `get_item_bins` | Bin/binrack locations for a SKU. Distinguishes bins found, no bin configured (clean empty result), bin tracking unavailable (this tenant has no WMS-managed locations at all), lookup failed, and rate limited — never collapses one into another |
 | `check_orders_pickable` | Feasibility check only (Picking/CheckAllocatableToPickwave) — proven side-effect free during the build that added it: no new wave, no order state change, no stock level change, byte-identical on repeat calls. Accepts GUID or numeric order ids; an id that can't be resolved is reported per-order, not raised |
 | `get_pick_wave_detail` | Full detail for one wave: every order with its pick state and locked/on-hold/cancelled/processed flags, every item with SKU, quantities and bin codes, plus a `blockers` list. Returns nothing for a finished (Shipped/Abandoned) wave — reported as `found: False`, never as an empty wave |
+
+**Picking (write) — writes default to dry_run=True**
+
+| Tool | What it does |
+|---|---|
+| `generate_pick_waves` | Create one or more pickwaves (one Linnworks call per wave). Checks every order first — resolves it, runs Linnworks' pickability check, warns if it isn't FIFO_READY — and validates the picker. Staged above 25 orders. Each new wave is read back; a partial multi-wave run says which waves exist and not to re-run the batch |
 
 **Categories (writes default to dry_run=True)**
 
@@ -312,6 +318,7 @@ All write tools default to `dry_run=True` — they will describe what they would
 | `set_inventory_item_image_order` | 25 items |
 | `set_order_status` | 25 orders |
 | `create_order` | 10 lines |
+| `generate_pick_waves` | 25 orders |
 | `archive_inventory_items` | 25 items |
 | `unarchive_inventory_items` | 25 items |
 | `list_to_shopify` | 25 listings |

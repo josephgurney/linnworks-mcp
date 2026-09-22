@@ -510,6 +510,7 @@ WRITE_THRESHOLDS: dict[str, int] = {
     "unarchive_inventory_items":      25,   # restores items to active; reversible via archive
     "set_order_status":               25,   # lock/unlock/paid/unpaid — reversible order-state changes
     "create_order":                   10,   # CREATES a real, pickable, dispatchable customer order
+    "generate_pick_waves":            25,   # creates live pickwaves the warehouse will pick from
     "default":                        25,   # fallback for any unlisted operation
 }
 
@@ -8067,6 +8068,273 @@ def _pick_wave_unknown_user(user_id, roster: dict) -> dict:
     return {
         "success": False,
         "error": f"user_id {user_id} is not a Linnworks picker. Known pickers: {known}",
+    }
+
+
+def _read_back_generated_wave(wave_ids: list[int], requested: list[int]) -> dict:
+    """
+    Read each newly created wave back and compare its order set with the
+    request. A read-back that fails or comes back empty is `unconfirmed` —
+    the wave may well exist, so it is never reported as not created.
+    """
+    got: list[int] = []
+    try:
+        for wave_id in wave_ids:
+            detail = _format_pick_wave_detail(_fetch_pick_wave(wave_id))
+            if detail is None:
+                return {
+                    "outcome": "unconfirmed",
+                    "picking_wave_ids": wave_ids,
+                    "readback_error": f"wave {wave_id} was reported created but reads back empty",
+                }
+            got.extend(o["order_id"] for o in detail["orders"])
+    except RateLimitError as exc:
+        return {"outcome": "unconfirmed", "picking_wave_ids": wave_ids,
+                "readback_error": f"rate limited: {exc}"}
+    except RuntimeError as exc:
+        return {"outcome": "unconfirmed", "picking_wave_ids": wave_ids,
+                "readback_error": str(exc)}
+    return {
+        "outcome": "created",
+        "picking_wave_ids": wave_ids,
+        "readback_order_ids": sorted(got),
+        "readback_matches": sorted(got) == sorted(requested),
+    }
+
+
+@mcp.tool()
+def generate_pick_waves(
+    waves: list[dict],
+    location_id: str = DEFAULT_LOCATION_ID,
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Create one or more pickwaves (Picking/GeneratePickingWave), one Linnworks
+    call per wave.
+
+    Each wave is a dict:
+        {"order_ids": [...],            # GUIDs or order numbers, in pick order
+         "user_id": 19,                 # optional — see get_pick_wave_users; omit for unassigned
+         "sorting_type": "BinPriority", # or "OrderView" (default BinPriority)
+         "group_type": "Items"}         # or "Orders" (default Items)
+
+    Before anything is written — on a dry run too — every order is resolved;
+    an order may appear only once per call; every user_id must be on the live
+    picker roster; Linnworks' own pickability check runs for every order (an
+    order already in a wave, locked, parked etc. is flagged with Linnworks'
+    reason); and orders without the FIFO_READY identifier get a WARNING (not a
+    block). An unresolved order blocks its own wave only. A rate limit during
+    these checks stops the call with nothing written.
+
+    Staged above 25 orders across all waves (confirmed_count). dry_run=True
+    by default.
+
+    Every created wave is read back with a fresh GetPickingWave call. A wave
+    whose read-back fails is `unconfirmed` — it may exist; check with
+    get_pick_waves before trying again.
+
+    ⚠️  Not atomic across waves. If a multi-wave run partly fails, the result
+    lists exactly which waves were created. Re-send only the failed waves —
+    re-running the whole batch would put the created waves' orders through
+    generate again.
+
+    There is no endpoint to add an order to an existing wave: remove it and
+    generate again. A wave is a point-in-time snapshot while pickers work.
+
+    ⚠️  The request body shape (wrapped or not) is set by
+    _PICKING_WRITE_WRAPPED; see CLAUDE.md for what the live proof established.
+
+    Returns:
+        dry run: manifest (per wave: orders with num_order_id, order_guid,
+        pickable, pickable_errors, fifo_ready; blocked, blocked_reasons,
+        warnings), warnings. Live: results (per wave: outcome of created /
+        refused / rate_limited / error / unconfirmed / blocked, picking_wave_ids,
+        readback_order_ids, readback_matches, validation_results), created_wave_ids,
+        rate_limited, warnings, complete, message.
+    """
+    # 1. Shape checks — no API calls.
+    if not waves:
+        return {"success": False, "error": "waves is empty — pass at least one wave."}
+    problems: list[str] = []
+    for i, wave in enumerate(waves):
+        if not isinstance(wave, dict) or not wave.get("order_ids"):
+            problems.append(f"wave {i}: needs a non-empty order_ids list")
+            continue
+        if wave.get("sorting_type", "BinPriority") not in _PICK_WAVE_SORTING_TYPES:
+            problems.append(f"wave {i}: sorting_type must be one of {list(_PICK_WAVE_SORTING_TYPES)}")
+        if wave.get("group_type", "Items") not in _PICK_WAVE_GROUP_TYPES:
+            problems.append(f"wave {i}: group_type must be one of {list(_PICK_WAVE_GROUP_TYPES)}")
+        user_id = wave.get("user_id")
+        if user_id is not None and (
+            isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0
+        ):
+            problems.append(f"wave {i}: user_id must be a positive integer (see get_pick_wave_users)")
+    if problems:
+        return {"success": False, "error": "Invalid waves: " + "; ".join(problems)}
+
+    seen_inputs: dict[str, int] = {}
+    for i, wave in enumerate(waves):
+        for order_id in wave["order_ids"]:
+            key = str(order_id).strip().lower()
+            if key in seen_inputs:
+                return {"success": False, "error": (
+                    f"Order {order_id!r} appears more than once (wave {seen_inputs[key]} "
+                    f"and wave {i}). An order can only go in one wave per call.")}
+            seen_inputs[key] = i
+
+    all_ids = [order_id for wave in waves for order_id in wave["order_ids"]]
+
+    # 2. Reads only: resolve, duplicate-by-number, roster, pickability, FIFO.
+    resolved, resolve_errors, rate_limited = _resolve_order_numbers(all_ids)
+    if rate_limited:
+        return _pick_wave_preflight_throttled(rate_limited)
+    by_input = {str(r[0]).strip().lower(): (r[1], r[2]) for r in resolved}
+
+    seen_nums: dict[int, int] = {}
+    for i, wave in enumerate(waves):
+        for order_id in wave["order_ids"]:
+            hit = by_input.get(str(order_id).strip().lower())
+            if hit is None:
+                continue
+            num = hit[0]
+            if num in seen_nums:
+                return {"success": False, "error": (
+                    f"Order {num} is listed twice (wave {seen_nums[num]} and wave {i}), "
+                    "once by GUID and once by number. An order can only go in one wave per call.")}
+            seen_nums[num] = i
+
+    wanted_users = {w["user_id"] for w in waves if w.get("user_id") is not None}
+    roster: dict[int, str | None] = {}
+    if wanted_users:
+        try:
+            roster = _fetch_picker_roster()
+        except RateLimitError as exc:
+            return _pick_wave_preflight_throttled([{"step": "picker roster", "reason": str(exc)}])
+        unknown = sorted(u for u in wanted_users if u not in roster)
+        if unknown:
+            return _pick_wave_unknown_user(unknown[0] if len(unknown) == 1 else unknown, roster)
+
+    warnings: list[str] = []
+    try:
+        pickability = _check_pickable_numbers([r[1] for r in resolved])
+    except RateLimitError as exc:
+        return _pick_wave_preflight_throttled([{"step": "pickability check", "reason": str(exc)}])
+    fifo_ready: set[str] | None
+    try:
+        guids = [r[2] for r in resolved]
+        fifo_ready = _fetch_fifo_ready_guids(guids) if guids else set()
+    except RateLimitError as exc:
+        return _pick_wave_preflight_throttled([{"step": "FIFO_READY check", "reason": str(exc)}])
+    except RuntimeError as exc:
+        fifo_ready = None
+        warnings.append(f"{_FIFO_READY_TAG} check was SKIPPED, not passed: {exc}")
+
+    # 3. Manifest.
+    errors_by_input = {str(e["order_id"]).strip().lower(): e["reason"] for e in resolve_errors}
+    manifest: list[dict] = []
+    for i, wave in enumerate(waves):
+        user_id = wave.get("user_id")
+        orders: list[dict] = []
+        blocked_reasons: list[str] = []
+        wave_warnings: list[str] = []
+        for order_id in wave["order_ids"]:
+            key = str(order_id).strip().lower()
+            if key in errors_by_input:
+                blocked_reasons.append(f"order {order_id!r} could not be resolved: {errors_by_input[key]}")
+                orders.append({"order_id": order_id, "resolved": False})
+                continue
+            num, guid = by_input[key]
+            check = pickability.get(num)
+            is_fifo = None if fifo_ready is None else guid.lower() in fifo_ready
+            if check is not None and not check["pickable"]:
+                wave_warnings.append(f"order {num}: Linnworks says it is not pickable: {check['errors']}")
+            if is_fifo is False:
+                wave_warnings.append(f"order {num} is not tagged {_FIFO_READY_TAG}")
+            orders.append({
+                "order_id": order_id,
+                "resolved": True,
+                "num_order_id": num,
+                "order_guid": guid,
+                "pickable": None if check is None else check["pickable"],
+                "pickable_errors": [] if check is None else check["errors"],
+                "fifo_ready": is_fifo,
+            })
+        manifest.append({
+            "wave_index": i,
+            "user_id": user_id,
+            "user_email": roster.get(user_id) if user_id is not None else None,
+            "sorting_type": wave.get("sorting_type", "BinPriority"),
+            "group_type": wave.get("group_type", "Items"),
+            "orders": orders,
+            "blocked": bool(blocked_reasons),
+            "blocked_reasons": blocked_reasons,
+            "warnings": wave_warnings,
+        })
+
+    guard = _write_guard("generate_pick_waves", all_ids, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, "manifest": manifest, "warnings": warnings}
+    if dry_run:
+        sendable = sum(not m["blocked"] for m in manifest)
+        return {
+            "dry_run": True,
+            "wave_count": len(waves),
+            "order_count": len(all_ids),
+            "manifest": manifest,
+            "warnings": warnings,
+            "message": f"Dry run — {sendable} of {len(waves)} wave(s) would be sent. Nothing was created.",
+        }
+
+    # 4. Live: one GeneratePickingWave per unblocked wave, each read back.
+    results: list[dict] = []
+    for m in manifest:
+        base = {"wave_index": m["wave_index"], "user_id": m["user_id"]}
+        if m["blocked"]:
+            results.append({**base, "outcome": "blocked", "reasons": m["blocked_reasons"]})
+            continue
+        nums = [o["num_order_id"] for o in m["orders"]]
+        body = {
+            "LocationId": location_id,
+            "SortingType": m["sorting_type"],
+            "GroupType": m["group_type"],
+            "Orders": [{"OrderId": n, "SortOrder": pos} for pos, n in enumerate(nums)],
+        }
+        if m["user_id"] is not None:
+            body["UserId"] = m["user_id"]
+        try:
+            resp = _picking_write("Picking/GeneratePickingWave", body)
+        except RateLimitError as exc:
+            results.append({**base, "outcome": "rate_limited", "error": str(exc)})
+            continue
+        except RuntimeError as exc:
+            results.append({**base, "outcome": "error", "error": str(exc)})
+            continue
+        created = [w.get("PickingWaveId") for w in (resp.get("PickingWaves") or [])
+                   if w.get("PickingWaveId")]
+        if not created:
+            results.append({**base, "outcome": "refused",
+                            "validation_results": resp.get("ValidationResults") or []})
+            continue
+        results.append({**base, **_read_back_generated_wave(created, nums)})
+
+    created_ids = [wid for r in results for wid in r.get("picking_wave_ids", [])]
+    failed = [r["wave_index"] for r in results if r["outcome"] not in ("created", "unconfirmed")]
+    complete = all(r["outcome"] == "created" and r.get("readback_matches") for r in results)
+    message = f"{len(created_ids)} wave(s) created: {created_ids}."
+    if created_ids and failed:
+        message += (
+            f" PARTIAL RUN: waves {created_ids} already exist. Do NOT re-run the whole "
+            f"batch — re-send only wave index(es) {failed}."
+        )
+    return {
+        "dry_run": False,
+        "results": results,
+        "created_wave_ids": created_ids,
+        "rate_limited": [r for r in results if r["outcome"] == "rate_limited"],
+        "warnings": warnings,
+        "complete": complete,
+        "message": message,
     }
 
 
