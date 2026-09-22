@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.55.11"
+__version__ = "1.56.0"
 
 import json
 import os
@@ -510,6 +510,8 @@ WRITE_THRESHOLDS: dict[str, int] = {
     "unarchive_inventory_items":      25,   # restores items to active; reversible via archive
     "set_order_status":               25,   # lock/unlock/paid/unpaid — reversible order-state changes
     "create_order":                   10,   # CREATES a real, pickable, dispatchable customer order
+    "generate_pick_waves":            25,   # creates live pickwaves the warehouse will pick from
+    "remove_orders_from_pick_waves":  25,   # pulls orders out of waves — a picker may already hold the items
     "default":                        25,   # fallback for any unlisted operation
 }
 
@@ -7070,9 +7072,11 @@ def find_unlinked_order_lines(
 #
 # Four READ-ONLY tools over the /api/Picking/ endpoint family, which this repo
 # has never called before this build. The write half (generate a wave, remove
-# orders from one, update/abandon it) is issue #67, deliberately held — see
-# CLAUDE.md's Conflicts note. Nothing in this section writes to Linnworks:
-# no dry_run parameter, no WRITE_THRESHOLDS entry, no call_linnworks_void.
+# orders from one, update/abandon it) is issue #67 — those writes now exist as
+# generate_pick_waves, update_pick_wave and remove_orders_from_pick_waves (see
+# the "Pickwave detail + writes (issue #67)" section below). Nothing in THIS
+# section writes to Linnworks: no dry_run parameter, no WRITE_THRESHOLDS
+# entry, no call_linnworks_void.
 #
 # Everything below was live-probed against the real tenant during this build
 # (see CLAUDE.md's confirmed-endpoints table for the exact request shapes and
@@ -7114,15 +7118,14 @@ def find_unlinked_order_lines(
 #     byte-identical and neither level guarantees a stable ordering. Exposed
 #     anyway because it is a real, documented, harmless parameter.
 #
-#   - GetAllPickingWaves / GetPickingWave (the "detailed", order-level variant)
-#     returned ZERO wave rows for every state tried, including a wave created
-#     hours before this build ran (id 3520) and a wave fetched directly by id
-#     (id 5) that GetAllPickingWaveHeaders confirms exists. Full per-order pick
-#     detail appears not to be retrievable via this API once a wave has
-#     shipped, at least on this tenant — so get_pick_waves wraps
-#     GetAllPickingWaveHeaders (which reliably returns real data, including
-#     OrderCount, enough to satisfy the post-merge "compare order count and
-#     state label" check) rather than the richer-sounding but empty endpoint.
+#   - GetPickingWave (the "detailed", order-level variant) returns full detail
+#     for a LIVE wave (confirmed 22 Sep 2026, wave 3549, 8 orders) and nothing
+#     for a finished one. The v1.54.0 probes (wave 3520, wave 5) only ever hit
+#     finished waves, which is why they came back empty. get_pick_wave_detail
+#     (#67) wraps it. GetAllPickingWaves is still unused. get_pick_waves wraps
+#     GetAllPickingWaveHeaders, which returns finished waves too and carries
+#     OrderCount, enough for the post-merge "compare order count and state
+#     label" check.
 #
 #   - Every location on this tenant reads IsWarehouseManaged: False (confirmed
 #     via Inventory/GetStockLocations), and GetItemBinracks refuses a real item
@@ -7147,24 +7150,33 @@ def find_unlinked_order_lines(
 #     PickingWaveId to target an existing wave — it can only create new ones.
 #     The only routes that touch wave membership at all are
 #     DeleteOrdersFromPickingWaves (removal) and GeneratePickingWave (create/
-#     regenerate) — both are write endpoints held for #67.
+#     regenerate) — both are #67 write endpoints, now wrapped as
+#     remove_orders_from_pick_waves and generate_pick_waves respectively.
 
 # Raw `State` values from the live Picking API (GetAllPickingWaveHeaders,
-# GetPickwaveUsersWithSummary) that have actually been observed on a REAL wave
-# during this build, each cross-checked against a genuine PickingWaveId/
-# CreatedDate row — not merely present in the API's documented enum. The
-# documented enum also lists Unallocated, Allocated, InProgress, Paused,
-# Complete and Packing (confirmed live as valid FILTER values — they just
-# never matched a real wave here, because nothing was actively being picked
-# during this build), but none of those has been seen on a genuine wave row,
-# so none is mapped here. A human confirming one of those states against the
-# Linnworks UI screen (per CLAUDE.md's post-merge verification steps) is what
-# would extend this dict — never a guess from the enum name alone. This is
-# deliberately module-level, not nested in a tool, so #67's write tools import
-# it rather than minting a second, possibly-divergent state map (the mistake
-# this repo already made once with _ORDER_STATUS_LABELS vs
-# _PAYMENT_STATUS_LABELS, and does not want to repeat a third time).
+# GetPickwaveUsersWithSummary) that have actually been observed on a REAL wave,
+# each cross-checked against a genuine PickingWaveId/CreatedDate row — not
+# merely present in the API's documented enum. Confirmed so far:
+#   - Unallocated: confirmed ON SCREEN by the owner (wave 3552, 22 Sep 2026).
+#   - Allocated: seen live on waves 3552/3553, matching the Linnworks UI
+#     column — generating a wave with a UserId sets it automatically.
+#   - InProgress: seen live on wave 3531 (22 Sep 2026), shown as "In Progress"
+#     in the UI.
+#   - Abandoned / Shipped: confirmed via the header list (see get_pick_waves).
+# Complete, Packing and Paused are valid per the documented enum (and valid
+# FILTER values — see get_pick_waves) but have never been seen on a real wave
+# row, so they are deliberately still unlabelled. A human confirming one of
+# those against the Linnworks UI screen (per CLAUDE.md's post-merge
+# verification steps) is what would extend this dict — never a guess from the
+# enum name alone. This is deliberately module-level, not nested in a tool,
+# so #67's write tools import it rather than minting a second, possibly-
+# divergent state map (the mistake this repo already made once with
+# _ORDER_STATUS_LABELS vs _PAYMENT_STATUS_LABELS, and does not want to repeat
+# a third time).
 _PICK_WAVE_STATE_LABELS: dict[str, str] = {
+    "Unallocated": "Unallocated",
+    "Allocated": "Allocated",
+    "InProgress": "In Progress",
     "Abandoned": "Abandoned",
     "Shipped": "Shipped",
 }
@@ -7341,8 +7353,9 @@ def get_pick_waves(
     a wave that already exists; GeneratePickingWave has no field to target an
     existing wave, so it only ever creates new ones. The only routes that
     touch wave membership at all are removing orders
-    (DeleteOrdersFromPickingWaves) or regenerating the wave — both are write
-    endpoints held for issue #67, not available here.
+    (remove_orders_from_pick_waves) or regenerating the wave
+    (generate_pick_waves) — see those tools, and get_pick_wave_detail for the
+    live order/item detail this tool's own header rows don't carry.
 
     This tool never computes or returns a summed weight or volume for a wave.
     The underlying payload carries no such field, and even if it did,
@@ -7695,29 +7708,7 @@ def check_orders_pickable(order_ids: list[str]) -> dict:
             Linnworks' full retry ladder — order_id and reason
           - complete: False if resolve_errors or rate_limited is non-empty
     """
-    resolved: list[tuple[str, int, str]] = []  # (input_order_id, num_order_id, order_guid)
-    resolve_errors: list[dict] = []
-    rate_limited: list[dict] = []
-
-    for order_id in order_ids:
-        try:
-            order_guid, raw = _resolve_order_guid(order_id)
-        except RateLimitError as exc:
-            rate_limited.append({"order_id": order_id, "reason": str(exc)})
-            continue
-        except RuntimeError as exc:
-            resolve_errors.append({"order_id": order_id, "reason": str(exc)})
-            continue
-
-        num_order_id = raw.get("NumOrderId")
-        if num_order_id is None:
-            resolve_errors.append({
-                "order_id": order_id,
-                "reason": f"Order '{order_id}' resolved but carries no NumOrderId.",
-            })
-            continue
-
-        resolved.append((order_id, num_order_id, order_guid))
+    resolved, resolve_errors, rate_limited = _resolve_order_numbers(order_ids)
 
     results: list[dict] = []
 
@@ -7773,6 +7764,1105 @@ def check_orders_pickable(order_ids: list[str]) -> dict:
         "resolve_errors": resolve_errors,
         "rate_limited": rate_limited,
         "complete": not resolve_errors and not rate_limited,
+    }
+
+
+# ── Pickwave detail + writes (issue #67) ────────────────────────────────────
+#
+# Live facts this section relies on (confirmed read-only, 22 Sep 2026 — see
+# docs/superpowers/specs/2026-09-22-pickwave-write-tools-design.md):
+#   - Picking/GetPickingWave returns full order + item detail for a LIVE wave.
+#     It returns NOTHING for a SHIPPED wave, or an EMPTIED wave (removing a
+#     wave's last order auto-abandons it — confirmed live 22 Sep 2026, see the
+#     #67 contained test). An ABANDONED wave that still holds orders IS
+#     returned by it. The v1.54.0 note that it "returns zero waves" was only
+#     ever tested on waves that were already shipped or emptied.
+#   - The wave row carries UserId/EmailAddress only while the wave is assigned
+#     (the keys are ABSENT, not null, when unassigned).
+#   - Bins[] on that response carries real bin codes (e.g. "10-A-03"), even
+#     though GetItemBinracks errors on every item here (non-WMS locations).
+
+_PICK_WAVE_EMPTY_DETAIL_NOTE = (
+    "Linnworks returned no wave for this id. It does this for some FINISHED "
+    "waves: a SHIPPED wave, or an EMPTIED wave (removing a wave's last order "
+    "auto-abandons it) — confirmed live 22 Sep 2026 — or for an id that "
+    "doesn't exist. An ABANDONED wave that still holds orders IS returned. "
+    "An empty response here does NOT mean the wave has no orders. Use "
+    "get_pick_waves(state='Shipped' or 'Abandoned') to see a finished wave's "
+    "header counts."
+)
+
+# (output name, Linnworks order flag) — an order with any of these set can't
+# be picked as planned, so get_pick_wave_detail lists it under `blockers`.
+_PICK_WAVE_BLOCKER_FLAGS = (
+    ("locked", "IsLocked"),
+    ("on_hold", "IsOnHold"),
+    ("cancelled", "IsCancelled"),
+    ("processed", "IsProcessed"),
+)
+
+
+def _fetch_pick_wave(picking_wave_id: int) -> dict:
+    """
+    Raw Picking/GetPickingWave response for one wave (GET ?pickingWaveId=).
+    Returns {} if the body isn't a dict. Lets RateLimitError propagate: the
+    caller decides how to report a throttle, and it is never "no such wave".
+    """
+    resp = call_linnworks_get("Picking/GetPickingWave", {"pickingWaveId": picking_wave_id})
+    return resp if isinstance(resp, dict) else {}
+
+
+def _format_pick_wave_detail(resp: dict, picking_wave_id: int | None = None) -> dict | None:
+    """
+    Normalise a GetPickingWave response into header + orders + blockers.
+
+    Returns None when the response holds no wave (a finished wave, or an
+    unknown id — see _PICK_WAVE_EMPTY_DETAIL_NOTE). With picking_wave_id, the
+    wave whose PickingWaveId matches is used, and None is returned if none
+    does — a response for another wave is never treated as this one. Without
+    it, the first wave is used. The header comes from _format_pick_wave, so
+    there is exactly one pickwave state map (#64 AC7). No weight or volume
+    figure is produced (#67 defers those).
+    """
+    waves = resp.get("PickingWaves") or []
+    if picking_wave_id is not None:
+        target = _as_int(picking_wave_id)
+        waves = [w for w in waves
+                 if isinstance(w, dict) and _as_int(w.get("PickingWaveId")) == target]
+    if not waves:
+        return None
+    wave = waves[0]
+
+    skus = {str(s.get("StockItemId") or "").lower(): s for s in (resp.get("Skus") or [])}
+    bins: dict[str, list[str]] = {}
+    for b in resp.get("Bins") or []:
+        sid = str(b.get("StockItemId") or "").lower()
+        rack = b.get("BinRack")
+        if rack and rack not in bins.setdefault(sid, []):
+            bins[sid].append(rack)
+
+    orders: list[dict] = []
+    blockers: list[dict] = []
+    for o in wave.get("Orders") or []:
+        items = []
+        for it in o.get("Items") or []:
+            sid = str(it.get("StockItemId") or "").lower()
+            sku = skus.get(sid, {})
+            items.append({
+                "picking_wave_item_row_id": it.get("PickingWaveItemsRowId"),
+                "order_item_row_id": it.get("OrderItemRowId"),
+                "stock_item_id": it.get("StockItemId"),
+                "sku": sku.get("SKU"),
+                "title": sku.get("ItemTitle"),
+                "to_pick": it.get("ToPickQuantity"),
+                "picked": it.get("PickedQuantity"),
+                "item_state": it.get("ItemState"),
+                "bins": bins.get(sid, []),
+            })
+        flags = {name: bool(o.get(key)) for name, key in _PICK_WAVE_BLOCKER_FLAGS}
+        row = {
+            "order_id": o.get("OrderId"),
+            "order_guid": o.get("OrderId_Guid"),
+            "pick_state": o.get("PickState"),
+            "sort_order": o.get("SortOrder"),
+            **{f"is_{name}": value for name, value in flags.items()},
+            "is_paid": bool(o.get("IsPaid")),
+            "items": items,
+        }
+        orders.append(row)
+        reasons = [name for name, value in flags.items() if value]
+        if reasons:
+            blockers.append({
+                "order_id": row["order_id"],
+                "order_guid": row["order_guid"],
+                "reasons": reasons,
+            })
+
+    return {**_format_pick_wave(wave), "orders": orders, "blockers": blockers}
+
+
+@mcp.tool()
+def get_pick_wave_detail(picking_wave_id: int) -> dict:
+    """
+    Read one pickwave in full (Picking/GetPickingWave): its header, every
+    order with its pick state and locked / on-hold / cancelled / processed /
+    paid flags, and every item with SKU, title, quantity to pick, quantity
+    picked and bin codes.
+
+    Read-only. A point-in-time snapshot: pickers change waves while they work.
+
+    `blockers` lists orders in the wave that are now locked, on hold,
+    cancelled or processed — the candidates for remove_orders_from_pick_waves.
+
+    ⚠️  Linnworks returns NOTHING for a SHIPPED wave or an EMPTIED wave
+    (removing a wave's last order auto-abandons it — confirmed live 22 Sep
+    2026), or for an unknown id. That comes back as found=False with a note,
+    never as "this wave has no orders". An ABANDONED wave that still holds
+    orders IS returned here. An unassigned wave has user_id None.
+
+    Bin codes come from the wave's own Bins data. That works on this tenant
+    even though get_item_bins can't (there are no WMS-managed locations).
+
+    Args:
+        picking_wave_id: The wave's id, from get_pick_waves or generate_pick_waves.
+
+    Returns:
+        found (True / False, or None when rate limited). For a found wave:
+        the same header fields as get_pick_waves (picking_wave_id, state,
+        state_label, user_id, email_address, counts, group_type, sort_type)
+        plus orders[] and blockers[]. Always: rate_limited, complete.
+    """
+    try:
+        resp = _fetch_pick_wave(picking_wave_id)
+    except RateLimitError as exc:
+        return {
+            "picking_wave_id": picking_wave_id,
+            "found": None,
+            "rate_limited": True,
+            "complete": False,
+            "error": str(exc),
+        }
+    detail = _format_pick_wave_detail(resp, picking_wave_id)
+    if detail is None:
+        return {
+            "picking_wave_id": picking_wave_id,
+            "found": False,
+            "note": _PICK_WAVE_EMPTY_DETAIL_NOTE,
+            "rate_limited": False,
+            "complete": True,
+        }
+    return {**detail, "found": True, "rate_limited": False, "complete": True}
+
+
+_PICK_WAVE_SETTABLE_STATES = ("Abandoned", "Paused", "Unallocated")
+# Live-confirmed 22 Sep 2026 (#67 contained test): abandoning a wave does NOT
+# free the orders still in it — Linnworks keeps them attached to the
+# abandoned wave, so remove_orders_from_pick_waves is still required before
+# they can go into a new one. update_pick_wave surfaces this on both the
+# dry-run plan and the live result whenever the wave still holds orders.
+_PICK_WAVE_ABANDON_WARNING = (
+    "Abandoning does NOT release its orders — Linnworks keeps them in the "
+    "abandoned wave, so they can't go into a new wave until removed with "
+    "remove_orders_from_pick_waves (live-confirmed 22 Sep 2026)."
+)
+_PICK_WAVE_OPEN_STATES = ("Unallocated", "Allocated", "InProgress", "Paused", "Complete", "Packing")
+# Every State value in picking.json's enum. update_pick_wave refuses a wave
+# whose current state isn't one of these, because it sends that state back.
+_PICK_WAVE_ALL_STATES = (
+    "Unallocated", "Allocated", "InProgress", "Paused", "Complete", "Abandoned", "Packing", "Shipped",
+)
+# States that mean picking has begun. A picker may have items on a trolley, so
+# resetting such a wave (Abandoned / Unallocated) needs allow_in_progress=True.
+_PICK_WAVE_STARTED_STATES = ("InProgress", "Paused", "Complete", "Packing")
+_PICK_WAVE_SORTING_TYPES = ("BinPriority", "OrderView")
+_PICK_WAVE_GROUP_TYPES = ("Items", "Orders")
+_FIFO_READY_TAG = "FIFO_READY"
+
+# Whether each Picking write endpoint takes the {"request": {...}} wrapper.
+# picking.json uses two body styles:
+#   - Style B: a `Picking_XRequest` wrapper definition with an explicit
+#     `request` property. DeleteOrdersFromPickingWaves and
+#     CheckAllocatableToPickwave use it, and every style-B endpoint in this
+#     repo is live-confirmed wrapped. So Delete is wrapped.
+#   - Style A: the body parameter is NAMED `request` but holds the domain
+#     object directly. GeneratePickingWave and UpdatePickingWaveHeader use it.
+#     Of the 8 style-A endpoints with a live answer, 6 are unwrapped
+#     (SearchOrders, Search_PurchaseOrders2, GetIdentifiersByOrderIds,
+#     UpdateStockLevelsBulk, GetStockItemsByIds, GetOpenOrdersDetails).
+# Live-confirmed 22 Sep 2026 (#67 contained test, waves 3552/3553): Generate
+# and UpdateHeader take the UNWRAPPED body; DeleteOrdersFromPickingWaves takes
+# the WRAPPED body.
+_PICKING_WRITE_WRAPPED: dict[str, bool] = {
+    "Picking/GeneratePickingWave": False,
+    "Picking/UpdatePickingWaveHeader": False,
+    "Picking/DeleteOrdersFromPickingWaves": True,
+}
+
+
+def _picking_write(path: str, body: dict) -> dict:
+    """POST a Picking write body, wrapped or not per _PICKING_WRITE_WRAPPED."""
+    payload = {"request": body} if _PICKING_WRITE_WRAPPED[path] else body
+    return call_linnworks(path, payload)
+
+
+def _as_int(value) -> int | None:
+    """int(value), or None if it isn't one."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_order_numbers(order_ids: list) -> tuple[list[tuple], list[dict], list[dict]]:
+    """
+    Resolve GUID-or-numeric order ids to (input_id, NumOrderId, order GUID).
+
+    Returns (resolved, resolve_errors, rate_limited). Never raises for a
+    per-id failure: an unknown id goes to resolve_errors, and a throttle goes
+    to rate_limited — never folded into "not found" (#34/#37). Shared by
+    check_orders_pickable and the #67 write tools.
+    """
+    resolved: list[tuple] = []
+    resolve_errors: list[dict] = []
+    rate_limited: list[dict] = []
+    for order_id in order_ids:
+        try:
+            order_guid, raw = _resolve_order_guid(str(order_id))
+        except RateLimitError as exc:
+            rate_limited.append({"order_id": order_id, "reason": str(exc)})
+            continue
+        except RuntimeError as exc:
+            resolve_errors.append({"order_id": order_id, "reason": str(exc)})
+            continue
+        num_order_id = raw.get("NumOrderId")
+        if num_order_id is None:
+            resolve_errors.append({
+                "order_id": order_id,
+                "reason": f"Order '{order_id}' resolved but carries no NumOrderId.",
+            })
+            continue
+        resolved.append((order_id, num_order_id, order_guid))
+    return resolved, resolve_errors, rate_limited
+
+
+def _fetch_picker_roster() -> dict[int, str | None]:
+    """
+    user_id -> email for every warehouse user a wave can be assigned to.
+
+    Source: Picking/GetPickwaveUsersWithSummary with state=Unallocated, which
+    returns one row per registered user plus any unassigned wave rows
+    (UserId null) — live 22 Sep 2026: 15 users, e.g. warehouse+01 = 68. Lets
+    RateLimitError propagate.
+    """
+    resp = call_linnworks_get(
+        "Picking/GetPickwaveUsersWithSummary",
+        _pick_wave_query_params("Unallocated", None, None),
+    )
+    roster: dict[int, str | None] = {}
+    for row in (resp.get("PickingWaves") or []) if isinstance(resp, dict) else []:
+        user_id = row.get("UserId")
+        if isinstance(user_id, int) and not isinstance(user_id, bool) and user_id > 0:
+            roster.setdefault(user_id, row.get("EmailAddress"))
+    return roster
+
+
+def _fetch_fifo_ready_guids(order_guids: list[str]) -> set[str]:
+    """
+    Lower-cased GUIDs of the orders carrying the FIFO_READY identifier.
+
+    OpenOrders/GetIdentifiersByOrderIds, sent UNWRAPPED as {"OrderIds": [guid]}
+    — the {"request": ...} form 400s "OrderIds not provided in request" (live,
+    22 Sep 2026). Returns a flat list of {fkOrderId, IdentifierId, IsCustom,
+    Tag}. Chunked at 100, like the FIFO worker. Lets RateLimitError and
+    RuntimeError propagate.
+    """
+    ready: set[str] = set()
+    for start in range(0, len(order_guids), 100):
+        chunk = order_guids[start:start + 100]
+        resp = call_linnworks("OpenOrders/GetIdentifiersByOrderIds", {"OrderIds": chunk})
+        for row in resp if isinstance(resp, list) else []:
+            if str(row.get("Tag", "")).strip().upper() == _FIFO_READY_TAG:
+                ready.add(str(row.get("fkOrderId", "")).lower())
+    return ready
+
+
+def _check_pickable_numbers(num_ids: list[int]) -> dict[int, dict]:
+    """
+    NumOrderId -> {"pickable": bool, "errors": [...]} via
+    Picking/CheckAllocatableToPickwave (wrapped; proven side-effect free in
+    v1.54.0). Lets RateLimitError propagate.
+    """
+    if not num_ids:
+        return {}
+    resp = call_linnworks(
+        "Picking/CheckAllocatableToPickwave", {"request": {"OrderIds": num_ids}}
+    )
+    return {
+        r.get("OrderId"): {"pickable": not r.get("HasErrors"), "errors": r.get("Errors") or []}
+        for r in (resp.get("Results") or [])
+    }
+
+
+def _find_wave_header(
+    picking_wave_id: int, state: str, location_id: str = DEFAULT_LOCATION_ID
+) -> dict | None:
+    """
+    The formatted header for one wave, from GetAllPickingWaveHeaders(state=).
+    This is how a wave that GetPickingWave no longer returns (an Abandoned one)
+    gets read back. None if the wave isn't in that state's list. Adds
+    user_key_present: whether the header row carries a UserId key at all, so a
+    missing key is never read as "the user was removed". Lets RateLimitError
+    propagate.
+    """
+    resp = call_linnworks_get(
+        "Picking/GetAllPickingWaveHeaders", {"state": state, "locationId": location_id}
+    )
+    for row in (resp.get("PickwaveHeaders") or []) if isinstance(resp, dict) else []:
+        if row.get("PickingWaveId") == picking_wave_id:
+            return {**_format_pick_wave(row), "user_key_present": "UserId" in row}
+    return None
+
+
+def _pick_wave_preflight_throttled(rate_limited: list[dict]) -> dict:
+    """The response when a pre-write read is rate limited: nothing is written."""
+    return {
+        "success": False,
+        "rate_limited": rate_limited,
+        "complete": False,
+        "message": (
+            "Linnworks' rate limit was hit during the checks before writing. "
+            "Nothing was written. Wait a minute and call again."
+        ),
+    }
+
+
+def _pick_wave_unknown_user(user_id, roster: dict) -> dict:
+    """The refusal for a user_id that isn't on the live picker roster."""
+    known = ", ".join(f"{uid} ({email})" for uid, email in sorted(roster.items()))
+    return {
+        "success": False,
+        "error": f"user_id {user_id} is not a Linnworks picker. Known pickers: {known}",
+    }
+
+
+def _read_back_generated_wave(wave_ids: list[int], requested: list[int]) -> dict:
+    """
+    Read each newly created wave back and compare its order set with the
+    request. A read-back that fails or comes back empty is `unconfirmed` —
+    the wave may well exist, so it is never reported as not created. A
+    `created` result also carries missing_order_ids (requested, not in the
+    wave) and extra_order_ids (in the wave, not requested), both sorted.
+    """
+    got: list[int] = []
+    try:
+        for wave_id in wave_ids:
+            detail = _format_pick_wave_detail(_fetch_pick_wave(wave_id), wave_id)
+            if detail is None:
+                return {
+                    "outcome": "unconfirmed",
+                    "picking_wave_ids": wave_ids,
+                    "readback_error": f"wave {wave_id} was reported created but reads back empty",
+                }
+            got.extend(o["order_id"] for o in detail["orders"])
+    except RateLimitError as exc:
+        return {"outcome": "unconfirmed", "picking_wave_ids": wave_ids,
+                "readback_error": f"rate limited: {exc}"}
+    except RuntimeError as exc:
+        return {"outcome": "unconfirmed", "picking_wave_ids": wave_ids,
+                "readback_error": str(exc)}
+    except Exception as exc:
+        return {"outcome": "unconfirmed", "picking_wave_ids": wave_ids,
+                "readback_error": f"{type(exc).__name__}: {exc}"}
+    return {
+        "outcome": "created",
+        "picking_wave_ids": wave_ids,
+        "readback_order_ids": sorted(got),
+        "readback_matches": sorted(got) == sorted(requested),
+        "missing_order_ids": sorted(set(requested) - set(got)),
+        "extra_order_ids": sorted(set(got) - set(requested)),
+    }
+
+
+@mcp.tool()
+def generate_pick_waves(
+    waves: list[dict],
+    location_id: str = DEFAULT_LOCATION_ID,
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Create one or more pickwaves (Picking/GeneratePickingWave), one Linnworks
+    call per wave.
+
+    Each wave is a dict:
+        {"order_ids": [...],            # GUIDs or order numbers, in pick order
+         "user_id": 19,                 # optional — see get_pick_wave_users; omit for unassigned
+         "sorting_type": "BinPriority", # or "OrderView" (default BinPriority)
+         "group_type": "Items"}         # or "Orders" (default Items)
+
+    Before anything is written — on a dry run too — every order is resolved;
+    an order may appear only once per call; every user_id must be on the live
+    picker roster; Linnworks' own pickability check runs for every order (an
+    order already in a wave, locked, parked etc. is flagged with Linnworks'
+    reason); and orders without the FIFO_READY identifier get a WARNING (not a
+    block). An unresolved order blocks its own wave only. A rate limit during
+    these checks stops the call with nothing written.
+
+    Staged above 25 orders across all waves (confirmed_count). dry_run=True
+    by default.
+
+    Every created wave is read back with a fresh GetPickingWave call. A wave
+    whose read-back fails is `unconfirmed` — it may exist; check with
+    get_pick_waves before trying again. A wave is `refused` only when
+    Linnworks creates nothing AND gives a reason (ValidationResults). A
+    response with neither a wave nor a reason, or a timeout / dropped
+    connection after sending, is also `unconfirmed`, because the wave may
+    exist.
+
+    ⚠️  Not atomic across waves. If a multi-wave run partly fails, the result
+    lists exactly which waves were created. Re-send only the failed waves —
+    re-running the whole batch would put the created waves' orders through
+    generate again.
+
+    There is no endpoint to add an order to an existing wave: remove it and
+    generate again. A wave is a point-in-time snapshot while pickers work.
+
+    ⚠️  The body is sent UNWRAPPED until the #67 live proof settles it
+    (_PICKING_WRITE_WRAPPED); see CLAUDE.md for what the proof established.
+
+    Returns:
+        A refusal before any write: success False, error (or, for a rate
+        limit during the checks: success False, rate_limited, complete False,
+        message).
+        Staged (more than 25 orders, no matching confirmed_count): staged,
+        success, item_count, threshold, confirmed_count, message, manifest,
+        warnings.
+        Dry run: dry_run True, wave_count, order_count, manifest (per wave:
+        wave_index, user_id, user_email, sorting_type, group_type, orders
+        [order_id, resolved, num_order_id, order_guid, pickable,
+        pickable_errors, fifo_ready], blocked, blocked_reasons, warnings),
+        warnings, message.
+        Live: dry_run False, results, created_wave_ids, rate_limited,
+        warnings, complete, message. Each result has wave_index, user_id,
+        outcome and validation_results (Linnworks' ValidationResults
+        verbatim, [] when absent — kept even on a created wave). By outcome:
+          created: picking_wave_ids, readback_order_ids, readback_matches,
+            missing_order_ids, extra_order_ids;
+          unconfirmed: picking_wave_ids + readback_error (read-back failed),
+            or note + raw_response (no wave and no reason), or note + error
+            (network error after sending);
+          refused: validation_results only;
+          rate_limited / error: error;
+          blocked: reasons.
+    """
+    # 1. Shape checks — no API calls.
+    if not waves:
+        return {"success": False, "error": "waves is empty — pass at least one wave."}
+    problems: list[str] = []
+    for i, wave in enumerate(waves):
+        if not isinstance(wave, dict) or not wave.get("order_ids"):
+            problems.append(f"wave {i}: needs a non-empty order_ids list")
+            continue
+        if wave.get("sorting_type", "BinPriority") not in _PICK_WAVE_SORTING_TYPES:
+            problems.append(f"wave {i}: sorting_type must be one of {list(_PICK_WAVE_SORTING_TYPES)}")
+        if wave.get("group_type", "Items") not in _PICK_WAVE_GROUP_TYPES:
+            problems.append(f"wave {i}: group_type must be one of {list(_PICK_WAVE_GROUP_TYPES)}")
+        user_id = wave.get("user_id")
+        if user_id is not None and (
+            isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0
+        ):
+            problems.append(f"wave {i}: user_id must be a positive integer (see get_pick_wave_users)")
+    if problems:
+        return {"success": False, "error": "Invalid waves: " + "; ".join(problems)}
+
+    seen_inputs: dict[str, int] = {}
+    for i, wave in enumerate(waves):
+        for order_id in wave["order_ids"]:
+            key = str(order_id).strip().lower()
+            if key in seen_inputs:
+                return {"success": False, "error": (
+                    f"Order {order_id!r} appears more than once (wave {seen_inputs[key]} "
+                    f"and wave {i}). An order can only go in one wave per call.")}
+            seen_inputs[key] = i
+
+    all_ids = [order_id for wave in waves for order_id in wave["order_ids"]]
+
+    # 2. Reads only: resolve, duplicate-by-number, roster, pickability, FIFO.
+    resolved, resolve_errors, rate_limited = _resolve_order_numbers(all_ids)
+    if rate_limited:
+        return _pick_wave_preflight_throttled(rate_limited)
+    by_input = {str(r[0]).strip().lower(): (r[1], r[2]) for r in resolved}
+
+    seen_nums: dict[int, int] = {}
+    for i, wave in enumerate(waves):
+        for order_id in wave["order_ids"]:
+            hit = by_input.get(str(order_id).strip().lower())
+            if hit is None:
+                continue
+            num = hit[0]
+            if num in seen_nums:
+                return {"success": False, "error": (
+                    f"Order {num} is listed twice (wave {seen_nums[num]} and wave {i}), "
+                    "once by GUID and once by number. An order can only go in one wave per call.")}
+            seen_nums[num] = i
+
+    wanted_users = {w["user_id"] for w in waves if w.get("user_id") is not None}
+    roster: dict[int, str | None] = {}
+    if wanted_users:
+        try:
+            roster = _fetch_picker_roster()
+        except RateLimitError as exc:
+            return _pick_wave_preflight_throttled([{"step": "picker roster", "reason": str(exc)}])
+        except RuntimeError as exc:
+            return {"success": False,
+                    "error": f"Picker roster lookup failed — nothing was written: {exc}"}
+        unknown = sorted(u for u in wanted_users if u not in roster)
+        if unknown:
+            return _pick_wave_unknown_user(unknown[0] if len(unknown) == 1 else unknown, roster)
+
+    warnings: list[str] = []
+    try:
+        pickability = _check_pickable_numbers([r[1] for r in resolved])
+    except RateLimitError as exc:
+        return _pick_wave_preflight_throttled([{"step": "pickability check", "reason": str(exc)}])
+    except RuntimeError as exc:
+        return {"success": False,
+                "error": f"Pickability check failed — nothing was written: {exc}"}
+    fifo_ready: set[str] | None
+    try:
+        guids = [r[2] for r in resolved]
+        fifo_ready = _fetch_fifo_ready_guids(guids) if guids else set()
+    except RateLimitError as exc:
+        return _pick_wave_preflight_throttled([{"step": "FIFO_READY check", "reason": str(exc)}])
+    except RuntimeError as exc:
+        fifo_ready = None
+        warnings.append(f"{_FIFO_READY_TAG} check was SKIPPED, not passed: {exc}")
+
+    # 3. Manifest.
+    errors_by_input = {str(e["order_id"]).strip().lower(): e["reason"] for e in resolve_errors}
+    manifest: list[dict] = []
+    for i, wave in enumerate(waves):
+        user_id = wave.get("user_id")
+        orders: list[dict] = []
+        blocked_reasons: list[str] = []
+        wave_warnings: list[str] = []
+        for order_id in wave["order_ids"]:
+            key = str(order_id).strip().lower()
+            if key in errors_by_input:
+                blocked_reasons.append(f"order {order_id!r} could not be resolved: {errors_by_input[key]}")
+                orders.append({"order_id": order_id, "resolved": False})
+                continue
+            num, guid = by_input[key]
+            check = pickability.get(num)
+            is_fifo = None if fifo_ready is None else guid.lower() in fifo_ready
+            if check is not None and not check["pickable"]:
+                wave_warnings.append(f"order {num}: Linnworks says it is not pickable: {check['errors']}")
+            if is_fifo is False:
+                wave_warnings.append(f"order {num} is not tagged {_FIFO_READY_TAG}")
+            orders.append({
+                "order_id": order_id,
+                "resolved": True,
+                "num_order_id": num,
+                "order_guid": guid,
+                "pickable": None if check is None else check["pickable"],
+                "pickable_errors": [] if check is None else check["errors"],
+                "fifo_ready": is_fifo,
+            })
+        manifest.append({
+            "wave_index": i,
+            "user_id": user_id,
+            "user_email": roster.get(user_id) if user_id is not None else None,
+            "sorting_type": wave.get("sorting_type", "BinPriority"),
+            "group_type": wave.get("group_type", "Items"),
+            "orders": orders,
+            "blocked": bool(blocked_reasons),
+            "blocked_reasons": blocked_reasons,
+            "warnings": wave_warnings,
+        })
+
+    guard = _write_guard("generate_pick_waves", all_ids, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, "manifest": manifest, "warnings": warnings}
+    if dry_run:
+        sendable = sum(not m["blocked"] for m in manifest)
+        return {
+            "dry_run": True,
+            "wave_count": len(waves),
+            "order_count": len(all_ids),
+            "manifest": manifest,
+            "warnings": warnings,
+            "message": f"Dry run — {sendable} of {len(waves)} wave(s) would be sent. Nothing was created.",
+        }
+
+    # 4. Live: one GeneratePickingWave per unblocked wave, each read back.
+    results: list[dict] = []
+    for m in manifest:
+        base = {"wave_index": m["wave_index"], "user_id": m["user_id"], "validation_results": []}
+        if m["blocked"]:
+            results.append({**base, "outcome": "blocked", "reasons": m["blocked_reasons"]})
+            continue
+        nums = [o["num_order_id"] for o in m["orders"]]
+        body = {
+            "LocationId": location_id,
+            "SortingType": m["sorting_type"],
+            "GroupType": m["group_type"],
+            "Orders": [{"OrderId": n, "SortOrder": pos} for pos, n in enumerate(nums)],
+        }
+        if m["user_id"] is not None:
+            body["UserId"] = m["user_id"]
+        try:
+            resp = _picking_write("Picking/GeneratePickingWave", body)
+        except RateLimitError as exc:
+            results.append({**base, "outcome": "rate_limited", "error": str(exc)})
+            continue
+        except RuntimeError as exc:
+            results.append({**base, "outcome": "error", "error": str(exc)})
+            continue
+        except Exception as exc:  # a timeout or dropped connection, after sending
+            results.append({
+                **base,
+                "outcome": "unconfirmed",
+                "error": f"{type(exc).__name__}: {exc}",
+                "note": ("The request may have reached Linnworks and the wave may exist. "
+                         "Check get_pick_waves(state='Unallocated') before re-sending this wave."),
+            })
+            continue
+        if isinstance(resp, dict):
+            validation = resp.get("ValidationResults") or []
+            created = [w.get("PickingWaveId") for w in (resp.get("PickingWaves") or [])
+                       if isinstance(w, dict) and w.get("PickingWaveId")]
+        else:
+            validation, created = [], []
+        if created:
+            results.append({**base, **_read_back_generated_wave(created, nums),
+                            "validation_results": validation})
+        elif validation:
+            results.append({**base, "outcome": "refused", "validation_results": validation})
+        else:
+            # Neither a wave nor a reason: never call that a refusal.
+            results.append({
+                **base,
+                "outcome": "unconfirmed",
+                "note": ("Linnworks' response neither created a wave nor gave a reason. Check "
+                         "get_pick_waves(state='Unallocated') before re-sending this wave."),
+                "raw_response": resp if isinstance(resp, dict) else repr(resp)[:500],
+            })
+
+    created_ids = [wid for r in results for wid in r.get("picking_wave_ids", [])]
+    failed = [r["wave_index"] for r in results if r["outcome"] not in ("created", "unconfirmed")]
+    # An unconfirmed wave with no id: Linnworks may have created it.
+    uncertain = [r["wave_index"] for r in results
+                 if r["outcome"] == "unconfirmed" and not r.get("picking_wave_ids")]
+    complete = all(r["outcome"] == "created" and r.get("readback_matches") for r in results)
+    message = f"{len(created_ids)} wave(s) created: {created_ids}."
+    if sum(map(bool, (created_ids, failed, uncertain))) >= 2:
+        message += " PARTIAL RUN:"
+        if created_ids:
+            message += f" waves {created_ids} already exist."
+        message += " Do NOT re-run the whole batch"
+        message += f" — re-send only wave index(es) {failed}." if failed else "."
+    if uncertain:
+        message += (f" UNCONFIRMED: wave index(es) {uncertain} may exist — check get_pick_waves "
+                    "before re-sending.")
+    for r in results:
+        if r["outcome"] == "created" and not r.get("readback_matches"):
+            ids = r["picking_wave_ids"]
+            label = f"wave {ids[0]}" if len(ids) == 1 else f"waves {ids}"
+            message += (f" Read-back mismatch: {label} does not match the request "
+                        f"(missing {r['missing_order_ids']}, extra {r['extra_order_ids']}).")
+    return {
+        "dry_run": False,
+        "results": results,
+        "created_wave_ids": created_ids,
+        "rate_limited": [r for r in results if r["outcome"] == "rate_limited"],
+        "warnings": warnings,
+        "complete": complete,
+        "message": message,
+    }
+
+
+def _pick_wave_user(value) -> int | None:
+    """A wave's user id, or None for "no user": absent/None, 0 and -1 all mean unassigned."""
+    user = _as_int(value)
+    return None if user is None or user in (0, -1) else user
+
+
+def _read_back_updated_wave(
+    picking_wave_id: int,
+    target_state: str,
+    expected_user: int | None,
+    current_user: int | None,
+    judge_state: bool,
+    judge_user: bool,
+    location_id: str,
+) -> dict:
+    """
+    Re-read a wave after UpdatePickingWaveHeader, judging only what the caller
+    asked to change:
+      - judge_state (the caller passed `state`): the read-back state must equal
+        target_state. Otherwise state_changed_by_server reports whether the
+        server moved the state anyway.
+      - judge_user (the caller passed user_id or unassign): the read-back user
+        must equal expected_user. Otherwise user_changed_by_server reports
+        whether the server changed the user anyway — for an abandon, only when
+        the header row actually carries a user key.
+    "No user" is absent/None, 0 or -1 on either side (_pick_wave_user). An
+    Abandoned wave drops out of GetPickingWave, so it is looked up in the
+    Abandoned header list instead. after_state / after_user_id are raw.
+    """
+    try:
+        if target_state == "Abandoned":
+            after = _find_wave_header(picking_wave_id, "Abandoned", location_id)
+        else:
+            after = _format_pick_wave_detail(_fetch_pick_wave(picking_wave_id), picking_wave_id)
+    except RateLimitError as exc:
+        return {"outcome": "unconfirmed", "complete": False, "readback_error": f"rate limited: {exc}"}
+    except RuntimeError as exc:
+        return {"outcome": "unconfirmed", "complete": False, "readback_error": str(exc)}
+    except Exception as exc:
+        return {"outcome": "unconfirmed", "complete": False,
+                "readback_error": f"{type(exc).__name__}: {exc}"}
+    if after is None:
+        return {"outcome": "unconfirmed", "complete": False,
+                "readback_error": f"wave {picking_wave_id} could not be found after the update"}
+    after_user = _pick_wave_user(after["user_id"])
+    state_ok = after["state"] == target_state
+    user_ok = after_user == _pick_wave_user(expected_user)
+    applied = (state_ok or not judge_state) and (user_ok or not judge_user)
+    out = {
+        "outcome": "updated" if applied else "not_applied",
+        "complete": applied,
+        "after_state": after["state"],
+        "after_user_id": after["user_id"],
+        "after_email": after["email_address"],
+    }
+    if not judge_state:
+        out["state_changed_by_server"] = not state_ok
+    # The detail read has no user_key_present: an absent key there means unassigned.
+    if not judge_user and after.get("user_key_present", True):
+        out["user_changed_by_server"] = after_user != _pick_wave_user(current_user)
+    return out
+
+
+@mcp.tool()
+def update_pick_wave(
+    picking_wave_id: int,
+    user_id: int | None = None,
+    unassign: bool = False,
+    state: str | None = None,
+    allow_in_progress: bool = False,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Reassign, unassign, pause, reset or abandon one pickwave
+    (Picking/UpdatePickingWaveHeader).
+
+    - user_id: assign the wave to this picker (see get_pick_wave_users).
+    - unassign=True: remove the picker (sends UserId -1). Not with user_id.
+    - state: "Paused", "Unallocated" or "Abandoned" only.
+      generate_pick_waves with a user_id creates the wave Allocated;
+      update_pick_wave doesn't change state when you reassign. InProgress,
+      Complete, Packing and Shipped describe physical work on the warehouse
+      floor and are deliberately not settable here.
+
+    Abandoning a STARTED wave, or setting it back to Unallocated, needs
+    allow_in_progress=True — a picker may have items on a trolley. Started
+    means the wave is InProgress, Paused, Complete or Packing, or has any item
+    picked. Pausing doesn't need the flag.
+
+    ⚠️  Abandoning a wave that still holds orders does NOT release them —
+    Linnworks keeps them in the abandoned wave, so they can't go into a new
+    wave until removed with remove_orders_from_pick_waves (live-confirmed 22
+    Sep 2026). Both the dry-run plan and the live result carry a `warning`
+    saying exactly that whenever the wave still has orders; an empty wave
+    carries none.
+
+    A wave whose current state isn't a documented pickwave state (including a
+    missing state) is refused before any write, because the current state is
+    sent back and an unknown value could reset it.
+
+    The wave's current state is always sent, even when only the picker
+    changes, and its start/end times are carried through: leaving them out
+    could reset them on the server. Omitting UserId keeps the current picker
+    — verified live 22 Sep 2026. Linnworks applies State literally: it does
+    NOT couple state to assignment. Reassigning or unassigning a wave never
+    changes its state, and setting state never changes who is assigned — a
+    wave can be Allocated with no picker, or Unallocated with a picker still
+    on it (both live-confirmed the same day).
+
+    Reads the wave back afterwards (from the Abandoned header list for an
+    abandon, because an abandoned wave drops out of the detail endpoint once
+    it is empty) and reports outcome updated / not_applied / unconfirmed /
+    rate_limited / error. The outcome is judged only on what the call asked
+    to change: a user change on the user, a state change on the state, both
+    when both were asked. If the server changed the other field anyway, that
+    is reported as state_changed_by_server / user_changed_by_server rather
+    than as a failure. after_state and after_user_id are always the raw
+    read-back values; "no user" reads back as absent, 0 or -1. dry_run=True
+    by default.
+    """
+    if user_id is not None and unassign:
+        return {"success": False, "error": "Pass user_id OR unassign=True, not both."}
+    if user_id is None and not unassign and state is None:
+        return {"success": False, "error": "Nothing to change — pass user_id, unassign=True, or state."}
+    if state is not None and state not in _PICK_WAVE_SETTABLE_STATES:
+        return {"success": False, "error": (
+            f"state must be one of {list(_PICK_WAVE_SETTABLE_STATES)}. generate_pick_waves with a "
+            "user_id creates the wave Allocated; update_pick_wave never changes the state when you "
+            "reassign. InProgress, Complete, Packing and Shipped describe physical work on the "
+            "warehouse floor and are deliberately not settable here.")}
+    if user_id is not None and (isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0):
+        return {"success": False, "error": "user_id must be a positive integer (see get_pick_wave_users)."}
+
+    try:
+        current = _format_pick_wave_detail(_fetch_pick_wave(picking_wave_id), picking_wave_id)
+    except RateLimitError as exc:
+        return {"success": False, "picking_wave_id": picking_wave_id,
+                "outcome": "rate_limited", "complete": False, "error": str(exc)}
+    except RuntimeError as exc:
+        return {"success": False, "picking_wave_id": picking_wave_id,
+                "error": f"Reading the wave failed — nothing was written: {exc}"}
+    if current is None:
+        return {"success": False, "picking_wave_id": picking_wave_id,
+                "error": "No live wave with that id. " + _PICK_WAVE_EMPTY_DETAIL_NOTE}
+
+    current_state = current["state"]
+    if current_state not in _PICK_WAVE_ALL_STATES:
+        return {"success": False, "picking_wave_id": picking_wave_id, "current_state": current_state,
+                "error": (f"Wave {picking_wave_id}'s current state {current_state!r} is not a "
+                          f"documented pickwave state ({list(_PICK_WAVE_ALL_STATES)}). Nothing was "
+                          "written: this tool sends the current state back, and a missing or "
+                          "unknown value could reset the wave to the enum default.")}
+    items_picked = _as_int(current.get("items_picked")) or 0
+    started = current_state in _PICK_WAVE_STARTED_STATES or items_picked > 0
+    if state in ("Abandoned", "Unallocated") and started and not allow_in_progress:
+        return {"success": False, "picking_wave_id": picking_wave_id, "current_state": current_state,
+                "items_picked": current.get("items_picked"),
+                "error": (f"Wave {picking_wave_id} has started (state {current_state}, "
+                          f"{items_picked} item(s) picked) — a picker may have items on a trolley. "
+                          f"Setting it to {state} needs allow_in_progress=True. Pausing is allowed "
+                          "without it.")}
+
+    if user_id is not None:
+        try:
+            roster = _fetch_picker_roster()
+        except RateLimitError as exc:
+            return _pick_wave_preflight_throttled([{"step": "picker roster", "reason": str(exc)}])
+        except RuntimeError as exc:
+            return {"success": False,
+                    "error": f"Picker roster lookup failed — nothing was written: {exc}"}
+        if user_id not in roster:
+            return _pick_wave_unknown_user(user_id, roster)
+
+    target_state = state or current_state
+    expected_user = None if unassign else (user_id if user_id is not None else current["user_id"])
+    location = current.get("location_id") or DEFAULT_LOCATION_ID
+
+    body: dict = {"PickingWaveId": picking_wave_id, "State": target_state}
+    if unassign:
+        body["UserId"] = -1
+    elif user_id is not None:
+        body["UserId"] = user_id
+    for field, key in (("start_time", "StartTime"), ("end_time", "EndTime")):
+        if current.get(field):
+            body[key] = current[field]
+
+    plan = {
+        "picking_wave_id": picking_wave_id,
+        "current_state": current_state,
+        "current_user_id": current["user_id"],
+        "current_email": current["email_address"],
+        "new_state": target_state,
+        "new_user_id": expected_user,
+        "order_count": len(current["orders"]),
+    }
+    # Abandoning a wave that still holds orders doesn't free them — surface
+    # that on every response for this call, dry-run or live (live-confirmed
+    # 22 Sep 2026). An empty wave carries no warning.
+    abandon_warning = (
+        {"warning": _PICK_WAVE_ABANDON_WARNING}
+        if state == "Abandoned" and plan["order_count"] > 0 else {}
+    )
+    if dry_run:
+        return {"dry_run": True, "plan": plan, **abandon_warning,
+                "message": "Dry run — nothing was changed."}
+
+    try:
+        _picking_write("Picking/UpdatePickingWaveHeader", body)
+    except RateLimitError as exc:
+        return {"dry_run": False, "plan": plan, **abandon_warning, "outcome": "rate_limited",
+                "complete": False, "error": str(exc)}
+    except RuntimeError as exc:
+        return {"dry_run": False, "plan": plan, **abandon_warning, "outcome": "error",
+                "complete": False, "error": str(exc)}
+    except Exception as exc:  # a timeout or dropped connection, after sending
+        return {"dry_run": False, "plan": plan, **abandon_warning, "outcome": "unconfirmed",
+                "complete": False, "error": f"{type(exc).__name__}: {exc}",
+                "note": ("The request may have reached Linnworks and the change may have been "
+                         "applied. Check get_pick_wave_detail before trying again.")}
+
+    return {"dry_run": False, "plan": plan, **abandon_warning,
+            **_read_back_updated_wave(
+                picking_wave_id, target_state, expected_user, current["user_id"],
+                judge_state=state is not None,
+                judge_user=user_id is not None or unassign,
+                location_id=location,
+            )}
+
+
+def _locate_orders_in_open_waves(num_ids: list[int], location_id: str) -> dict[int, dict]:
+    """
+    NumOrderId -> {"picking_wave_id", "wave_state"} for each order found in a
+    non-finished wave at this location. One header call per open state plus
+    one detail call per open wave — a handful, since only a few waves are live
+    at once. Lets RateLimitError propagate.
+    """
+    wanted = set(num_ids)
+    found: dict[int, dict] = {}
+    for state in _PICK_WAVE_OPEN_STATES:
+        resp = call_linnworks_get(
+            "Picking/GetAllPickingWaveHeaders", {"state": state, "locationId": location_id}
+        )
+        for header in (resp.get("PickwaveHeaders") or []) if isinstance(resp, dict) else []:
+            wave_id = header.get("PickingWaveId")
+            detail = _format_pick_wave_detail(_fetch_pick_wave(wave_id), wave_id)
+            if detail is None:
+                continue
+            for o in detail["orders"]:
+                if o["order_id"] in wanted and o["order_id"] not in found:
+                    found[o["order_id"]] = {"picking_wave_id": wave_id, "wave_state": detail["state"]}
+    return found
+
+
+@mcp.tool()
+def remove_orders_from_pick_waves(
+    order_ids: list,
+    location_id: str = DEFAULT_LOCATION_ID,
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Take orders out of whatever pickwave holds them
+    (Picking/DeleteOrdersFromPickingWaves). The orders themselves are not
+    changed — they just stop being in a wave, and can go into a new one.
+
+    The manifest shows which wave holds each order, and warns when that wave
+    has started — InProgress, Paused, Complete or Packing (a picker may
+    already have the items on a trolley). Orders can be GUIDs or order
+    numbers; an unresolvable id is reported, not raised. Staged above 25
+    orders. dry_run=True by default.
+
+    ⚠️  Linnworks' delete is neither location- nor state-scoped. An order the
+    manifest didn't find in an open wave at this location may still be held
+    by an ABANDONED wave (abandoning doesn't release orders — see
+    update_pick_wave) or a wave at another location, and this call frees it
+    either way — live-confirmed for an abandoned wave, 22 Sep 2026.
+
+    Needs the DeletePickingWavesNode permission, which no read tool exercises
+    — a missing permission comes back as outcome "error" with Linnworks'
+    message verbatim.
+
+    Each affected wave is re-read afterwards. Per-order outcome: removed,
+    not_in_a_wave (Linnworks' NoPickwaves list), still_present (the read-back
+    still finds it), or unconfirmed (the read-back failed — the row carries
+    readback_error — or Linnworks' reply didn't say).
+
+    There is no endpoint to delete a wave itself. Removing a wave's last
+    order makes Linnworks abandon the wave automatically (live-confirmed 22
+    Sep 2026) — there is nothing more to do to retire it.
+    """
+    if not order_ids:
+        return {"success": False, "error": "order_ids is empty."}
+
+    resolved, resolve_errors, rate_limited = _resolve_order_numbers(order_ids)
+    if rate_limited:
+        return _pick_wave_preflight_throttled(rate_limited)
+    nums = [r[1] for r in resolved]
+    try:
+        holding = _locate_orders_in_open_waves(nums, location_id) if nums else {}
+    except RateLimitError as exc:
+        return _pick_wave_preflight_throttled([{"step": "locating waves", "reason": str(exc)}])
+    except RuntimeError as exc:
+        return {"success": False, "error": f"Locating the orders' waves failed — nothing was written: {exc}"}
+
+    manifest: list[dict] = []
+    for input_id, num, guid in resolved:
+        where = holding.get(num)
+        row = {
+            "order_id": input_id,
+            "num_order_id": num,
+            "order_guid": guid,
+            "picking_wave_id": where["picking_wave_id"] if where else None,
+            "wave_state": where["wave_state"] if where else None,
+        }
+        if where and where["wave_state"] in _PICK_WAVE_STARTED_STATES:
+            row["warning"] = (f"Wave {where['picking_wave_id']} has started ({where['wave_state']}) "
+                              "— a picker may already have this order's items on a trolley.")
+        if not where:
+            row["note"] = (
+                "Not found in any open wave at this location. It may still be held by an "
+                "ABANDONED wave (abandoning doesn't release orders) or a wave at another "
+                "location — Linnworks' delete is neither state- nor location-scoped and frees "
+                "it either way (live-confirmed for an abandoned wave, 22 Sep 2026)."
+            )
+        manifest.append(row)
+
+    guard = _write_guard("remove_orders_from_pick_waves", resolved, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, "manifest": manifest, "resolve_errors": resolve_errors}
+    if dry_run:
+        in_waves = sum(1 for m in manifest if m["picking_wave_id"])
+        return {
+            "dry_run": True,
+            "order_count": len(order_ids),
+            "manifest": manifest,
+            "resolve_errors": resolve_errors,
+            "message": f"Dry run — {in_waves} order(s) found in open waves. Nothing was removed.",
+        }
+    if not nums:
+        return {"dry_run": False, "results": [], "resolve_errors": resolve_errors,
+                "complete": False, "message": "No order resolved; nothing was sent."}
+
+    try:
+        resp = _picking_write("Picking/DeleteOrdersFromPickingWaves", {"OrderIds": nums})
+    except RateLimitError as exc:
+        return {"dry_run": False, "manifest": manifest, "outcome": "rate_limited",
+                "complete": False, "error": str(exc)}
+    except RuntimeError as exc:
+        return {"dry_run": False, "manifest": manifest, "outcome": "error",
+                "complete": False, "error": str(exc)}
+    except Exception as exc:  # a timeout or dropped connection, after sending
+        return {"dry_run": False, "manifest": manifest, "outcome": "unconfirmed",
+                "complete": False, "error": f"{type(exc).__name__}: {exc}",
+                "note": ("The request may have reached Linnworks and the removal may have "
+                         "happened. Check get_pick_wave_detail / check_orders_pickable before "
+                         "trying again.")}
+
+    # A reply that isn't a dict says nothing: every order falls through to the
+    # read-back (still_present) or to unconfirmed.
+    if not isinstance(resp, dict):
+        resp = {}
+    processed = {_as_int(x) for x in (resp.get("ProcessedOrderIds") or [])}
+    no_wave = {_as_int(x) for x in (resp.get("NoPickwaves") or [])}
+
+    still_in: set[int] = set()
+    readback_errors: dict[int, str] = {}
+    for wave_id in sorted({m["picking_wave_id"] for m in manifest if m["picking_wave_id"]}):
+        try:
+            detail = _format_pick_wave_detail(_fetch_pick_wave(wave_id), wave_id)
+        except RateLimitError as exc:
+            readback_errors[wave_id] = f"rate limited: {exc}"
+            continue
+        except Exception as exc:
+            readback_errors[wave_id] = str(exc)
+            continue
+        if detail is not None:
+            still_in.update(o["order_id"] for o in detail["orders"])
+
+    results: list[dict] = []
+    for m in manifest:
+        num = m["num_order_id"]
+        extra: dict = {}
+        if num in still_in:
+            outcome = "still_present"
+        elif m["picking_wave_id"] in readback_errors:
+            outcome = "unconfirmed"
+            extra["readback_error"] = readback_errors[m["picking_wave_id"]]
+        elif num in processed:
+            outcome = "removed"
+        elif num in no_wave:
+            outcome = "not_in_a_wave"
+        else:
+            outcome = "unconfirmed"
+        results.append({**m, "outcome": outcome, **extra})
+
+    complete = not resolve_errors and all(r["outcome"] in ("removed", "not_in_a_wave") for r in results)
+    return {
+        "dry_run": False,
+        "results": results,
+        "resolve_errors": resolve_errors,
+        "complete": complete,
+        "message": f"{sum(r['outcome'] == 'removed' for r in results)} order(s) removed from waves.",
     }
 
 
