@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.55.8"
+__version__ = "1.55.9"
 
 import json
 import os
@@ -4079,13 +4079,62 @@ def relink_order_line(
 #      We send UNWRAPPED {"orders": [...], "location": ...}, matching the rest
 #      of the Orders/ family.
 #   2. What "location" is. Typed `string` in the spec, not `uuid` — unlike
-#      CreateNewOrder's `fulfilmentCenter`, which IS a uuid. It may want a
-#      location NAME. We send the GUID and report what came back.
+#      CreateNewOrder's `fulfilmentCenter`, which IS a uuid. SETTLED 18 Sep
+#      2026 (v1.55.1): it wants the location NAME. The zero GUID returns HTTP
+#      400 "Location not found."; "Default" works. That finding was recorded
+#      but the code kept sending the GUID until issue #71 (22 Sep 2026), so
+#      every call on the default location failed. _create_order_location_name
+#      now translates.
 #   3. Whether PricePerUnit is read as tax-inclusive. `TaxCostInclusive` exists
 #      on ChannelOrderItem but its effect is unverified here, and this codebase
 #      has already been burned once by a tax-inclusivity assumption
 #      (PO line Cost, issue #15). Exposed as prices_include_tax, defaulted to
 #      True for UK retail, and flagged in the manifest as UNVERIFIED.
+
+# Order Sources Linnworks refuses to let CreateOrders save. Live-confirmed
+# 22 Sep 2026 (issue #71): source "AMAZON" returned HTTP 400 "Order of Source
+# AMAZON cannot be saved due to being reserved for linnworks integrated
+# channels", and no order was created. Only AMAZON has been tried. Other
+# integrated channels (SHOPIFY, EBAY, ...) are untested and may be refused the
+# same way, so the live path also recognises that refusal by its message
+# (_is_reserved_source_refusal) rather than relying on this set alone.
+_CREATE_ORDER_RESERVED_SOURCES = {"AMAZON"}
+
+
+def _is_reserved_source_refusal(message: str) -> bool:
+    """True when a CreateOrders error is Linnworks refusing a reserved Source."""
+    return "reserved for linnworks integrated channels" in (message or "").lower()
+
+
+def _create_order_location_name(location: str) -> tuple[str | None, str | None]:
+    """
+    Translate create_order's location argument into the location NAME that
+    Orders/CreateOrders wants (the GUID returns "Location not found.").
+
+    The Default location maps to "Default" with no API call — the only value
+    live-proven to work. Any other GUID or name is looked up in
+    Inventory/GetStockLocations and returned as the tenant's own spelling;
+    one that isn't there is refused before any write. Returns (name, error).
+    """
+    value = (location or "").strip()
+    if not value or value.lower() == DEFAULT_LOCATION_ID or value.lower() == "default":
+        return "Default", None
+    try:
+        rows = call_linnworks_get("Inventory/GetStockLocations") or []
+    except RateLimitError as exc:
+        return None, f"Rate limited while resolving location '{value}' — nothing was created. ({exc})"
+    except RuntimeError as exc:
+        return None, f"Could not read the location list to resolve '{value}' — nothing was created. ({exc})"
+    for row in rows if isinstance(rows, list) else []:
+        guid = str(row.get("StockLocationId") or "").lower()
+        name = row.get("LocationName") or ""
+        if value.lower() in (guid, name.lower()):
+            return name, None
+    return None, (
+        f"Location '{value}' is not one of this tenant's locations (by GUID or name). "
+        "Nothing was created. Use get_locations to see the list."
+    )
+
 
 _CREATE_ORDER_UNPROVEN_WARNING = (
     "Orders/CreateOrders has never been fired on this tenant. A 2xx means "
@@ -4257,10 +4306,13 @@ def create_order(
               outcome "created_but_status_not_set".
         source: Order source. Defaults to "DIRECT" — the value this codebase
             already treats as a manual order (_NON_CHANNEL_ORDER_SOURCES).
-            ⚠️ Setting a real channel ("AMAZON", "SHOPIFY") puts a replacement's
-            cost against that channel in reporting, but its blank ItemSource
-            will then read as an ORPHANED LINE to find_unlinked_order_lines.
-            The tool warns when you do this.
+            ⚠️ "AMAZON" is REFUSED before any write: Linnworks will not save a
+            created order with that Source ("reserved for linnworks integrated
+            channels", live-confirmed 22 Sep 2026, issue #71). Other real
+            channels ("SHOPIFY", "EBAY") are untested — Linnworks may refuse
+            them the same way, which is reported as a clear error with nothing
+            created. If one is accepted, how its lines classify in
+            find_unlinked_order_lines is unverified. The tool warns.
         sub_source: Sub-source label, e.g. "Phone", "Trade", "CS Replacement".
         reference_number: Your reference. Used to block duplicates — a matching
             open order aborts the write (Orders/CreateOrders silently skips
@@ -4288,7 +4340,11 @@ def create_order(
             drives the overdue flag: setting it to the current time makes the
             order INSTANTLY overdue in get_open_orders(overdue_only=True).
         note: Internal note added to the order, saving a second call.
-        location_id: Fulfilment location. Defaults to Default.
+        location_id: Fulfilment location, as a GUID or a location name.
+            Defaults to Default. Orders/CreateOrders wants the location NAME
+            (the GUID returns "Location not found."), so this is translated
+            before sending; only "Default" is live-proven. An unknown
+            location is refused before any write.
         confirmed_count: Echo back the number of LINES when staging triggers
             (orders over 10 lines).
         dry_run: True (default) shows the order without creating it.
@@ -4358,6 +4414,24 @@ def create_order(
     billing, billing_errors = _build_channel_address(billing_raw, "billing_address")
     if addr_errors or billing_errors:
         return {"status": "error", "error": "; ".join(addr_errors + billing_errors)}
+
+    # Linnworks refuses these Sources outright (issue #71) — say so up front
+    # rather than letting a dry run promise an order that can never be saved.
+    if (source or "").strip().upper() in _CREATE_ORDER_RESERVED_SOURCES:
+        return {
+            "status": "error",
+            "error": (
+                f"source='{source}' cannot be used: Linnworks refuses to save a created order "
+                "with that Source ('reserved for linnworks integrated channels', live-confirmed "
+                "22 Sep 2026). Nothing was created. Use source='DIRECT' and put the original "
+                "order in external_reference."
+            ),
+            "reserved_source": True,
+        }
+
+    location_name, loc_err = _create_order_location_name(location_id)
+    if loc_err:
+        return {"status": "error", "error": loc_err}
 
     # ── 2. Resolve every SKU. One bad SKU aborts the whole order. ─────────────
     resolved: list[dict] = []
@@ -4564,10 +4638,12 @@ def create_order(
 
     if _is_channel_order_source(source):
         warnings.append(
-            f"source='{source}' is a real channel, not DIRECT. The order's cost will sit "
-            f"against {source} in reporting — but its lines carry no channel line id, so "
-            "find_unlinked_order_lines will report them as ORPHANED. Use source='DIRECT' "
-            "unless you specifically want the channel attribution."
+            f"source='{source}' is not DIRECT. Linnworks refused source 'AMAZON' as "
+            "reserved for its integrated channels (live-confirmed 22 Sep 2026, issue #71); "
+            f"'{source}' is untested and may be refused the same way, in which case nothing "
+            "is created. If it is accepted, the order's cost sits against it in reporting, "
+            "but how its lines classify in find_unlinked_order_lines is unverified. Use "
+            "source='DIRECT' unless you specifically want the channel attribution."
         )
     if status_key == "resend":
         warnings.append(
@@ -4589,6 +4665,7 @@ def create_order(
         "currency": currency,
         "dispatch_by": dispatch_by_iso,
         "location_id": location_id,
+        "location_sent_to_linnworks": location_name,
         "prices_include_tax": prices_include_tax,
         "tax_note": (
             "prices_include_tax maps to ChannelOrderItem.TaxCostInclusive, whose effect is "
@@ -4672,8 +4749,8 @@ def create_order(
 
     # Sent UNWRAPPED. The swagger body parameter is named
     # Orders_CreateOrdersRequest, but that name is not the wire key — see the
-    # module note above. `location` is typed string, not uuid: unverified.
-    payload = {"orders": [channel_order], "location": location_id}
+    # module note above. `location` is the location NAME (see the module note).
+    payload = {"orders": [channel_order], "location": location_name}
 
     try:
         created = call_linnworks("Orders/CreateOrders", payload)
@@ -4689,15 +4766,28 @@ def create_order(
             "manifest": manifest,
         }
     except RuntimeError as exc:
+        if _is_reserved_source_refusal(str(exc)):
+            return {
+                "dry_run": False,
+                "status": "error",
+                "reserved_source": True,
+                "error": (
+                    f"Linnworks refused source='{source}' as reserved for its integrated "
+                    f"channels. Nothing was created. Use source='DIRECT' and put the original "
+                    f"order in external_reference. ({exc})"
+                ),
+                "manifest": manifest,
+            }
         return {
             "dry_run": False,
             "status": "error",
             "error": f"Orders/CreateOrders failed: {exc}",
             "payload_sent": payload,
             "hint": (
-                "This endpoint has never been fired on this tenant. If the error mentions a "
-                "missing parameter, the body may need the {'request': {...}} wrapper; if it "
-                "mentions the location, `location` may want a location NAME rather than a GUID."
+                "The unwrapped body and a location NAME are live-proven (v1.55.1), so neither "
+                "is the likely cause. If the error mentions a missing parameter, the body may "
+                "still need the {'request': {...}} wrapper for this case; if it mentions the "
+                f"location, check '{location_name}' against get_locations."
             ),
             "manifest": manifest,
         }
