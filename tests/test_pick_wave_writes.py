@@ -402,6 +402,27 @@ class TestGenerateRefusesBeforeAnyWrite:
         assert out["rate_limited"]
         assert fake.writes() == []
 
+    def test_roster_failure_is_a_structured_refusal(self):
+        fake = FakeLinnworks(orders=ORDERS, raise_on={
+            "Picking/GetPickwaveUsersWithSummary": RuntimeError("HTTP 500 — boom")})
+        with fake.active():
+            out = server.generate_pick_waves(
+                [{"order_ids": ["611385"], "user_id": 19}], dry_run=False)
+        assert out["success"] is False
+        assert "HTTP 500 — boom" in out["error"]
+        assert "nothing was written" in out["error"]
+        assert fake.writes() == []
+
+    def test_pickability_failure_is_a_structured_refusal(self):
+        fake = FakeLinnworks(orders=ORDERS, raise_on={
+            "Picking/CheckAllocatableToPickwave": RuntimeError("HTTP 400 — bad")})
+        with fake.active():
+            out = server.generate_pick_waves([{"order_ids": ["611385"]}], dry_run=False)
+        assert out["success"] is False
+        assert "HTTP 400 — bad" in out["error"]
+        assert "nothing was written" in out["error"]
+        assert fake.writes() == []
+
 
 class TestGenerateDryRun:
 

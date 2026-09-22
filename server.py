@@ -8211,6 +8211,9 @@ def generate_pick_waves(
             roster = _fetch_picker_roster()
         except RateLimitError as exc:
             return _pick_wave_preflight_throttled([{"step": "picker roster", "reason": str(exc)}])
+        except RuntimeError as exc:
+            return {"success": False,
+                    "error": f"Picker roster lookup failed — nothing was written: {exc}"}
         unknown = sorted(u for u in wanted_users if u not in roster)
         if unknown:
             return _pick_wave_unknown_user(unknown[0] if len(unknown) == 1 else unknown, roster)
@@ -8220,6 +8223,9 @@ def generate_pick_waves(
         pickability = _check_pickable_numbers([r[1] for r in resolved])
     except RateLimitError as exc:
         return _pick_wave_preflight_throttled([{"step": "pickability check", "reason": str(exc)}])
+    except RuntimeError as exc:
+        return {"success": False,
+                "error": f"Pickability check failed — nothing was written: {exc}"}
     fifo_ready: set[str] | None
     try:
         guids = [r[2] for r in resolved]
