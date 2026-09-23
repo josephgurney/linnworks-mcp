@@ -523,3 +523,75 @@ def test_runtime_warning_does_not_name_another_repository():
     for forbidden in ("order-sync-service", "ordersync"):
         assert forbidden not in server._RELINK_ORDER_LINE_UNPROVEN_WARNING
         assert forbidden not in server.DESPATCH_MAPPING_WARNING_TEXT
+
+
+# --- Orders/UpdateOrderItem payload shape / location scope (issue #105) -----
+#
+# AC6/AC7: the confirmed-endpoints row and the relink_order_line tools-table
+# row must name the proven payload shape, say the proof was obtained at the
+# Default location, and say a caller that hard-codes fulfilmentCenter to the
+# zero GUID is not covered by that proof at non-Default locations -- and none
+# of the three rows may overclaim that the endpoint is proven beyond Default
+# while the registry still records the fulfilmentCenter-effect as unknown.
+
+def _update_order_item_proof_scope_rows() -> dict:
+    return {
+        "CLAUDE.md Orders/UpdateOrderItem row": _update_order_item_endpoint_row(),
+        "CLAUDE.md relink_order_line row": _relink_claude_row(),
+        "README.md relink_order_line row": _relink_readme_row(),
+    }
+
+
+def test_docs_name_the_proven_payload_shape():
+    for name, row in _update_order_item_proof_scope_rows().items():
+        low = row.lower()
+        assert "fulfilmentcenter" in low, (
+            f"{name} does not name how fulfilmentCenter was chosen for the proof")
+        assert "deriv" in low, (
+            f"{name} does not say fulfilmentCenter was derived from the order")
+
+
+def test_docs_state_the_proof_was_obtained_at_the_default_location():
+    for name, row in _update_order_item_proof_scope_rows().items():
+        low = row.lower()
+        assert "default" in low, f"{name} does not name the Default location"
+        assert "105" in row, f"{name} does not cite issue #105"
+
+
+def test_docs_state_a_hard_coded_zero_guid_caller_is_not_covered_at_non_default():
+    for name, row in _update_order_item_proof_scope_rows().items():
+        low = row.lower()
+        assert "hard-cod" in low, (
+            f"{name} does not describe a caller that hard-codes fulfilmentCenter")
+        assert "zero guid" in low, (
+            f"{name} does not name the zero GUID that caller hard-codes")
+        assert "not covered" in low, (
+            f"{name} does not say that caller is not covered by the proof there")
+
+
+def test_docs_do_not_claim_update_order_item_proven_beyond_default_location():
+    """The registry says the fulfilmentCenter-effect is still unknown -- no
+    doc may claim otherwise, or a reader is told the opposite of what has
+    actually been tested."""
+    assert server.FULFILMENT_CENTER_EFFECT_OBSERVED == server.UPDATE_ITEM_NEVER_ATTEMPTED
+
+    overclaims = (
+        "proven at non-default",
+        "proven at non default",
+        "proven at any location",
+        "proven at every location",
+        "proven regardless of location",
+        "covered at non-default",
+        "covered at non default",
+        "fulfilmentcenter has been proven",
+        "fulfilmentcenter's value has been proven",
+    )
+    for name, row in _update_order_item_proof_scope_rows().items():
+        low = row.lower()
+        for claim in overclaims:
+            assert claim not in low, (
+                f"{name} claims Orders/UpdateOrderItem is proven beyond the "
+                f"Default location ({claim!r}), but "
+                f"FULFILMENT_CENTER_EFFECT_OBSERVED is "
+                f"{server.FULFILMENT_CENTER_EFFECT_OBSERVED!r}"
+            )

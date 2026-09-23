@@ -1157,3 +1157,257 @@ class TestRemoveOrderItemWarningUntouched:
             "a related order-item write has been observed to orphan surviving "
             "lines (issue #52)."
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Issue #105 — the payload shape the field proof was taken with, and whether
+# fulfilmentCenter's VALUE affects Orders/UpdateOrderItem, held separately
+# from UPDATE_ORDER_ITEM_FIELDS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestUpdateOrderItemProofShapeRegistry:
+    """AC1/AC2: the payload shape record and the fulfilmentCenter-effect
+    state must be separate from the per-field registry, so a green field row
+    can never be read as proof of the location behaviour."""
+
+    def test_proof_shape_is_a_separate_object_from_the_per_field_registry(self):
+        assert server.UPDATE_ORDER_ITEM_PROOF_SHAPE is not server.UPDATE_ORDER_ITEM_FIELDS
+        assert "UPDATE_ORDER_ITEM_PROOF_SHAPE" not in server.UPDATE_ORDER_ITEM_FIELDS
+
+    def test_proof_shape_records_how_fulfilment_center_was_chosen(self):
+        shape = server.UPDATE_ORDER_ITEM_PROOF_SHAPE
+        assert shape["fulfilment_center_selection"] == "derived_from_order"
+
+    def test_proof_shape_records_the_location_the_proving_orders_actually_held(self):
+        shape = server.UPDATE_ORDER_ITEM_PROOF_SHAPE
+        assert shape["fulfilment_center_value_on_proving_orders"] == server.DEFAULT_LOCATION_ID
+        assert shape["proving_orders_location_name"] == "Default"
+
+    def test_proof_shape_records_how_source_was_chosen(self):
+        assert server.UPDATE_ORDER_ITEM_PROOF_SHAPE["source_selection"] == (
+            "derived_from_order_source")
+
+    def test_proof_shape_does_not_overclaim_611150s_selection_mechanism(self):
+        """The brief's own trap: order 611150 (18 Sep) predates
+        relink_order_line's first live run (611697, 23 Sep), so which
+        mechanism chose its fulfilmentCenter is NOT established -- only the
+        value it sent (the zero GUID) is. The registry must say so rather
+        than silently assuming its write went through this tool's own code
+        path."""
+        shape = server.UPDATE_ORDER_ITEM_PROOF_SHAPE
+        assert "611150" in shape["proving_orders"]
+        assert "611150" in shape["caveat"]
+        assert "not established" in shape["caveat"]
+
+    def test_fulfilment_center_effect_starts_unknown_never_attempted(self):
+        """AC2: starts as unknown/never-attempted."""
+        assert server.FULFILMENT_CENTER_EFFECT_OBSERVED == server.UPDATE_ITEM_NEVER_ATTEMPTED
+
+    def test_fulfilment_center_effect_uses_the_existing_proof_state_vocabulary(self):
+        """AC2: uses the existing proof-state vocabulary where possible —
+        not a fourth, ad hoc value invented just for this."""
+        assert server.FULFILMENT_CENTER_EFFECT_OBSERVED in server.UPDATE_ITEM_OBSERVED_STATES
+
+    def test_a_proven_fulfilment_center_effect_must_carry_evidence(self):
+        import server as s
+        orig_state = s.FULFILMENT_CENTER_EFFECT_OBSERVED
+        orig_evidence = s.FULFILMENT_CENTER_EFFECT_EVIDENCE
+        try:
+            s.FULFILMENT_CENTER_EFFECT_OBSERVED = s.UPDATE_ITEM_PROVEN
+            s.FULFILMENT_CENTER_EFFECT_EVIDENCE = ""
+            with pytest.raises(ValueError, match="carries no evidence"):
+                s._assert_update_order_item_observations_consistent()
+        finally:
+            s.FULFILMENT_CENTER_EFFECT_OBSERVED = orig_state
+            s.FULFILMENT_CENTER_EFFECT_EVIDENCE = orig_evidence
+        s._assert_update_order_item_observations_consistent()
+
+    def test_a_fulfilment_center_effect_state_outside_the_vocabulary_is_rejected(self):
+        import server as s
+        orig = s.FULFILMENT_CENTER_EFFECT_OBSERVED
+        try:
+            s.FULFILMENT_CENTER_EFFECT_OBSERVED = "sometimes"
+            with pytest.raises(ValueError, match="not one of"):
+                s._assert_update_order_item_observations_consistent()
+        finally:
+            s.FULFILMENT_CENTER_EFFECT_OBSERVED = orig
+        s._assert_update_order_item_observations_consistent()
+
+    def test_proving_orders_location_must_stay_default_or_the_assertion_fails(self):
+        """The 'proof covers Default-location orders only' wording depends on
+        this being true. A future edit that quietly changes it must be
+        caught at import time, not silently believed."""
+        import server as s
+        original = dict(s.UPDATE_ORDER_ITEM_PROOF_SHAPE)
+        try:
+            s.UPDATE_ORDER_ITEM_PROOF_SHAPE["fulfilment_center_value_on_proving_orders"] = (
+                "not-the-default-location")
+            with pytest.raises(ValueError, match="DEFAULT_LOCATION_ID"):
+                s._assert_update_order_item_observations_consistent()
+        finally:
+            s.UPDATE_ORDER_ITEM_PROOF_SHAPE.clear()
+            s.UPDATE_ORDER_ITEM_PROOF_SHAPE.update(original)
+        s._assert_update_order_item_observations_consistent()
+
+
+class TestRelinkWarningStatesLocationScope:
+    """AC3: the live-run warning states the proof covers Default-location
+    orders only, and the text is built from the new registry values."""
+
+    def test_warning_states_default_location_only(self):
+        assert "DEFAULT-LOCATION ORDERS ONLY" in server._RELINK_ORDER_LINE_UNPROVEN_WARNING
+
+    def test_warning_names_the_fulfilment_center_effect_state(self):
+        assert server.FULFILMENT_CENTER_EFFECT_OBSERVED in (
+            server._RELINK_ORDER_LINE_UNPROVEN_WARNING)
+
+    def test_warning_changes_when_the_registry_value_is_mutated(self):
+        """The specific AC3 requirement: a test mutates the value and asserts
+        the warning changes — proving the text is derived, not a static
+        literal that merely happens to match today's registry."""
+        import server as s
+        before = s._build_relink_order_line_warning()
+        orig_state = s.FULFILMENT_CENTER_EFFECT_OBSERVED
+        orig_evidence = s.FULFILMENT_CENTER_EFFECT_EVIDENCE
+        try:
+            s.FULFILMENT_CENTER_EFFECT_OBSERVED = s.UPDATE_ITEM_PROVEN
+            s.FULFILMENT_CENTER_EFFECT_EVIDENCE = "test evidence for issue #105"
+            after = s._build_relink_order_line_warning()
+            assert after != before
+            assert s.UPDATE_ITEM_PROVEN in after
+        finally:
+            s.FULFILMENT_CENTER_EFFECT_OBSERVED = orig_state
+            s.FULFILMENT_CENTER_EFFECT_EVIDENCE = orig_evidence
+        assert s._build_relink_order_line_warning() == before
+
+    def test_module_constant_matches_a_fresh_build(self):
+        """The precomputed module-level warning must not drift from what the
+        builder produces right now — if it did, the two would be two
+        documents again, exactly what #105 is meant to prevent."""
+        assert server._RELINK_ORDER_LINE_UNPROVEN_WARNING == (
+            server._build_relink_order_line_warning())
+
+    def test_warning_names_no_external_repository(self):
+        """AC8 / #78's AC11, re-checked against the new text specifically."""
+        for name in ("order-sync-service", "ordersync"):
+            assert name not in server._RELINK_ORDER_LINE_UNPROVEN_WARNING
+
+
+class TestDryRunManifestShowsFulfilmentCenterLocationScope:
+    """AC4: the dry-run manifest shows the fulfilmentCenter it will send and
+    whether that is the Default location, flagging a non-Default location as
+    unproven."""
+
+    def test_manifest_shows_fulfilment_center_and_flags_non_default(self):
+        # BASE_ORDER's FulfilmentLocationId is GUID_LOC, not the Default GUID.
+        with patch("server.call_linnworks", side_effect=_post_side_effect(BASE_ORDER)):
+            result = server.relink_order_line(
+                GUID, ROW_ID_1, channel_line_id=NEW_CHANNEL_LINE_ID, dry_run=True
+            )
+
+        assert result["fulfilment_center"] == GUID_LOC
+        assert result["fulfilment_center_is_default"] is False
+        assert "fulfilment_center_warning" in result
+        assert "Default location" in result["fulfilment_center_warning"]
+        assert "105" in result["fulfilment_center_warning"]
+
+    def test_manifest_omits_the_warning_at_the_default_location(self):
+        default_order = dict(BASE_ORDER)
+        default_order["FulfilmentLocationId"] = server.DEFAULT_LOCATION_ID
+        with patch("server.call_linnworks", side_effect=_post_side_effect(default_order)):
+            result = server.relink_order_line(
+                GUID, ROW_ID_1, channel_line_id=NEW_CHANNEL_LINE_ID, dry_run=True
+            )
+
+        assert result["fulfilment_center"] == server.DEFAULT_LOCATION_ID
+        assert result["fulfilment_center_is_default"] is True
+        assert result["order_fulfilment_location"] == server.DEFAULT_LOCATION_ID
+        assert result["order_fulfilment_location_is_default"] is True
+        assert result["fulfilment_center_location_mismatch"] is False
+        assert "fulfilment_center_warning" not in result
+
+    def test_location_id_override_is_reflected_in_the_manifest(self):
+        override = "ffffffff-0000-0000-0000-000000000056"
+        with patch("server.call_linnworks", side_effect=_post_side_effect(BASE_ORDER)):
+            result = server.relink_order_line(
+                GUID, ROW_ID_1, channel_line_id=NEW_CHANNEL_LINE_ID,
+                location_id=override, dry_run=True,
+            )
+
+        assert result["fulfilment_center"] == override
+        assert result["fulfilment_center_is_default"] is False
+        assert "fulfilment_center_warning" in result
+
+    def test_mismatched_override_to_default_on_a_non_default_order_is_flagged(self):
+        """QA round 1 reproduction: BASE_ORDER sits at GUID_LOC (non-Default).
+        Overriding location_id to the Default GUID is exactly the hard-coded
+        zero-GUID shape the issue is about — the manifest must show both that
+        the order itself is non-Default AND that the sent value disagrees
+        with it, not silently read as 'Default, all clear'."""
+        with patch("server.call_linnworks", side_effect=_post_side_effect(BASE_ORDER)):
+            result = server.relink_order_line(
+                GUID, ROW_ID_1, channel_line_id=NEW_CHANNEL_LINE_ID,
+                location_id=server.DEFAULT_LOCATION_ID, dry_run=True,
+            )
+
+        # The value about to be SENT is the Default GUID...
+        assert result["fulfilment_center"] == server.DEFAULT_LOCATION_ID
+        assert result["fulfilment_center_is_default"] is True
+        # ...but the ORDER's own location is not, and disagrees with it.
+        assert result["order_fulfilment_location"] == GUID_LOC
+        assert result["order_fulfilment_location_is_default"] is False
+        assert result["fulfilment_center_location_mismatch"] is True
+        assert "fulfilment_center_warning" in result
+        assert "Default location" in result["fulfilment_center_warning"]
+        assert "105" in result["fulfilment_center_warning"]
+        assert "does NOT match" in result["fulfilment_center_warning"]
+
+    def test_default_order_overridden_to_non_default_does_not_claim_order_is_non_default(self):
+        """The reverse of the case above: the ORDER is at Default, but the
+        caller overrides location_id to a non-Default value. The mismatch
+        must still be flagged, but the warning must not claim the order
+        itself sits away from Default — that would be false."""
+        default_order = dict(BASE_ORDER)
+        default_order["FulfilmentLocationId"] = server.DEFAULT_LOCATION_ID
+        with patch("server.call_linnworks", side_effect=_post_side_effect(default_order)):
+            result = server.relink_order_line(
+                GUID, ROW_ID_1, channel_line_id=NEW_CHANNEL_LINE_ID,
+                location_id=GUID_LOC, dry_run=True,
+            )
+
+        assert result["fulfilment_center"] == GUID_LOC
+        assert result["fulfilment_center_is_default"] is False
+        # The order itself IS at Default...
+        assert result["order_fulfilment_location"] == server.DEFAULT_LOCATION_ID
+        assert result["order_fulfilment_location_is_default"] is True
+        # ...but the sent value disagrees with it.
+        assert result["fulfilment_center_location_mismatch"] is True
+        assert "fulfilment_center_warning" in result
+        assert "does NOT match" in result["fulfilment_center_warning"]
+        assert "own fulfilment location is NOT the Default location" not in (
+            result["fulfilment_center_warning"]
+        )
+
+    def test_manifest_flags_non_default_on_a_live_run_too(self):
+        """The manifest fields are computed before the dry_run branch, so
+        they must also appear on a live-run response (merged in via the
+        error/result paths, not only the dry-run early return)."""
+        after = _with_relinked_line(BASE_ORDER, ROW_ID_1, NEW_CHANNEL_LINE_ID, "SHOPIFY")
+        counter = {"n": 0}
+
+        def side(path, payload, **kwargs):
+            if "GetOrdersById" in path:
+                counter["n"] += 1
+                return [BASE_ORDER] if counter["n"] == 1 else [after]
+            if "UpdateOrderItem" in path:
+                return {}
+            raise AssertionError(f"Unexpected call: {path}")
+
+        with patch("server.call_linnworks", side_effect=side):
+            result = server.relink_order_line(
+                GUID, ROW_ID_1, channel_line_id=NEW_CHANNEL_LINE_ID, dry_run=False
+            )
+
+        assert result["fulfilment_center"] == GUID_LOC
+        assert result["fulfilment_center_is_default"] is False
+        assert "fulfilment_center_warning" in result
