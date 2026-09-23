@@ -19,6 +19,8 @@ import sys
 import os
 from unittest.mock import patch
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server
@@ -943,16 +945,68 @@ class TestRelinkUnprovenWarningWording:
         assert "Amazon" not in self.W
         assert "eBay" not in self.W
 
-    def test_still_states_persistence_is_not_established(self):
-        assert "UNPROVEN" in self.W
-        assert "persistence is not established" in self.W
+    def test_states_what_is_proven_without_softening_the_caution(self):
+        """#59 proved ItemNumber/ItemSource persist, so the old blanket
+        "UNPROVEN" is now false and had to go. The caution it carried must
+        NOT have gone with it: a 2xx is still not proof, because this endpoint
+        silently discards some values behind one.
+        """
+        assert "PROVEN" in self.W
         assert "not proof" in self.W.lower()
         assert "find_unlinked_order_lines" in self.W
+        # The specific trap that makes a 2xx untrustworthy even now.
+        assert "silently discarded" in self.W
+        assert "NON-EMPTY" in self.W
+        # And the whole-line hazard, since price/quantity ride along.
+        assert "unexpected_field_changes" in self.W
+
+    def test_names_only_fields_this_repo_proved_itself(self):
+        """AC11 again, at the level of the derived list: PricePerUnit, TaxRate
+        and Quantity are another repository's evidence and must not appear in
+        runtime text, however true they may be."""
+        named = server._update_order_item_proven_fields()
+        assert named == "ItemNumber, ItemSource", named
+        for foreign in ("PricePerUnit", "TaxRate", "Quantity"):
+            assert foreign not in self.W
 
     def test_separates_persistence_from_despatch_mapping(self):
+        """The #78 distinction survives the rewrite. Persisting the fields and
+        despatch honouring them are still different claims, and the second is
+        still not established."""
         assert "persist" in self.W
         assert "despatch" in self.W
-        assert "Two separate things are unknown" in self.W
+        assert "SEPARATELY" in self.W
+        assert "different claims" in self.W
+        assert server.DESPATCH_MAPPING_OBSERVED in self.W
+
+    def test_warning_is_derived_not_retyped(self):
+        """#59 AC13: one machine-readable place. Flipping the registry must
+        change the warning, or the two can drift as #45 and #47 did."""
+        import server as s
+        original = dict(s.UPDATE_ORDER_ITEM_FIELDS["ItemNumber"])
+        try:
+            s.UPDATE_ORDER_ITEM_FIELDS["ItemNumber"] = {
+                **original, "state": s.UPDATE_ITEM_NEVER_ATTEMPTED,
+            }
+            assert "ItemNumber" not in s._update_order_item_proven_fields()
+        finally:
+            s.UPDATE_ORDER_ITEM_FIELDS["ItemNumber"] = original
+        assert "ItemNumber" in s._update_order_item_proven_fields()
+
+    def test_records_that_this_server_cannot_despatch(self):
+        """The reason the despatch half stays open is a capability gap, not an
+        oversight -- no tool here can despatch, so no future run of this tool
+        can close it either. Callers must be told that plainly."""
+        assert "NO TOOL IN THIS SERVER CAN DESPATCH AN ORDER" in self.W.upper()
+        assert "update_pick_wave" in self.W
+
+    def test_warns_the_detector_cannot_see_a_mispointed_link(self):
+        """Found during #59's live run: find_unlinked_order_lines classifies on
+        ItemSource alone, so a link pointing at the WRONG storefront line reads
+        as healthy. Telling a caller to "confirm it reads as linked" without
+        that caveat invites a false pass."""
+        assert "WRONG" in self.W
+        assert "MISSING" in self.W
 
     def test_names_no_external_repository(self):
         """AC11 — no second-hand evidence from another repo in runtime text."""
@@ -972,6 +1026,79 @@ class TestRelinkUnprovenWarningWording:
         comment = src[max(0, idx - 800):idx]
         assert "never hard-coded" in comment
         assert "remove_order_item" in comment and "cancel_order" in comment
+
+
+class TestUpdateOrderItemFieldRegistry:
+    """#59 AC13/AC14 -- the outcome lives in ONE machine-readable place, held
+    consistent at import time the way GLT_CHANNELS/EBAY_CHANNELS are."""
+
+    def test_every_field_uses_the_one_vocabulary(self):
+        for field, entry in server.UPDATE_ORDER_ITEM_FIELDS.items():
+            assert entry["state"] in server.UPDATE_ITEM_OBSERVED_STATES, field
+
+    def test_a_proven_field_must_carry_its_evidence(self):
+        original = dict(server.UPDATE_ORDER_ITEM_FIELDS["ItemNumber"])
+        try:
+            server.UPDATE_ORDER_ITEM_FIELDS["ItemNumber"] = {
+                **original, "evidence": None}
+            with pytest.raises(ValueError, match="carries no evidence"):
+                server._assert_update_order_item_observations_consistent()
+        finally:
+            server.UPDATE_ORDER_ITEM_FIELDS["ItemNumber"] = original
+        server._assert_update_order_item_observations_consistent()
+
+    def test_a_proven_field_must_say_who_proved_it(self):
+        original = dict(server.UPDATE_ORDER_ITEM_FIELDS["ItemNumber"])
+        try:
+            server.UPDATE_ORDER_ITEM_FIELDS["ItemNumber"] = {
+                **original, "proven_by": "somewhere"}
+            with pytest.raises(ValueError, match="proven_by"):
+                server._assert_update_order_item_observations_consistent()
+        finally:
+            server.UPDATE_ORDER_ITEM_FIELDS["ItemNumber"] = original
+        server._assert_update_order_item_observations_consistent()
+
+    def test_item_source_is_not_recorded_as_plainly_proven(self):
+        """The finding that would be lost by collapsing it: a non-empty value
+        persists, an empty one is silently discarded. Recording ItemSource as
+        flatly "proven" would licence a caller to blank it."""
+        assert server.UPDATE_ORDER_ITEM_FIELDS["ItemSource"]["state"] == (
+            server.UPDATE_ITEM_PROVEN_NON_EMPTY_ONLY)
+
+    def test_despatch_mapping_is_recorded_separately_from_field_persistence(self):
+        """The whole point of #59's split verdict: the fields persisting is not
+        the endpoint working. Both are now proven, but they stay two values."""
+        assert server.DESPATCH_MAPPING_OBSERVED == server.UPDATE_ITEM_PROVEN
+        assert server.DESPATCH_MAPPING_EVIDENCE
+        assert "611697" in server.DESPATCH_MAPPING_EVIDENCE
+
+    def test_the_matching_key_is_recorded_as_still_unknown(self):
+        """#59's run proved a despatch lands, but was raced and so could not
+        isolate ItemNumber from ChannelSKU. Recording the mapping as proven
+        while leaving the KEY unset is the honest state; a future edit that
+        sets a key must have evidence, which is why it is its own value."""
+        assert server.DESPATCH_MAPPING_KEY is None
+        assert server.DESPATCH_MAPPING_KEY_CANDIDATES == ("ItemNumber", "ChannelSKU")
+        # The caveat has to reach the caller, not just live in a comment.
+        assert "ChannelSKU" in server._RELINK_ORDER_LINE_UNPROVEN_WARNING
+        assert "raced" in server.DESPATCH_MAPPING_EVIDENCE.lower()
+
+    def test_mapping_cannot_be_claimed_proven_without_the_write(self):
+        """Guards the nonsense state: despatch mapping proven while the field
+        it depends on was never written."""
+        import server as s
+        orig_map = s.DESPATCH_MAPPING_OBSERVED
+        orig_field = dict(s.UPDATE_ORDER_ITEM_FIELDS["ItemNumber"])
+        try:
+            s.DESPATCH_MAPPING_OBSERVED = s.UPDATE_ITEM_PROVEN
+            s.UPDATE_ORDER_ITEM_FIELDS["ItemNumber"] = {
+                **orig_field, "state": s.UPDATE_ITEM_NEVER_ATTEMPTED}
+            with pytest.raises(ValueError, match="cannot be proven without"):
+                s._assert_update_order_item_observations_consistent()
+        finally:
+            s.DESPATCH_MAPPING_OBSERVED = orig_map
+            s.UPDATE_ORDER_ITEM_FIELDS["ItemNumber"] = orig_field
+        s._assert_update_order_item_observations_consistent()
 
 
 class TestRemoveOrderItemWarningUntouched:
