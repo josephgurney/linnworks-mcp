@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.57.0"
+__version__ = "1.58.0"
 
 import json
 import os
@@ -3717,39 +3717,58 @@ DESPATCH_MAPPING_OBSERVED = UPDATE_ITEM_PROVEN
 # one -- stays in DESPATCH_MAPPING_EVIDENCE, for a human reading this file.
 # Nothing is softened by the split: the caller is still told the key is unknown.
 DESPATCH_MAPPING_WARNING_TEXT = (
-    "a despatch after an API write DID reach the storefront and mark its lines "
-    "fulfilled (live 2026-09-23, order 611697). But that run was raced by "
-    "another local service which added a line mid-experiment, so it does NOT "
-    "establish WHICH field despatch matches on: ItemNumber and ChannelSKU both "
-    "explain what was observed. Do not assume writing ItemNumber is what makes "
-    "a despatch land. NO TOOL IN THIS SERVER CAN DESPATCH AN ORDER -- "
-    "update_pick_wave refuses Complete/Packing/Shipped by design"
+    "a despatch after an API write DOES reach the storefront and mark the "
+    "correct line fulfilled, and ItemNumber is the field that steers it (live "
+    "2026-09-23, order 611708). ChannelSKU is excluded: a line whose ItemNumber "
+    "pointed elsewhere did NOT fulfil its own SKU's storefront line. So writing "
+    "ItemNumber is what makes a despatch land, which is what this tool writes. "
+    "Two limits remain. A line whose ItemNumber points at the WRONG storefront "
+    "line will fulfil that wrong line, silently and successfully -- so a wrong "
+    "id is worse than a blank one, which is why channel_line_id is never "
+    "guessed here. And NO TOOL IN THIS SERVER CAN DESPATCH AN ORDER, so none of "
+    "this can be re-verified from here: update_pick_wave refuses "
+    "Complete/Packing/Shipped by design"
 )
 
 DESPATCH_MAPPING_EVIDENCE = (
-    "live 2026-09-23 on order 611697 / Shopify #11182593: after relink_order_line "
-    "wrote a line's ItemNumber, the order was despatched in the Linnworks UI and "
-    "Shopify created ONE fulfilment covering both of its lines, 1 unit each, "
-    "leaving nothing unfulfilled (displayFulfillmentStatus FULFILLED). So a "
-    "despatch does reach the storefront and does mark lines fulfilled after an "
-    "API write. TWO LIMITS ON THIS PROOF, both important. (1) The run was raced: "
-    "order-sync-service added a third line 18 seconds after the write, giving "
-    "BOTH storefront lines a claimant, so this order cannot show which Linnworks "
-    "line drove which storefront fulfilment. (2) It therefore does NOT isolate "
-    "the matching KEY -- ItemNumber and ChannelSKU both predict the observed "
-    "outcome. What is separately established is that a line with NO channel link "
-    "does not fulfil (22 orders, 1 Aug-19 Sep 2026) and that matching is not by "
-    "the Linnworks SKU. NOTE no tool in this server can despatch an order: "
-    "update_pick_wave refuses Complete/Packing/Shipped by design, so any repeat "
-    "needs a Linnworks UI despatch, and order-sync-service paused first"
+    "live 2026-09-23 on order 611708 / Shopify #11182601 (issue #103), with "
+    "order-sync-service SUSPENDED so nothing could race the run. A line's "
+    "ItemNumber was repointed at a sibling line's storefront id, its ChannelSKU "
+    "left untouched, so nothing pointed at the sibling's own storefront line. "
+    "On despatch Shopify went PARTIALLY_FULFILLED: it fulfilled ONLY the line "
+    "named by ItemNumber and left the other unfulfilled, despite a despatched "
+    "Linnworks line carrying that line's exact ChannelSKU. So a despatch does "
+    "reach the storefront after an API write, AND ItemNumber is what steers it. "
+    "Corroborated the same day from a second subsystem: a refund push on the "
+    "same order failed with 'the requested refund amount exceeds the amount "
+    "available to refund for this line' on BOTH lines, because both resolved to "
+    "the SAME storefront line -- the refunds adapter resolves by ItemNumber too, "
+    "so this is not a quirk of the fulfilment path. Also observed: an over-claim "
+    "does NOT break the push (two Linnworks units claimed a one-unit storefront "
+    "line; Shopify fulfilled one and dropped the excess), which is why issue "
+    "#59's raced run came back non-discriminating rather than erroring. NOTE no "
+    "tool in this server can despatch an order: update_pick_wave refuses "
+    "Complete/Packing/Shipped by design, so any repeat needs a Linnworks UI "
+    "despatch, and order-sync-service SUSPENDED -- setting ORDER_SYNC_PAUSED is "
+    "not sufficient, it does not reach the running worker"
 )
 
 
-# Which FIELD despatch matches on is still unknown, and is deliberately its
-# own value so no reader infers it from DESPATCH_MAPPING_OBSERVED above. A
-# repair that writes ItemNumber is only known to work because the whole line
-# fulfilled, not because ItemNumber was shown to be the key.
-DESPATCH_MAPPING_KEY = None
+# Which FIELD despatch matches on. Kept as its own value, separate from
+# DESPATCH_MAPPING_OBSERVED above, because "a despatch reaches the storefront"
+# and "THIS field is what steers it" are different claims and were established
+# by different runs -- #59 proved the first and could not isolate the second.
+#
+# ItemNumber, proven 2026-09-23 (issue #103) on order 611708 / Shopify
+# #11182601, with order-sync-service suspended so nothing could race it. One
+# line's ItemNumber was repointed at a SIBLING line's storefront id while its
+# ChannelSKU was left alone, so the two identifiers disagreed and nothing
+# pointed at the sibling's own storefront line. On despatch Shopify fulfilled
+# ONLY the line named by ItemNumber and left the other UNFULFILLED -- even
+# though a despatched Linnworks line carried that line's exact ChannelSKU.
+# That excludes ChannelSKU: had it been the key, the repointed line would have
+# fulfilled its own SKU's storefront line, and it did not.
+DESPATCH_MAPPING_KEY = "ItemNumber"
 DESPATCH_MAPPING_KEY_CANDIDATES = ("ItemNumber", "ChannelSKU")
 
 
@@ -3811,6 +3830,22 @@ def _assert_update_order_item_observations_consistent() -> None:
             "DESPATCH_MAPPING_OBSERVED claims proven while ItemNumber was never "
             "written: despatch mapping cannot be proven without the write"
         )
+    # The key is a stronger claim than the mapping itself: it names WHICH field
+    # steers a despatch, and #103 is the only run that could isolate it. It may
+    # only be one of the candidates, and only once the mapping is proven at all.
+    if DESPATCH_MAPPING_KEY is not None:
+        if DESPATCH_MAPPING_KEY not in DESPATCH_MAPPING_KEY_CANDIDATES:
+            raise ValueError(
+                f"DESPATCH_MAPPING_KEY={DESPATCH_MAPPING_KEY!r} is not one of "
+                f"{DESPATCH_MAPPING_KEY_CANDIDATES}"
+            )
+        if DESPATCH_MAPPING_OBSERVED != UPDATE_ITEM_PROVEN:
+            raise ValueError(
+                f"DESPATCH_MAPPING_KEY={DESPATCH_MAPPING_KEY!r} names the field "
+                "despatch matches on, but DESPATCH_MAPPING_OBSERVED="
+                f"{DESPATCH_MAPPING_OBSERVED!r}: the key cannot be known while "
+                "the mapping itself is not"
+            )
 
 
 _assert_update_order_item_observations_consistent()

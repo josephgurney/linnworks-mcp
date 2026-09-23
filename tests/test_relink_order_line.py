@@ -1070,18 +1070,60 @@ class TestUpdateOrderItemFieldRegistry:
         the endpoint working. Both are now proven, but they stay two values."""
         assert server.DESPATCH_MAPPING_OBSERVED == server.UPDATE_ITEM_PROVEN
         assert server.DESPATCH_MAPPING_EVIDENCE
-        assert "611697" in server.DESPATCH_MAPPING_EVIDENCE
+        assert "611708" in server.DESPATCH_MAPPING_EVIDENCE
 
-    def test_the_matching_key_is_recorded_as_still_unknown(self):
-        """#59's run proved a despatch lands, but was raced and so could not
-        isolate ItemNumber from ChannelSKU. Recording the mapping as proven
-        while leaving the KEY unset is the honest state; a future edit that
-        sets a key must have evidence, which is why it is its own value."""
-        assert server.DESPATCH_MAPPING_KEY is None
+    def test_the_matching_key_is_item_number(self):
+        """#103: a line whose ItemNumber pointed at a sibling's storefront line
+        fulfilled THAT line and left its own SKU's line unfulfilled, which
+        excludes ChannelSKU. The caller has to be told, or they cannot know
+        that writing ItemNumber is the thing that makes a despatch land."""
+        assert server.DESPATCH_MAPPING_KEY == "ItemNumber"
         assert server.DESPATCH_MAPPING_KEY_CANDIDATES == ("ItemNumber", "ChannelSKU")
-        # The caveat has to reach the caller, not just live in a comment.
-        assert "ChannelSKU" in server._RELINK_ORDER_LINE_UNPROVEN_WARNING
-        assert "raced" in server.DESPATCH_MAPPING_EVIDENCE.lower()
+        assert "ItemNumber" in server._RELINK_ORDER_LINE_UNPROVEN_WARNING
+        # The exclusion is the finding, so it must survive in the runtime text:
+        # "proven" without "and the alternative is ruled out" invites a rerun.
+        assert "ChannelSKU is excluded" in server._RELINK_ORDER_LINE_UNPROVEN_WARNING
+
+    def test_the_superseded_do_not_assume_caveat_is_gone(self):
+        """#59's warning told callers NOT to assume ItemNumber steers a
+        despatch. #103 established that it does, so that sentence is now false
+        and must not survive anywhere in the runtime text."""
+        W = server._RELINK_ORDER_LINE_UNPROVEN_WARNING
+        assert "Do not assume" not in W
+        assert "both explain what was observed" not in W
+        assert "raced" not in W.lower()
+
+    def test_a_wrong_id_is_still_called_out_as_worse_than_a_blank_one(self):
+        """The direct consequence of ItemNumber being the key, and the reason
+        channel_line_id is never guessed: a wrong id fulfils the WRONG
+        storefront line, silently and successfully."""
+        W = server._RELINK_ORDER_LINE_UNPROVEN_WARNING
+        assert "WRONG storefront" in W
+        assert "worse than a blank one" in W
+
+    def test_the_key_cannot_be_set_while_the_mapping_is_unproven(self):
+        """Naming the field is a stronger claim than 'a despatch lands'. The
+        validator must refuse a key asserted on top of an unproven mapping."""
+        import server as s
+        orig = s.DESPATCH_MAPPING_OBSERVED
+        try:
+            s.DESPATCH_MAPPING_OBSERVED = s.UPDATE_ITEM_NEVER_ATTEMPTED
+            with pytest.raises(ValueError, match="key cannot be known"):
+                s._assert_update_order_item_observations_consistent()
+        finally:
+            s.DESPATCH_MAPPING_OBSERVED = orig
+        s._assert_update_order_item_observations_consistent()
+
+    def test_the_key_must_be_one_of_the_candidates(self):
+        import server as s
+        orig = s.DESPATCH_MAPPING_KEY
+        try:
+            s.DESPATCH_MAPPING_KEY = "SKU"
+            with pytest.raises(ValueError, match="not one of"):
+                s._assert_update_order_item_observations_consistent()
+        finally:
+            s.DESPATCH_MAPPING_KEY = orig
+        s._assert_update_order_item_observations_consistent()
 
     def test_mapping_cannot_be_claimed_proven_without_the_write(self):
         """Guards the nonsense state: despatch mapping proven while the field

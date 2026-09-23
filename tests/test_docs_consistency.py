@@ -460,15 +460,30 @@ def test_docs_state_the_empty_item_source_trap():
             f"{name} omits that an empty ItemSource is silently discarded")
 
 
-def test_docs_do_not_claim_the_despatch_mapping_key_is_known():
-    """DESPATCH_MAPPING_KEY is None: the #59 run was raced and could not
-    isolate ItemNumber from ChannelSKU. No doc may present ItemNumber as the
-    established key while that is so."""
-    assert server.DESPATCH_MAPPING_KEY is None
+def test_docs_state_the_despatch_mapping_key_now_that_it_is_known():
+    """Inverted by #103. This guard previously failed if a doc CLAIMED the key,
+    because #59's run was raced and could not isolate it. #103 isolated it, so
+    the guard now fails if a doc does NOT state it -- a reader who is not told
+    that ItemNumber steers a despatch cannot know the repair does anything."""
+    assert server.DESPATCH_MAPPING_KEY == "ItemNumber"
     for name, row in (("CLAUDE.md tool row", _relink_claude_row()),
                       ("README.md row", _relink_readme_row())):
+        assert "ItemNumber" in row, f"{name} does not name the mapping key"
+        assert "611708" in row, (
+            f"{name} does not cite the order the key was proven on")
+        # The exclusion is half the finding: without it a later reader may
+        # reasonably wonder whether ChannelSKU was ever ruled out.
         assert "ChannelSKU" in row, (
-            f"{name} does not name ChannelSKU as the unexcluded alternative")
+            f"{name} does not record that ChannelSKU was excluded")
+
+
+def test_no_doc_still_says_the_despatch_mapping_key_is_unknown():
+    for name, row in (("CLAUDE.md tool row", _relink_claude_row()),
+                      ("README.md row", _relink_readme_row())):
+        low = row.lower()
+        for stale in ("is still unknown", "both explain the result",
+                      "do not assume writing"):
+            assert stale not in low, f"{name} still says '{stale}'"
 
 
 def test_docs_record_that_the_detector_cannot_see_a_mispointed_link():
