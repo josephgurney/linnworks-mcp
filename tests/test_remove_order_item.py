@@ -4,12 +4,16 @@ QA tests for remove_order_item (issue #57).
 All tests use unittest.mock — no live Linnworks API calls.
 Run with: pytest tests/test_remove_order_item.py -v
 
-NOTE: Orders/RemoveOrderItem has only ever been probed for existence with a
-deliberately invalid payload against the zero GUID (issue #52). It has never
-been called against a real order. These tests prove the tool's own logic —
-resolution, refusals, payload shape, and read-back classification — and
-nothing about whether Linnworks actually removes the line. See CLAUDE.md's
-post_merge_verification checklist for the owner-run live proof.
+NOTE: THIS BUILD has never fired Orders/RemoveOrderItem against a real order —
+it has only ever probed the route with a deliberately invalid payload against
+the zero GUID (issue #52), and issue #89 is the owner-run proof from here.
+The ENDPOINT itself is no longer unproven: order-sync-service removed a line
+from order 611288 on 23 Sep 2026 (issue #106), which is recorded per
+observation in server.REMOVE_ORDER_ITEM_OBSERVATIONS and tagged as another
+repository's evidence. These tests prove the tool's own logic — resolution,
+refusals, payload shape, and read-back classification — plus that registry's
+invariants. They still prove nothing about what Linnworks does when THIS
+build calls it.
 """
 import sys
 import os
@@ -564,3 +568,197 @@ class TestUnprovenWarningAndTotals:
 
         assert result["order_total_before"] == 25.0
         assert result["order_total_after"] == 25.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Issue #106 — Orders/RemoveOrderItem was fired live by ANOTHER repository
+# (order-sync-service, order 611288, 23 Sep 2026). That evidence is recorded
+# per observation with its provenance, and it is kept OUT of runtime text:
+# #78's AC11, and the reason _REMOVE_ORDER_ITEM_UNPROVEN_WARNING is untouched
+# until this build fires the endpoint itself (issue #89).
+# ══════════════════════════════════════════════════════════════════════════════
+
+import pytest
+
+
+class TestRemoveOrderItemObservationRegistry:
+    """AC1/AC2: what the 23 Sep run did and did not establish, per observation."""
+
+    def test_every_required_observation_has_a_row(self):
+        for name in server._REMOVE_ORDER_ITEM_REQUIRED_OBSERVATIONS:
+            assert name in server.REMOVE_ORDER_ITEM_OBSERVATIONS, (
+                f"{name} has no row; an unknown that is simply absent reads as "
+                "one nobody thought of"
+            )
+
+    def test_the_registry_reuses_the_update_order_item_vocabulary(self):
+        for name, entry in server.REMOVE_ORDER_ITEM_OBSERVATIONS.items():
+            assert entry["state"] in server.UPDATE_ITEM_OBSERVED_STATES, name
+            if entry["state"] != server.UPDATE_ITEM_NEVER_ATTEMPTED:
+                assert entry["proven_by"] in server.UPDATE_ITEM_PROVENANCES, name
+
+    @pytest.mark.parametrize("name", [
+        "endpoint_removes_a_line",
+        "lowercase_rowid_key",
+        "order_total_recalculated",
+    ])
+    def test_the_three_proven_observations_are_another_repos_evidence(self, name):
+        entry = server.REMOVE_ORDER_ITEM_OBSERVATIONS[name]
+        assert entry["state"] == server.UPDATE_ITEM_PROVEN
+        assert entry["proven_by"] == server.UPDATE_ITEM_PROVEN_ELSEWHERE
+        assert "611288" in entry["evidence"]
+        assert "2026-09-23" in entry["evidence"]
+
+    @pytest.mark.parametrize("name", [
+        "non_default_fulfilment_center",
+        "removing_the_last_line",
+        "channel_sync_re_adds_a_removed_line",
+    ])
+    def test_the_three_untested_observations_claim_nothing(self, name):
+        entry = server.REMOVE_ORDER_ITEM_OBSERVATIONS[name]
+        assert entry["state"] == server.UPDATE_ITEM_NEVER_ATTEMPTED
+        assert entry.get("proven_by") is None, (
+            "a never-attempted observation that names a provenance reads as proof"
+        )
+
+    def test_nothing_is_recorded_as_proven_by_this_repo(self):
+        """Until #89 fires it here, every proven row is another repo's."""
+        assert not [
+            name for name, entry in server.REMOVE_ORDER_ITEM_OBSERVATIONS.items()
+            if entry.get("proven_by") == server.UPDATE_ITEM_PROVEN_HERE
+        ]
+
+
+class TestRemoveOrderItemObservationValidator:
+    """AC3: the registry is held to its vocabulary at import time."""
+
+    def _mutate(self, name, **changes):
+        """Apply changes to one row, returning a restore callable."""
+        original = dict(server.REMOVE_ORDER_ITEM_OBSERVATIONS[name])
+        server.REMOVE_ORDER_ITEM_OBSERVATIONS[name].update(changes)
+        return lambda: server.REMOVE_ORDER_ITEM_OBSERVATIONS.__setitem__(name, original)
+
+    def test_a_state_outside_the_vocabulary_raises(self):
+        restore = self._mutate("endpoint_removes_a_line", state="probably_fine")
+        try:
+            with pytest.raises(ValueError, match="state"):
+                server._assert_remove_order_item_observations_consistent()
+        finally:
+            restore()
+        server._assert_remove_order_item_observations_consistent()
+
+    def test_a_provenance_outside_the_vocabulary_raises(self):
+        restore = self._mutate("endpoint_removes_a_line", proven_by="a_mate_said_so")
+        try:
+            with pytest.raises(ValueError, match="proven_by"):
+                server._assert_remove_order_item_observations_consistent()
+        finally:
+            restore()
+        server._assert_remove_order_item_observations_consistent()
+
+    def test_a_proven_observation_with_no_evidence_raises(self):
+        restore = self._mutate("order_total_recalculated", evidence="")
+        try:
+            with pytest.raises(ValueError, match="evidence"):
+                server._assert_remove_order_item_observations_consistent()
+        finally:
+            restore()
+        server._assert_remove_order_item_observations_consistent()
+
+    def test_a_never_attempted_observation_claiming_a_provenance_raises(self):
+        restore = self._mutate(
+            "removing_the_last_line", proven_by=server.UPDATE_ITEM_PROVEN_ELSEWHERE)
+        try:
+            with pytest.raises(ValueError, match="never_attempted"):
+                server._assert_remove_order_item_observations_consistent()
+        finally:
+            restore()
+        server._assert_remove_order_item_observations_consistent()
+
+    def test_a_missing_required_observation_raises(self):
+        original = server.REMOVE_ORDER_ITEM_OBSERVATIONS.pop(
+            "channel_sync_re_adds_a_removed_line")
+        try:
+            with pytest.raises(ValueError, match="channel_sync_re_adds_a_removed_line"):
+                server._assert_remove_order_item_observations_consistent()
+        finally:
+            server.REMOVE_ORDER_ITEM_OBSERVATIONS[
+                "channel_sync_re_adds_a_removed_line"] = original
+        server._assert_remove_order_item_observations_consistent()
+
+    def test_softening_the_warning_on_another_repos_evidence_raises(self):
+        """The trap this issue exists to avoid: the pinned test in
+        test_relink_order_line.py can be edited to match a softened warning
+        and CI stays green. This invariant cannot be satisfied that way —
+        the warning may only drop its never-fired claim once a row is
+        proven HERE."""
+        original = server._REMOVE_ORDER_ITEM_UNPROVEN_WARNING
+        server._REMOVE_ORDER_ITEM_UNPROVEN_WARNING = (
+            "⚠️ Orders/RemoveOrderItem removes a line; proceed."
+        )
+        try:
+            with pytest.raises(ValueError, match="never fired"):
+                server._assert_remove_order_item_observations_consistent()
+        finally:
+            server._REMOVE_ORDER_ITEM_UNPROVEN_WARNING = original
+        server._assert_remove_order_item_observations_consistent()
+
+    def test_the_warning_may_not_name_another_repository_or_its_order(self):
+        """AC5 as an import-time invariant, not only a test: #78's AC11."""
+        original = server._REMOVE_ORDER_ITEM_UNPROVEN_WARNING
+        server._REMOVE_ORDER_ITEM_UNPROVEN_WARNING = (
+            original + " order-sync-service proved it on order 611288."
+        )
+        try:
+            with pytest.raises(ValueError, match="AC11|another repository"):
+                server._assert_remove_order_item_observations_consistent()
+        finally:
+            server._REMOVE_ORDER_ITEM_UNPROVEN_WARNING = original
+        server._assert_remove_order_item_observations_consistent()
+
+
+class TestRemoveOrderItemRuntimeTextCarriesNoOtherRepoEvidence:
+    """AC5: another repository's run may be read in CLAUDE.md. It may not
+    reach a caller through a tool response."""
+
+    FORBIDDEN = ("order-sync-service", "611288", "other repo", "another repository")
+
+    def _strings(self, payload):
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                yield from self._strings(key)
+                yield from self._strings(value)
+        elif isinstance(payload, (list, tuple)):
+            for item in payload:
+                yield from self._strings(item)
+        elif isinstance(payload, str):
+            yield payload
+
+    def test_a_dry_run_response_names_no_other_repository(self):
+        with patch("server.call_linnworks", return_value=[TWO_LINE_ORDER]):
+            result = server.remove_order_item(GUID, ROW_ID_1)
+        blob = " ".join(self._strings(result))
+        for phrase in self.FORBIDDEN:
+            assert phrase not in blob, f"{phrase!r} reached a tool response"
+
+    def test_a_live_run_response_names_no_other_repository(self):
+        after = _order(items=[item for item in TWO_LINE_ORDER["Items"]
+                              if item["RowId"] != ROW_ID_1], total=10.0)
+        calls = {"n": 0}
+
+        def side(endpoint, *args, **kwargs):
+            if endpoint == "Orders/RemoveOrderItem":
+                return {}
+            calls["n"] += 1
+            return [TWO_LINE_ORDER] if calls["n"] == 1 else [after]
+
+        with patch("server.call_linnworks", side_effect=side):
+            result = server.remove_order_item(GUID, ROW_ID_1, dry_run=False)
+        blob = " ".join(self._strings(result))
+        for phrase in self.FORBIDDEN:
+            assert phrase not in blob, f"{phrase!r} reached a tool response"
+
+    def test_the_docstring_names_no_other_repository(self):
+        doc = server.remove_order_item.__doc__ or ""
+        assert "order-sync-service" not in doc
+        assert "611288" not in doc
