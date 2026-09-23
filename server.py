@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.61.1"
+__version__ = "1.62.0"
 
 import json
 import os
@@ -6900,6 +6900,25 @@ def _flatten_order_item(i: dict) -> dict:
     channel link. Callers that need to tell "field never returned" from "field
     returned empty" (find_unlinked_order_lines does) rely on that distinction;
     do not collapse it with `or ""`.
+
+    `added_date` (AddedDate) and `is_unlinked` (IsUnlinked) are exposed
+    verbatim, `None` when the raw item never carried the key, for the same
+    reason as above (issue #104). They are NOT consumed by
+    _classify_order_line or find_unlinked_order_lines: a read-only live probe
+    (order 611288's Jessup_11inch_35, a confirmed genuine orphan from the
+    1 Aug-19 Sep scan — order 607251's RS-85769 — and a normal fully-linked
+    channel order, order 607855) found that a deliberate Linnworks add and a
+    genuinely orphaned line show the identical "AddedDate far later than the
+    rest of the order, close to processing time" pattern, and IsUnlinked read
+    False on every example including the confirmed orphan. The two fields
+    cannot be told apart this way, so no timing-based classification was
+    built (CLAUDE.md's issue #104 note has the full probe data). They are
+    exposed here purely so a human reviewing an order (via
+    get_processed_order_items, get_top_skus, get_category_report,
+    get_revenue_summary, get_component_sales, or any other caller of this
+    function) can see the raw signal for themselves. Note `get_order` does
+    NOT go through this function — it uses _format_order_detail instead, and
+    does not carry these two fields.
     """
     sub = i.get("CompositeSubItems") or []
     return {
@@ -6917,6 +6936,8 @@ def _flatten_order_item(i: dict) -> dict:
         "channel_sku": i.get("ChannelSKU"),
         "channel_line_id": i.get("ItemNumber"),
         "channel_line_source": i.get("ItemSource"),
+        "added_date": i.get("AddedDate"),
+        "is_unlinked": i.get("IsUnlinked"),
         "composite_sub_items": [_flatten_order_item(s) for s in sub],
     }
 
@@ -7287,6 +7308,27 @@ def find_unlinked_order_lines(
     products, and a genuine orphaned sale of one is suppressed with the rest.
     Every suppressed line is counted in `internal_sku_suppressed`, so a scan
     never hides findings without saying how many.
+
+    NO TIMING-BASED CLASSIFICATION EXISTS (issue #104). A line added directly
+    in Linnworks after an order downloads (order 611288's Jessup_11inch_35)
+    still classifies as `unlinked` when it looks orphaned, exactly like a
+    genuinely broken line — the SKU-list suppression above cannot catch it,
+    because it is a real product, not a marker SKU. Building a rule on
+    AddedDate/IsUnlinked was investigated first: a read-only probe compared
+    order 611288's Jessup_11inch_35 (a deliberate Linnworks add) against a
+    confirmed genuine orphan from the 1 Aug-19 Sep scan (order 607251's
+    RS-85769) and a normal fully-linked channel order (order 607855). Both
+    the deliberate add and the confirmed orphan show the identical pattern —
+    AddedDate far later than the rest of the order's lines, close to the
+    order's processing time — and IsUnlinked read False on every example,
+    including the confirmed orphan. On these fields, a deliberate add and a
+    re-added orphan cannot be told apart, so the timing-based classification
+    described in issue #104 was not built; see CLAUDE.md's issue #104 note
+    for the full probe data. The raw `added_date` (AddedDate) and
+    `is_unlinked` (IsUnlinked) fields are exposed on every line returned by
+    `get_processed_order_items` (via _flatten_order_item, and every other
+    caller of it) for manual review, but this tool's own classification
+    ignores them entirely.
 
     A line is classified `unknown` — also excluded from `unlinked` — only
     when the raw order data never carried the identity fields at all (as

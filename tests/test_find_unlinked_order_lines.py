@@ -36,14 +36,16 @@ def _raw_item(
     title=None,
     row_id=None,
     sub_items=None,
+    added_date=_UNSET,
+    is_unlinked=_UNSET,
 ):
     """
     Build a raw OrderItem dict as Orders/GetOrdersById returns it.
 
-    Passing item_number/item_source/channel_sku as _UNSET (the default) omits
-    the key entirely from the dict — simulating a field the API never
-    returned, distinct from passing "" (present but blank, the live-observed
-    orphaned-line shape).
+    Passing item_number/item_source/channel_sku/added_date/is_unlinked as
+    _UNSET (the default) omits the key entirely from the dict — simulating a
+    field the API never returned, distinct from passing "" (present but
+    blank, the live-observed orphaned-line shape).
     """
     d = {"SKU": sku, "Title": title or sku, "RowId": row_id or f"row-{sku}"}
     if item_number is not _UNSET:
@@ -52,6 +54,10 @@ def _raw_item(
         d["ItemSource"] = item_source
     if channel_sku is not _UNSET:
         d["ChannelSKU"] = channel_sku
+    if added_date is not _UNSET:
+        d["AddedDate"] = added_date
+    if is_unlinked is not _UNSET:
+        d["IsUnlinked"] = is_unlinked
     if sub_items:
         d["CompositeSubItems"] = sub_items
     return d
@@ -1013,3 +1019,339 @@ class TestInternalSkuDocstrings:
         assert "internal_sku" in doc
         assert "checked LAST" in doc
         assert "coarse" in doc
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Issue #104 — AC1: a read-only live probe (order 611288's Jessup_11inch_35,
+# a confirmed genuine orphan from the 1 Aug-19 Sep scan, and a normal fully-
+# linked channel order) found that AddedDate and IsUnlinked do NOT separate a
+# deliberate Linnworks add from a genuinely orphaned line — both patterns
+# overlap. Per AC1, the timing-based classification is therefore NOT built.
+# AC2 (_flatten_order_item exposes the two raw fields, additively) is built;
+# the tests below cover that plus the "nothing changed" guarantees AC3-AC9
+# reduce to once no new rule exists.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestAddedDateAndIsUnlinkedSurfaced:
+    """AC2 — _flatten_order_item carries AddedDate/IsUnlinked verbatim."""
+
+    def test_carries_added_date_and_is_unlinked_verbatim(self):
+        raw = _raw_item(
+            "Jessup_11inch_35",
+            item_number="17414520373494",
+            item_source="SHOPIFY",
+            channel_sku="Jessup_11inch_35",
+            added_date="2026-09-22T08:12:36.39Z",
+            is_unlinked=False,
+        )
+        flat = server._flatten_order_item(raw)
+        assert flat["added_date"] == "2026-09-22T08:12:36.39Z"
+        assert flat["is_unlinked"] is False
+
+    def test_returns_none_when_keys_absent(self):
+        flat = server._flatten_order_item(_raw_item("NO-TIMING-FIELDS"))
+        assert flat["added_date"] is None
+        assert flat["is_unlinked"] is None
+
+    def test_true_is_unlinked_value_carried_verbatim_too(self):
+        raw = _raw_item("SOME-SKU", added_date="2026-01-01T00:00:00Z", is_unlinked=True)
+        flat = server._flatten_order_item(raw)
+        assert flat["is_unlinked"] is True
+
+    def test_existing_keys_unchanged_by_the_new_fields(self):
+        """AC2 — no existing key changes name or value. Golden output for
+        every pre-existing key, captured from LINKED_ITEM, must still match
+        with the two new keys present alongside it."""
+        flat = server._flatten_order_item(LINKED_ITEM)
+        golden = {
+            "sku": "LOB-CLA-CAR",
+            "title": "Clawskin - Cartoon",
+            "quantity": None,
+            "price_per_unit": None,
+            "line_total_ex_tax": None,
+            "line_total_inc_tax": None,
+            "tax": None,
+            "tax_rate": None,
+            "category": None,
+            "stock_item_id": None,
+            "bin_rack": None,
+            "channel_sku": "LOB-CLA-CAR",
+            "channel_line_id": "16506671005945",
+            "channel_line_source": "SHOPIFY",
+            "composite_sub_items": [],
+        }
+        for key, value in golden.items():
+            assert flat[key] == value, f"key {key!r} changed: {flat[key]!r} != {value!r}"
+        # Additive only: the new keys exist alongside every old one.
+        assert set(golden.keys()) < set(flat.keys())
+        assert flat.keys() - golden.keys() == {"added_date", "is_unlinked"}
+
+
+class TestTimingHasNoEffectOnClassification:
+    """
+    AC1 found AddedDate/IsUnlinked do not distinguish a deliberate add from a
+    genuine orphan (order 608188 and order 607251's RS-85769 — both confirmed
+    genuine orphans in the 1 Aug-19 Sep scan — show the identical "added late,
+    close to processing" pattern as order 611288's Jessup_11inch_35, which is
+    the reporter's own "added in Linnworks" example). No timing-based rule was
+    built. These tests pin that _classify_order_line ignores AddedDate/
+    IsUnlinked entirely, so exposing them (AC2) cannot silently change any
+    line's classification — which is what AC3-AC6 reduce to when no new rule
+    exists.
+    """
+
+    def test_linked_line_stays_linked_whatever_its_added_date(self):
+        """AC6 — 'a line with a non-blank ItemSource stays linked whatever
+        its AddedDate' — including a very late one, the exact shape of the
+        611288 Jessup line."""
+        raw = _raw_item(
+            "Jessup_11inch_35",
+            item_number="17414520373494",
+            item_source="SHOPIFY",
+            channel_sku="Jessup_11inch_35",
+            added_date="2026-09-22T08:12:36.39Z",  # 5 days after order receipt
+            is_unlinked=False,
+        )
+        flat = server._flatten_order_item(raw)
+        rows = server._classify_order_line(flat, is_channel_order=True)
+        assert rows[0]["status"] == "linked"
+        assert rows[0]["reason"] is None
+
+    def test_unlinked_line_with_a_late_added_date_stays_unlinked(self):
+        """AC4 (reduced) — a blank-ItemSource line with an AddedDate FAR
+        outside any import-lag window (the RS-85769 / 607251 shape: added 5
+        days after the rest of the order) is still `unlinked`, because no
+        rule exists to move it."""
+        raw = _raw_item(
+            "RS-85769",
+            item_number="RS-85769",
+            item_source="",
+            channel_sku="RS-85769",
+            added_date="2026-08-04T08:52:23.37Z",  # 5 days after the order's other lines
+            is_unlinked=False,
+        )
+        flat = server._flatten_order_item(raw)
+        rows = server._classify_order_line(flat, is_channel_order=True)
+        assert rows[0]["status"] == "unlinked"
+        assert rows[0]["reason"] is None
+
+    def test_unlinked_line_within_normal_import_lag_stays_unlinked(self):
+        """AC4 — a blank-ItemSource line whose AddedDate is only minutes
+        after receipt (ordinary import lag) is still `unlinked`."""
+        raw = _raw_item(
+            "vnm-robodino-red-MFS",
+            item_number="vnm-robodino-red-MFS",
+            item_source="",
+            channel_sku="vnm-robodino-red-MFS",
+            added_date="2026-08-04T14:27:40.86Z",
+            is_unlinked=False,
+        )
+        flat = server._flatten_order_item(raw)
+        rows = server._classify_order_line(flat, is_channel_order=True)
+        assert rows[0]["status"] == "unlinked"
+
+    def test_missing_added_date_keeps_todays_classification(self):
+        """AC5 — a line whose AddedDate is absent entirely keeps exactly the
+        classification it has today (both for a linked and an unlinked
+        shape)."""
+        linked_raw = _raw_item("LINKED-SKU", item_number="c1", item_source="SHOPIFY")
+        unlinked_raw = _raw_item("UNLINKED-SKU", item_number="UNLINKED-SKU", item_source="")
+        assert server._flatten_order_item(linked_raw)["added_date"] is None
+        assert server._flatten_order_item(unlinked_raw)["added_date"] is None
+
+        linked_row = server._classify_order_line(
+            server._flatten_order_item(linked_raw), is_channel_order=True
+        )[0]
+        unlinked_row = server._classify_order_line(
+            server._flatten_order_item(unlinked_raw), is_channel_order=True
+        )[0]
+        assert linked_row["status"] == "linked"
+        assert unlinked_row["status"] == "unlinked"
+
+    def test_malformed_added_date_keeps_todays_classification(self):
+        """AC5 — an unparseable AddedDate must not raise and must not change
+        the line's classification."""
+        raw = _raw_item(
+            "UNLINKED-SKU",
+            item_number="UNLINKED-SKU",
+            item_source="",
+            added_date="not-a-real-timestamp",
+        )
+        flat = server._flatten_order_item(raw)
+        assert flat["added_date"] == "not-a-real-timestamp"  # passed through verbatim
+        row = server._classify_order_line(flat, is_channel_order=True)[0]
+        assert row["status"] == "unlinked"
+
+    def test_composite_child_precedence_unaffected_by_added_date(self):
+        """AC6 — composite_child still wins over anything AddedDate-shaped."""
+        child = _raw_item(
+            "blackgrip-9x33", item_number="blackgrip-9x33", item_source="",
+            added_date="2026-08-04T08:52:23.37Z",
+        )
+        parent = _raw_item(
+            "swh_GRIP_OPTION", item_number="p1", item_source="SHOPIFY", sub_items=[child],
+        )
+        rows = server._classify_order_line(server._flatten_order_item(parent), True)
+        assert rows[1]["status"] == "not_expected"
+        assert rows[1]["reason"] == "composite_child"
+
+    def test_manual_order_precedence_unaffected_by_added_date(self):
+        """AC6 — manual_order still wins over anything AddedDate-shaped."""
+        raw = _raw_item(
+            "H159ORANGEL/XL", item_number="", item_source="",
+            added_date="2026-08-14T08:41:52.98Z",
+        )
+        row = server._classify_order_line(
+            server._flatten_order_item(raw), is_channel_order=False
+        )[0]
+        assert row["status"] == "not_expected"
+        assert row["reason"] == "manual_order"
+
+    def test_fields_absent_stays_unknown_regardless_of_added_date(self):
+        """AC6 — fields_absent still wins even with an AddedDate present."""
+        raw = _raw_item("SOME-SKU", added_date="2026-09-22T08:12:36.39Z")
+        row = server._classify_order_line(
+            server._flatten_order_item(raw), is_channel_order=True
+        )[0]
+        assert row["status"] == "unknown"
+        assert row["reason"] == "fields_absent"
+
+    def test_internal_sku_behaviour_unchanged_for_every_sku_in_the_list(self):
+        """AC6/AC10 — every _INTERNAL_SKUS entry is still suppressed as
+        internal_sku, whatever AddedDate it carries."""
+        for sku in server._INTERNAL_SKUS:
+            raw = _raw_item(
+                sku, item_number=sku, item_source="",
+                added_date="2026-08-04T08:52:23.37Z",
+            )
+            row = server._classify_order_line(
+                server._flatten_order_item(raw), is_channel_order=True
+            )[0]
+            assert row["status"] == "not_expected"
+            assert row["reason"] == "internal_sku"
+
+    def test_no_new_status_value_was_introduced(self):
+        """Confirms AC1's stop condition was honoured: _classify_order_line
+        still only ever produces the four pre-existing statuses."""
+        samples = [
+            server._classify_order_line(server._flatten_order_item(LINKED_ITEM), True)[0],
+            server._classify_order_line(server._flatten_order_item(UNLINKED_ITEM), True)[0],
+            server._classify_order_line(server._flatten_order_item(_raw_item("X")), True)[0],
+            server._classify_order_line(
+                server._flatten_order_item(_raw_item("Y", item_number="", item_source="")), False
+            )[0],
+        ]
+        statuses = {row["status"] for row in samples}
+        assert statuses <= {"linked", "unlinked", "unknown", "not_expected"}
+
+    def test_counts_dict_shape_unchanged(self):
+        """AC7 (reduced) — with no new rule built, there is nothing new to
+        count: `counts` still has exactly the four pre-existing keys."""
+        order = _raw_order(
+            PROCESSED_ORDER_GUID, 611288, "SHOPIFY", True,
+            [
+                _raw_item(
+                    "Jessup_11inch_35", item_number="17414520373494",
+                    item_source="SHOPIFY", added_date="2026-09-22T08:12:36.39Z",
+                ),
+                _raw_item(
+                    "RS-78872", item_number="17392255205622",
+                    item_source="SHOPIFY", added_date="2026-09-16T21:47:20.82Z",
+                ),
+            ],
+        )
+        dispatch = _make_dispatch(
+            processed_pages=[_processed_orders_page(
+                [{"pkOrderID": PROCESSED_ORDER_GUID, "nOrderId": 611288, "Source": "SHOPIFY"}]
+            )],
+            order_details=[order],
+        )
+        with patch.object(server, "call_linnworks", side_effect=dispatch):
+            result = server.find_unlinked_order_lines(
+                include_open=False, from_date="2026-09-15", to_date="2026-09-23",
+                only_problems=False,
+            )
+        assert set(result["counts"].keys()) == {"linked", "unlinked", "unknown", "not_expected"}
+        assert result["counts"]["linked"] == 2
+        assert result["counts"]["unlinked"] == 0
+
+
+class TestInternalSkusUnchangedByIssue104:
+    """AC10 — _INTERNAL_SKUS is unchanged and still names order-sync-service."""
+
+    def test_set_is_byte_identical_to_the_pre_104_list(self):
+        assert server._INTERNAL_SKUS == {
+            "check-notes", "applygrip", "buildmyboard", "ven_ttool",
+            "vmn_griptape_black", "blackgrip-9x33", "royal-mail-placement",
+            "swh_grip_option", "service",
+        }
+
+    def test_source_of_truth_comment_still_names_order_sync_service(self):
+        import inspect
+        src = inspect.getsource(server)
+        idx = src.index("_INTERNAL_SKUS = {")
+        comment = src[max(0, idx - 1500):idx]
+        assert "order-sync-service" in comment
+        assert "authoritative" in comment
+
+
+class TestDocstringsDescribeTheInvestigation:
+    """AC11 — docstrings describe the new fields, the investigation, and the
+    fact that a re-added orphan looks the same as a deliberate add (which
+    AC1 found to be true)."""
+
+    def test_flatten_order_item_docstring_names_the_new_fields(self):
+        doc = server._flatten_order_item.__doc__ or ""
+        assert "added_date" in doc
+        assert "is_unlinked" in doc
+        assert "AddedDate" in doc
+        assert "IsUnlinked" in doc
+
+    def test_flatten_order_item_docstring_says_not_used_for_classification(self):
+        doc = server._flatten_order_item.__doc__ or ""
+        assert "104" in doc
+
+    def test_find_unlinked_order_lines_docstring_names_the_investigation(self):
+        doc = server.find_unlinked_order_lines.__doc__ or ""
+        assert "104" in doc
+        assert "added_date" in doc or "AddedDate" in doc
+
+    def test_find_unlinked_order_lines_docstring_states_the_finding(self):
+        """The docstring must say plainly that timing does not distinguish
+        the two cases, and that no new status was built as a result."""
+        doc = server.find_unlinked_order_lines.__doc__ or ""
+        assert "cannot be told apart" in doc or "cannot reliably" in doc or "does not distinguish" in doc
+        assert "not built" in doc or "no new status" in doc
+
+
+@pytest.fixture(scope="module")
+def claude_md_104():
+    from pathlib import Path
+    return (Path(__file__).resolve().parent.parent / "CLAUDE.md").read_text()
+
+
+class TestClaudeMdRecordsTheIssue104Probe:
+    """AC1 — the probe results are recorded in CLAUDE.md, per instruction."""
+
+    def test_records_the_added_in_linnworks_example(self, claude_md_104):
+        assert "611288" in claude_md_104
+        assert "Jessup_11inch_35" in claude_md_104
+        assert "2026-09-22T08:12:36" in claude_md_104
+
+    def test_records_a_confirmed_genuine_orphan_example(self, claude_md_104):
+        assert "607251" in claude_md_104
+        assert "RS-85769" in claude_md_104
+        assert "2026-08-04T08:52:23" in claude_md_104
+
+    def test_records_a_normal_fully_linked_order_example(self, claude_md_104):
+        assert "607855" in claude_md_104
+
+    def test_records_the_conclusion_that_timing_does_not_separate_the_cases(self, claude_md_104):
+        idx = claude_md_104.index("issue #104")
+        section = claude_md_104[idx: idx + 6000]
+        assert "cannot be told apart" in section or "does not distinguish" in section or "cannot reliably" in section
+
+    def test_records_that_the_classification_was_not_built(self, claude_md_104):
+        idx = claude_md_104.index("issue #104")
+        section = claude_md_104[idx: idx + 6000]
+        assert "not built" in section
