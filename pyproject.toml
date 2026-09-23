@@ -1,6 +1,6 @@
 [project]
 name = "linnworks-mcp"
-version = "1.60.1"
+version = "1.61.0"
 description = "A local MCP server that connects Claude Desktop to your Linnworks account"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,3 +19,8 @@ Issues = "https://github.com/josephgurney/linnworks-mcp/issues"
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.backends.legacy:build"
+
+[tool.pytest.ini_options]
+markers = [
+    "real_scope_probe: opts out of the auto full-grant Shopify scope stub (#113)",
+]

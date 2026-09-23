@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.60.1"
+__version__ = "1.61.0"
 
 import json
 import os
@@ -20732,6 +20732,110 @@ def _shopify_setup_error(sub_source: str) -> dict:
     }
 
 
+# What each Shopify surface actually needs. Declared here, next to the setup
+# error that lists them, so a tool and its scope requirement cannot drift.
+SHOPIFY_SCOPES_LISTING_CHECK = ("read_products",)
+SHOPIFY_SCOPES_IMAGE_REPAIR = ("read_products", "write_products",
+                               "read_files", "write_files")
+
+# shop_domain -> frozenset of granted scopes, or None when the probe failed.
+# Per process, not per SKU: the grant cannot change mid-run, and a repair over
+# 25 SKUs must not cost 25 extra round trips.
+_SHOPIFY_SCOPE_CACHE: dict[str, frozenset | None] = {}
+
+
+def _shopify_granted_scopes(store: dict) -> frozenset | None:
+    """Scopes actually granted to this token, or None if that can't be read.
+
+    GET /admin/oauth/access_scopes.json reports the access token's own grant
+    and itself requires no scope, so it works on a read-only token -- which is
+    the whole point, since the least-privilege case is the one that needs
+    catching.
+
+    Returns None rather than raising. A probe that fails is NOT evidence of a
+    missing scope, and turning a diagnostic into a new hard failure would be a
+    worse bug than the one this exists to prevent. Callers degrade to
+    "couldn't check" and carry on, the same way _shopify_listings_exist
+    degrades to exists=None rather than guessing.
+    """
+    domain = store["shop_domain"]
+    if domain in _SHOPIFY_SCOPE_CACHE:
+        return _SHOPIFY_SCOPE_CACHE[domain]
+
+    granted: frozenset | None = None
+    try:
+        resp = requests.get(
+            f"https://{domain}/admin/oauth/access_scopes.json",
+            headers={"X-Shopify-Access-Token": store["access_token"]},
+            timeout=30,
+        )
+        if resp.status_code < 400:
+            body = resp.json()
+            scopes = body.get("access_scopes")
+            # A 2xx whose body we do not recognise is "couldn't read", NOT "no
+            # scopes granted". Defaulting to [] here produced an EMPTY set,
+            # which reads as "every required scope is missing" and blocked
+            # every Shopify tool while claiming the app needed re-installing
+            # -- the exact misdirection this helper exists to prevent.
+            # Only a genuine non-empty list is evidence of a grant.
+            if isinstance(scopes, list) and scopes:
+                names = [a.get("handle") for a in scopes if isinstance(a, dict)]
+                names = [n for n in names if n]
+                if names:
+                    granted = frozenset(names)
+    except Exception:
+        granted = None
+
+    _SHOPIFY_SCOPE_CACHE[domain] = granted
+    return granted
+
+
+def _shopify_scope_error(sub_source: str, store: dict, needed, granted) -> dict:
+    """Refusal for a token that IS installed but lacks the scopes required.
+
+    Deliberately a different message from _shopify_setup_error: that one sends
+    the reader off to check a domain and a token, and here both are already
+    correct. Sending someone to re-check working credentials is how a
+    five-minute fix becomes an afternoon.
+    """
+    missing = [sc for sc in needed if sc not in granted]
+    return {
+        "error": (
+            f"The Shopify Admin token for '{sub_source}' is installed and valid, but it "
+            f"was not granted the scopes this tool needs. Missing: {', '.join(missing)}."
+        ),
+        "how_to_fix": [
+            f"In Shopify admin for {store['shop_domain']}: Settings > Apps and sales "
+            "channels > Develop apps > your app > Configuration.",
+            f"Add the Admin API scopes: {', '.join(missing)}.",
+            "Save, then re-install the app. Shopify issues a NEW access token when "
+            "scopes change -- the old one keeps its original grant.",
+            "Update SHOPIFY_ADMIN_ACCESS_TOKEN (or the SHOPIFY_STORES entry) with the "
+            "new token, then restart Claude Desktop.",
+            "The shop domain and the token itself are fine -- do not change them.",
+        ],
+        "shopify_configured": True,
+        "scopes_ok": False,
+        "scopes_needed": list(needed),
+        "scopes_granted": sorted(granted),
+        "scopes_missing": missing,
+    }
+
+
+def _shopify_scope_block(store: dict, sub_source: str, needed) -> dict | None:
+    """The refusal dict when scopes are provably missing, else None.
+
+    None covers both "all present" and "couldn't tell" -- see
+    _shopify_granted_scopes on why an unreadable grant must not block.
+    """
+    granted = _shopify_granted_scopes(store)
+    if granted is None:
+        return None
+    if all(sc in granted for sc in needed):
+        return None
+    return _shopify_scope_error(sub_source, store, needed, granted)
+
+
 def _shopify_graphql(store: dict, query: str, variables: dict) -> dict:
     """POST one GraphQL document to the Shopify Admin API and return `data`.
 
@@ -20922,6 +21026,21 @@ def _glt_listing_existence(rows: list[dict], sub_source: str,
             "dangling ActiveListingId cannot be detected. See "
             "repair_channel_listing_images for the SHOPIFY_STORES / "
             "SHOPIFY_SHOP_DOMAIN setup."
+        )
+        return result
+
+    # A token installed but missing read_products would otherwise sail past the
+    # guard above and fail on the read instead (#113). Reported as its own
+    # reason, distinct from not_configured: the remedy is different, and
+    # "credentials missing" would send the reader to re-check a token that is
+    # already correct.
+    scope_block = _shopify_scope_block(store, sub_source, SHOPIFY_SCOPES_LISTING_CHECK)
+    if scope_block is not None:
+        result["reason"] = (
+            "insufficient_scope — the Shopify Admin token for this store is installed "
+            "but was not granted %s, so a dangling ActiveListingId cannot be detected. "
+            "Add the scope, re-install the app, and update the token (Shopify issues a "
+            "new one when scopes change)." % ", ".join(scope_block["scopes_missing"])
         )
         return result
 
@@ -21199,6 +21318,16 @@ def repair_channel_listing_images(
     store = _shopify_store_for(sub_source)
     if store is None:
         return {**_shopify_setup_error(sub_source), "sub_source": sub_source, "skus": skus}
+
+    # Before ANY planning, and deliberately before the dry_run return below.
+    # A token with only read scopes can read media and produce a perfectly
+    # healthy-looking manifest, so the operator passes _write_guard with a
+    # confirmed_count and only THEN does the first mutation fail at Shopify --
+    # mid-loop, after the friction that exists to make a write considered has
+    # already been spent (#113). Checking here means a dry run says so.
+    blocked = _shopify_scope_block(store, sub_source, SHOPIFY_SCOPES_IMAGE_REPAIR)
+    if blocked is not None:
+        return {**blocked, "sub_source": sub_source, "skus": skus}
 
     lw_source = GLT_CHANNELS["shopify"]["source"]  # "SHOPIFY"
     want_ss = (sub_source or "").strip().lower()
