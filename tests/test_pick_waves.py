@@ -70,11 +70,26 @@ class TestModuleLevelSymbols:
     def test_state_label_mapping_only_contains_live_observed_states(self):
         # Abandoned and Shipped were seen during #64; Unallocated, Allocated
         # and InProgress were confirmed live during the #67 contained test on
-        # 22 Sep 2026 (waves 3552/3553/3531). Complete, Packing and Paused
-        # must NOT be pre-guessed into the map.
+        # 22 Sep 2026 (waves 3552/3553/3531); Complete was seen on waves
+        # 3554-3556 on 23 Sep 2026 (#108). Packing and Paused must NOT be
+        # pre-guessed into the map.
+        #
+        # Deliberately an EXACT-set assertion, not a subset check: relaxing it
+        # to `>=` would stop enforcing the rule this test exists for, which is
+        # that a state is only ever labelled once it has been observed on a
+        # real wave — never because it appears in the documented enum.
         assert set(server._PICK_WAVE_STATE_LABELS) == {
             "Abandoned", "Shipped", "Unallocated", "Allocated", "InProgress",
+            "Complete",
         }
+
+    def test_packing_and_paused_are_still_not_labelled(self):
+        # The two enum values that sit right next to Complete and have still
+        # never been seen on a real wave. Named separately from the exact-set
+        # assertion above so a future extension has to delete a test that says
+        # what it is doing, rather than quietly widening a set literal.
+        assert "Packing" not in server._PICK_WAVE_STATE_LABELS
+        assert "Paused" not in server._PICK_WAVE_STATE_LABELS
 
     def test_formatters_are_module_level_functions(self):
         assert inspect.isfunction(server._format_pick_wave)
@@ -93,6 +108,16 @@ class TestStateLabelling:
         out = server._format_pick_wave(row)
         assert out["state"] == "Shipped"
         assert out["state_label"] == "Shipped"
+        assert out["state_confirmed"] is True
+
+    def test_complete_state_gets_its_label(self):
+        # #108: waves 3554-3556 were seen in the Complete state via
+        # GetAllPickingWaveHeaders on 23 Sep 2026, so Complete is no longer an
+        # unconfirmed enum value. state_confirmed flips False -> True with it.
+        row = {"PickingWaveId": 3556, "State": "Complete"}
+        out = server._format_pick_wave(row)
+        assert out["state"] == "Complete"
+        assert out["state_label"] == "Complete"
         assert out["state_confirmed"] is True
 
     def test_unconfirmed_but_documented_state_is_explicit_unknown_not_guessed(self):
