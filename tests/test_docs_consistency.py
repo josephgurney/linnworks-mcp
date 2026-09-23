@@ -393,6 +393,67 @@ def test_delete_extended_properties_confirmed_endpoint_row_states_the_observed_s
     assert "CONFIRMED LIVE" in row
 
 
+# --- CreateInventoryItemExtendedProperties create-only claim (issue #100) ---
+# The v1.56.1/#90 proof found a single Create call against an item that
+# already held a row with the same ProperyName behaved like an upsert. The
+# confirmed-endpoints row had never been updated to reflect that and still
+# opened with a bare "Creates new extended property rows" claim -- exactly
+# the assumption #90's multi-match delete branch exists to guard against.
+# These guards fail in both directions: if the bare claim reappears, and if
+# the bounded, dated observed-upsert statement disappears.
+
+def _create_extended_properties_confirmed_endpoint_row() -> str:
+    match = re.search(
+        r"^\| `Inventory/CreateInventoryItemExtendedProperties` \|.*$", CLAUDE_MD, re.M
+    )
+    assert match, (
+        "CLAUDE.md is missing the CreateInventoryItemExtendedProperties "
+        "confirmed-endpoints row"
+    )
+    return match.group(0)
+
+
+def test_create_extended_properties_row_no_longer_claims_create_only():
+    row = _create_extended_properties_confirmed_endpoint_row()
+    assert not re.search(r"creates new extended property rows", row, re.I), (
+        "CLAUDE.md's CreateInventoryItemExtendedProperties row still opens "
+        "with the bare create-only claim, but a 22 Sep 2026 observation "
+        "(issue #90, written up in issue #100) found it can upsert an "
+        "existing row instead of adding a duplicate"
+    )
+
+
+def test_create_extended_properties_row_states_the_observed_upsert_bounded():
+    row = _create_extended_properties_confirmed_endpoint_row()
+    assert "22 Sep 2026" in row, (
+        "the observed-upsert statement (dated 22 Sep 2026) is missing from "
+        "the CreateInventoryItemExtendedProperties row"
+    )
+    assert "did **not**" in row or "did not" in row.lower(), (
+        "the row no longer states that the observed Create did not add a "
+        "second row"
+    )
+    # Bounded to one observation -- must not read as a general rule.
+    assert "UNCONFIRMED" in row or "unconfirmed" in row, (
+        "the row must state the uniqueness question is unconfirmed, not "
+        "assert a general uniqueness rule"
+    )
+    assert "one item" in row.lower() and "one date" in row.lower(), (
+        "the row must explicitly bound the finding to one observation on "
+        "one item on one date"
+    )
+    # The still-true facts from issue #13 must survive the rewrite.
+    assert "pkRowId" in row and "client-generated GUID" in row, (
+        "the still-true pkRowId-required-for-create fact was dropped"
+    )
+    assert "zero-GUID" in row or "zero-guid" in row.lower(), (
+        "the still-true zero-GUID primary-key-collision fact was dropped"
+    )
+    assert "NON-empty" in row and "NON-JSON" in row, (
+        "the still-true non-empty, non-JSON 2xx success body caveat "
+        "(issue #13) was dropped"
+    )
+
 
 CLAIM = "Spec-based, not yet live-run"
 
