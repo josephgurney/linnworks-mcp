@@ -3741,6 +3741,53 @@ UPDATE_ORDER_ITEM_FIELDS: dict[str, dict] = {
     },
 }
 
+# ── Orders/UpdateOrderItem: the PAYLOAD SHAPE the field proof above was
+# taken with (issue #105) ─────────────────────────────────────────────────
+# UPDATE_ORDER_ITEM_FIELDS records what happens to each FIELD once a write
+# lands. It says nothing about what was SENT to get there, and this endpoint
+# is known to have at least two different callers with two different ways of
+# choosing fulfilmentCenter: relink_order_line derives it from the order
+# itself (a caller override, then the order's own FulfilmentLocationId, then
+# Default) and source/subSource from the order's own values; a second,
+# separate caller is understood to hard-code fulfilmentCenter to the zero
+# GUID regardless of the order's real location.
+#
+# On EVERY proving order (611150, 611697, 611708) the VALUE that reached
+# Linnworks was the Default/zero GUID -- but which SELECTION MECHANISM chose
+# it is only certain for 611697, relink_order_line's own first live run
+# (v1.57.0). Order 611150 (18 Sep) predates that run, so its write may not
+# have gone through this exact code path, and this record does not claim
+# otherwise. That does not weaken the conclusion below: at the Default
+# location the two mechanisms produce IDENTICAL bytes, so which one produced
+# any given proving write makes no difference to what the proof can claim.
+# That is exactly why the proof is silent on whether fulfilmentCenter's
+# VALUE matters at all, and exactly why it covers Default-location orders
+# only. Kept apart from UPDATE_ORDER_ITEM_FIELDS on purpose: a proven field
+# state says a WRITE landed, it says nothing about which SHAPE produced it,
+# and that fact must never be read off a field row.
+UPDATE_ORDER_ITEM_PROOF_SHAPE: dict = {
+    "fulfilment_center_selection": "derived_from_order",
+    "source_selection": "derived_from_order_source",
+    "fulfilment_center_value_on_proving_orders": DEFAULT_LOCATION_ID,
+    "proving_orders_location_name": "Default",
+    "proving_orders": ("611150", "611697", "611708"),
+    "caveat": (
+        "the selection mechanism behind order 611150's write is not "
+        "established here -- only the value it sent (the zero GUID) is"
+    ),
+}
+
+# Whether fulfilmentCenter's VALUE has any effect on Orders/UpdateOrderItem
+# at all -- a different question from HOW it was chosen, above. Every
+# proving order sat at the Default location, so the order's real location
+# and the value this repo sent were always identical; nothing here has ever
+# sent a fulfilmentCenter that DISAGREED with the order's real location, so
+# this starts unknown. Uses the same proof-state vocabulary as
+# UPDATE_ORDER_ITEM_FIELDS rather than inventing a fourth ad hoc value, so a
+# green field-persistence row can never be read as proof of this too.
+FULFILMENT_CENTER_EFFECT_OBSERVED = UPDATE_ITEM_NEVER_ATTEMPTED
+FULFILMENT_CENTER_EFFECT_EVIDENCE = ""
+
 # Whether despatch then maps a line back to its storefront line is a SEPARATE
 # question from whether the fields persist, and no read of Linnworks can
 # answer it (issue #78 established the distinction; issue #59 carries the
@@ -3869,6 +3916,30 @@ def _assert_update_order_item_observations_consistent() -> None:
         )
     if not DESPATCH_MAPPING_EVIDENCE:
         raise ValueError("DESPATCH_MAPPING_OBSERVED carries no evidence text")
+    # issue #105: the "proof covers Default-location orders only" wording
+    # depends on every proving order having actually sat at Default -- if
+    # that ever stops being true the wording must change with it, not drift.
+    if (UPDATE_ORDER_ITEM_PROOF_SHAPE["fulfilment_center_value_on_proving_orders"]
+            != DEFAULT_LOCATION_ID):
+        raise ValueError(
+            "UPDATE_ORDER_ITEM_PROOF_SHAPE claims the proving orders' "
+            "fulfilmentCenter was not DEFAULT_LOCATION_ID -- the 'proof "
+            "covers Default-location orders only' wording relies on this "
+            "being true; update the wording before changing this value"
+        )
+    if FULFILMENT_CENTER_EFFECT_OBSERVED not in UPDATE_ITEM_OBSERVED_STATES:
+        raise ValueError(
+            "FULFILMENT_CENTER_EFFECT_OBSERVED="
+            f"{FULFILMENT_CENTER_EFFECT_OBSERVED!r} is not one of "
+            f"{UPDATE_ITEM_OBSERVED_STATES}"
+        )
+    if (FULFILMENT_CENTER_EFFECT_OBSERVED != UPDATE_ITEM_NEVER_ATTEMPTED
+            and not FULFILMENT_CENTER_EFFECT_EVIDENCE):
+        raise ValueError(
+            "FULFILMENT_CENTER_EFFECT_OBSERVED is "
+            f"{FULFILMENT_CENTER_EFFECT_OBSERVED} but carries no evidence; "
+            "the warning text is interpolated from it"
+        )
     # The trap this guard exists for: ItemNumber persisting is NOT despatch
     # mapping. If a future edit marks the mapping proven, ItemNumber must be
     # proven too, or the claim rests on nothing.
@@ -3900,40 +3971,64 @@ def _assert_update_order_item_observations_consistent() -> None:
 _assert_update_order_item_observations_consistent()
 
 
-# The live-run warning carried on every relink_order_line write. It is now
-# DERIVED from UPDATE_ORDER_ITEM_FIELDS above rather than restating what is
-# proven -- issues #45 and #47 both drifted because the same fact was retyped
-# in prose in several places, and #59's acceptance criteria require this to be
-# recorded in exactly one machine-readable place.
+# The live-run warning carried on every relink_order_line write. It is
+# DERIVED from UPDATE_ORDER_ITEM_FIELDS and UPDATE_ORDER_ITEM_PROOF_SHAPE
+# above rather than restating what is proven -- issues #45 and #47 both
+# drifted because the same fact was retyped in prose in several places, and
+# #59's acceptance criteria require this to be recorded in exactly one
+# machine-readable place. Built as a FUNCTION, not a bare literal, so a test
+# can mutate a registry value and call it again to prove the warning is
+# actually derived rather than merely matching by coincidence (issue #105).
 #
 # It still separates the two unknowns #78 established, because they remain
 # genuinely different questions: whether the FIELDS persist on Linnworks' own
 # record (this tool's read-back answers that per run) and whether DESPATCH then
 # maps the line to its storefront line (no read of Linnworks can answer it).
-_RELINK_ORDER_LINE_UNPROVEN_WARNING = (
-    "⚠️ Orders/UpdateOrderItem writes are PROVEN on this tenant, by this repo, "
-    f"to persist for: {_update_order_item_proven_fields()} — see "
-    "UPDATE_ORDER_ITEM_FIELDS for the evidence per field. Note ItemSource "
-    "persists only for a NON-EMPTY "
-    "value: writing an empty string is silently discarded behind a 200, so a "
-    "2xx is still NOT proof on its own. This tool re-reads the order after "
-    "the write, so check the outcome is 'relinked', not 'not_persisted' or "
-    "'unconfirmed', and check unexpected_field_changes is empty — this "
-    "endpoint takes the whole line, so price, quantity and tax ride on the "
-    "same object. "
-    f"SEPARATELY ({DESPATCH_MAPPING_OBSERVED}, with a caveat): whether despatch "
-    "then maps this line back to its storefront line. Persisting the fields "
-    "and despatch honouring them are different claims — "
-    f"{DESPATCH_MAPPING_WARNING_TEXT}. "
-    "What IS established is that a line with NO channel link does not fulfil "
-    "on the storefront (22 orders, 1 Aug-19 Sep 2026), and that matching is "
-    "not done by the Linnworks SKU. Whether the key is ItemNumber or "
-    "ChannelSKU is not yet known. So: re-run find_unlinked_order_lines on this "
-    "SAME order to confirm the line reads as linked — bearing in mind that "
-    "check only sees a MISSING link, never a link pointing at the WRONG "
-    "storefront line — and after despatch check the storefront order shows "
-    "this line, and only this line, fulfilled."
-)
+def _build_relink_order_line_warning() -> str:
+    return (
+        "⚠️ Orders/UpdateOrderItem writes are PROVEN on this tenant, by this repo, "
+        f"to persist for: {_update_order_item_proven_fields()} — see "
+        "UPDATE_ORDER_ITEM_FIELDS for the evidence per field. Note ItemSource "
+        "persists only for a NON-EMPTY "
+        "value: writing an empty string is silently discarded behind a 200, so a "
+        "2xx is still NOT proof on its own. This tool re-reads the order after "
+        "the write, so check the outcome is 'relinked', not 'not_persisted' or "
+        "'unconfirmed', and check unexpected_field_changes is empty — this "
+        "endpoint takes the whole line, so price, quantity and tax ride on the "
+        "same object. "
+        f"SEPARATELY ({DESPATCH_MAPPING_OBSERVED}, with a caveat): whether despatch "
+        "then maps this line back to its storefront line. Persisting the fields "
+        "and despatch honouring them are different claims — "
+        f"{DESPATCH_MAPPING_WARNING_TEXT}. "
+        "What IS established is that a line with NO channel link does not fulfil "
+        "on the storefront (22 orders, 1 Aug-19 Sep 2026), and that matching is "
+        "not done by the Linnworks SKU. Whether the key is ItemNumber or "
+        "ChannelSKU is not yet known. So: re-run find_unlinked_order_lines on this "
+        "SAME order to confirm the line reads as linked — bearing in mind that "
+        "check only sees a MISSING link, never a link pointing at the WRONG "
+        "storefront line — and after despatch check the storefront order shows "
+        "this line, and only this line, fulfilled. "
+        "⚠️ PAYLOAD SHAPE AND LOCATION SCOPE (issue #105): this tool derives "
+        f"fulfilmentCenter {UPDATE_ORDER_ITEM_PROOF_SHAPE['fulfilment_center_selection']} "
+        f"and source/subSource {UPDATE_ORDER_ITEM_PROOF_SHAPE['source_selection']}. "
+        "On every proving order "
+        f"({', '.join(UPDATE_ORDER_ITEM_PROOF_SHAPE['proving_orders'])}) the "
+        "fulfilmentCenter VALUE that reached Linnworks was the "
+        f"{UPDATE_ORDER_ITEM_PROOF_SHAPE['proving_orders_location_name']}/zero GUID — "
+        "at that location this tool's derivation and a caller that simply "
+        "hard-codes the zero GUID produce IDENTICAL bytes, so THE PROOF COVERS "
+        "DEFAULT-LOCATION ORDERS ONLY and cannot tell the two apart there. "
+        "Whether fulfilmentCenter's VALUE has any effect on this endpoint at "
+        f"all is {FULFILMENT_CENTER_EFFECT_OBSERVED} — nothing has ever sent a "
+        "fulfilmentCenter that disagreed with the order's real location, so a "
+        "caller that hard-codes a fixed value regardless of the order's real "
+        "location is NOT covered by this proof at a non-Default location. The "
+        "dry-run manifest shows the fulfilmentCenter this call will send and "
+        "flags it when the order sits away from Default."
+    )
+
+
+_RELINK_ORDER_LINE_UNPROVEN_WARNING = _build_relink_order_line_warning()
 
 
 _RELINK_MISSING = object()
@@ -4066,6 +4161,22 @@ def relink_order_line(
                          order, while writing, or while reading back —
                          distinct from "not_persisted" and "unconfirmed"
 
+    ⚠️ LOCATION SCOPE (issue #105): this tool derives fulfilmentCenter from
+    the order in every case, and on every proving order the fulfilmentCenter
+    VALUE that reached Linnworks was the Default/zero GUID (see
+    UPDATE_ORDER_ITEM_PROOF_SHAPE) — at that location this tool's derivation
+    and a caller that simply hard-codes the zero GUID send identical bytes,
+    so the proof covers DEFAULT-LOCATION ORDERS ONLY and cannot tell the two
+    apart there. Whether fulfilmentCenter's VALUE has any effect on this
+    endpoint at all is FULFILMENT_CENTER_EFFECT_OBSERVED, which starts
+    never_attempted — nothing has ever sent a fulfilmentCenter that
+    disagreed with the order's real location. A caller elsewhere that
+    hard-codes fulfilmentCenter to a fixed value regardless of the order's
+    real location is therefore NOT covered by this proof at a non-Default
+    location. The manifest (dry_run or live) always shows the
+    fulfilmentCenter this call will send and flags it when the order does
+    not sit at the Default location.
+
     The same read-back also compares every OTHER field on the line against
     its pre-write value and reports any that changed under the distinct key
     "unexpected_field_changes" — money and quantity ride on the same
@@ -4095,7 +4206,8 @@ def relink_order_line(
         location_id: Fulfilment centre GUID to send with the update.
             Defaults to the order's own fulfilment location, falling back
             to the Default location only when the order carries none.
-            Supplying this overrides both.
+            Supplying this overrides both. This proof only covers the
+            Default location — see the LOCATION SCOPE note above.
         dry_run: If True (default), shows exactly what would be written
             (current vs intended identity values) without writing anything.
             Set to False to execute.
@@ -4108,7 +4220,16 @@ def relink_order_line(
         external_reference, row_id, line (sku, title, quantity),
         channel_line_id_before/after, channel_line_source_before/after,
         channel_line_source_origin ("derived_from_order_source" or
-        "supplied") — plus, once a live write has been attempted: outcome
+        "supplied"), fulfilment_center (the value this call will send),
+        fulfilment_center_is_default (bool — whether the value about to be
+        SENT is the Default location), order_fulfilment_location (the
+        order's OWN location, ignoring any location_id override),
+        order_fulfilment_location_is_default (bool),
+        fulfilment_center_location_mismatch (bool — whether the value about
+        to be sent differs from the order's own location), and
+        fulfilment_center_warning (present whenever the order itself sits
+        away from the Default location OR the two disagree — see LOCATION
+        SCOPE above) — plus, once a live write has been attempted: outcome
         ("relinked" / "not_persisted" / "unconfirmed" / "rate_limited"),
         linnworks_response, unexpected_field_changes, and unproven_warning.
     """
@@ -4196,6 +4317,36 @@ def relink_order_line(
             "channel_line_source_current": current_source,
         }
 
+    # fulfilmentCenter is DERIVED from the order (caller override, then the
+    # order's own FulfilmentLocationId, then Default), never hard-coded to the
+    # Default/zero GUID — the same resolution remove_order_item and
+    # cancel_order use. Every open order today sits on Default, so a
+    # hard-coded value would pass every test and every live run until the
+    # first order on another location, then send the wrong fulfilment centre
+    # (issue #78). Three tests pin this order of resolution. Computed before
+    # the dry_run check (rather than only inside the live-write branch) so
+    # the dry-run manifest can show it too — Orders/UpdateOrderItem is only
+    # proven at the Default location (issue #105), so a caller reviewing a
+    # dry run needs to see, before anything is written, whether this order
+    # falls inside that proof or outside it.
+    fulfilment_centre = (
+        location_id or raw.get("FulfilmentLocationId") or DEFAULT_LOCATION_ID
+    )
+    fulfilment_center_is_default = fulfilment_centre == DEFAULT_LOCATION_ID
+
+    # The order's OWN location, regardless of any location_id override — the
+    # value the QA round-1 fix (issue #105) requires the flag to be keyed on.
+    # fulfilment_center_is_default above answers "is the value about to be
+    # SENT the Default location?"; this answers "does the ORDER itself sit at
+    # the Default location?" — a zero-GUID override on a non-Default order
+    # makes those two questions disagree, and that disagreement is exactly
+    # the hard-coded-caller shape this issue is about.
+    order_fulfilment_location = raw.get("FulfilmentLocationId") or DEFAULT_LOCATION_ID
+    order_fulfilment_location_is_default = (
+        order_fulfilment_location == DEFAULT_LOCATION_ID
+    )
+    fulfilment_center_location_mismatch = fulfilment_centre != order_fulfilment_location
+
     manifest = {
         "order_id": fmt.get("order_id"),
         "num_order_id": fmt.get("num_order_id"),
@@ -4213,7 +4364,32 @@ def relink_order_line(
         "channel_line_source_before": current_source,
         "channel_line_source_after": effective_source,
         "channel_line_source_origin": source_origin,
+        "fulfilment_center": fulfilment_centre,
+        "fulfilment_center_is_default": fulfilment_center_is_default,
+        "order_fulfilment_location": order_fulfilment_location,
+        "order_fulfilment_location_is_default": order_fulfilment_location_is_default,
+        "fulfilment_center_location_mismatch": fulfilment_center_location_mismatch,
     }
+    if not order_fulfilment_location_is_default or fulfilment_center_location_mismatch:
+        warning_parts = []
+        if not order_fulfilment_location_is_default:
+            warning_parts.append(
+                "This order's own fulfilment location is NOT the Default "
+                "location. Orders/UpdateOrderItem has only been proven at "
+                "the Default location (issue #105) — whether "
+                "fulfilmentCenter's value has any effect on this endpoint "
+                f"elsewhere is {FULFILMENT_CENTER_EFFECT_OBSERVED}."
+            )
+        if fulfilment_center_location_mismatch:
+            warning_parts.append(
+                f"The fulfilmentCenter value about to be sent ({fulfilment_centre!r}) "
+                "does NOT match this order's own fulfilment location "
+                f"({order_fulfilment_location!r}). This exact mismatch has "
+                "never been tested and its effect on Linnworks — a 400, a "
+                "silent no-op, or a moved stock allocation — is completely "
+                "unknown."
+            )
+        manifest["fulfilment_center_warning"] = " ".join(warning_parts)
 
     if dry_run:
         return {
@@ -4243,16 +4419,6 @@ def relink_order_line(
             **manifest,
         })
 
-    # fulfilmentCenter is DERIVED from the order (caller override, then the
-    # order's own FulfilmentLocationId, then Default), never hard-coded to the
-    # Default/zero GUID — the same resolution remove_order_item and
-    # cancel_order use. Every open order today sits on Default, so a
-    # hard-coded value would pass every test and every live run until the
-    # first order on another location, then send the wrong fulfilment centre
-    # (issue #78). Three tests pin this order of resolution.
-    fulfilment_centre = (
-        location_id or raw.get("FulfilmentLocationId") or DEFAULT_LOCATION_ID
-    )
     payload = {
         "orderId": guid,
         "orderItem": payload_item,
