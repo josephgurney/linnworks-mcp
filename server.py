@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.56.2"
+__version__ = "1.57.0"
 
 import json
 import os
@@ -3625,38 +3625,230 @@ def remove_order_item(
     return result
 
 
-# Orders/UpdateOrderItem has been probed for existence only (issue #52, 9 Sep
-# 2026 — a deliberately invalid payload against the zero GUID returned the
-# same "reached real validation code" 400 this repo treats as evidence a
-# route exists). It has never been called from this repo with a payload that
-# could touch a real order. This warning is carried on every
-# relink_order_line live-run response until an owner-run live proof (issue
-# #59, CLAUDE.md's post_merge_verification) updates it.
+# ── Orders/UpdateOrderItem: per-FIELD write observations (issue #59) ─────────
+# The one place this repo records what Orders/UpdateOrderItem is observed to
+# do. Every message about the endpoint is interpolated from here; nothing
+# retypes a state or a date in prose. #45 and #47 each shipped the same fact
+# written out by hand in two or three documents and then drifted; the
+# push_observed_state vocabulary was the fix, and this is the same shape
+# applied one layer down, per FIELD rather than per channel.
 #
-# It deliberately separates two unknowns (issue #78). The first — do
-# ItemNumber/ItemSource persist on Linnworks' own order record? — is one this
-# tool answers for itself on every live run, by re-reading the order and
-# reporting relinked/not_persisted rather than trusting the 2xx. The second —
-# does despatch then map the line back to its storefront line? — no read of
-# Linnworks can answer. An earlier wording justified the caution by analogy
-# to the Amazon/eBay channel pushes; that did not hold, because those are
-# channel-push endpoints whose effect lands on the storefront, whereas this
-# endpoint writes to Linnworks' own order record, which the read-back checks.
+# Per FIELD is the necessary granularity, and it is not a stylistic choice:
+# this endpoint takes a whole OrderItem and is observed to PERSIST some
+# fields while SILENTLY DISCARDING others behind the same 200. A single
+# endpoint-level "proven" flag would therefore be a lie about whichever
+# field had not been tried.
+UPDATE_ITEM_PROVEN = "proven"                       # written and read back changed
+UPDATE_ITEM_NEVER_ATTEMPTED = "never_attempted"     # no live write of this field
+UPDATE_ITEM_PROVEN_NON_EMPTY_ONLY = "proven_non_empty_only"  # non-empty persists, empty discarded
+UPDATE_ITEM_OBSERVED_STATES = (UPDATE_ITEM_PROVEN, UPDATE_ITEM_NEVER_ATTEMPTED,
+                               UPDATE_ITEM_PROVEN_NON_EMPTY_ONLY)
+
+# WHO proved it, which the runtime text must respect. #78's AC11 forbids the
+# live-run warning from resting on another repository's evidence: a wrong
+# second-hand note would soften the caution on a tool that writes to live
+# orders, and this repo cannot re-verify another repo's run. So the warning
+# names ONLY the fields proven here, and the rest stay in the registry as
+# context for a human reading this file.
+UPDATE_ITEM_PROVEN_HERE = "this_repo"
+UPDATE_ITEM_PROVEN_ELSEWHERE = "other_repo"
+UPDATE_ITEM_PROVENANCES = (UPDATE_ITEM_PROVEN_HERE, UPDATE_ITEM_PROVEN_ELSEWHERE)
+
+# `evidence` is the ONLY place a field's proof text may be written. A field
+# recorded as anything other than never-attempted MUST carry one, because the
+# warning text is interpolated from it and an empty one silently guts the
+# message (the invariant #45 learned the hard way).
+UPDATE_ORDER_ITEM_FIELDS: dict[str, dict] = {
+    "PricePerUnit": {
+        "state": UPDATE_ITEM_PROVEN, "proven_by": UPDATE_ITEM_PROVEN_ELSEWHERE,
+        "evidence": "live 2026-09-09, order-sync-service",
+    },
+    "TaxRate": {
+        "state": UPDATE_ITEM_PROVEN, "proven_by": UPDATE_ITEM_PROVEN_ELSEWHERE,
+        "evidence": "live 2026-09-09, order-sync-service",
+    },
+    "Quantity": {
+        "state": UPDATE_ITEM_PROVEN, "proven_by": UPDATE_ITEM_PROVEN_ELSEWHERE,
+        "evidence": "live 2026-09-15 on order 611150, order-sync-service#1",
+    },
+    "ItemNumber": {
+        "state": UPDATE_ITEM_PROVEN, "proven_by": UPDATE_ITEM_PROVEN_HERE,
+        "evidence": "live 2026-09-18 on order 611150 (issue #59); restored "
+                    "byte-identically across all 49 raw line fields, and the "
+                    "written value was still present on a re-read 5 days later",
+    },
+    "ItemSource": {
+        "state": UPDATE_ITEM_PROVEN_NON_EMPTY_ONLY,
+        "proven_by": UPDATE_ITEM_PROVEN_HERE,
+        "evidence": "live 2026-09-18 on order 611150 (issue #59): writing a "
+                    "DIFFERENT non-empty value ('EBAY') persisted, and so did "
+                    "restoring 'SHOPIFY', but writing '' was SILENTLY DISCARDED "
+                    "behind a 200 and read back unchanged. A repair writes "
+                    "blank->non-blank, which is the proven direction. A "
+                    "consequence worth keeping: because the API will not accept "
+                    "an empty value, no API caller can blank a line's channel "
+                    "link, so an orphan cannot be manufactured for testing and "
+                    "cannot have been caused by this server",
+    },
+}
+
+# Whether despatch then maps a line back to its storefront line is a SEPARATE
+# question from whether the fields persist, and no read of Linnworks can
+# answer it (issue #78 established the distinction; issue #59 carries the
+# proof). It is held apart from the per-field registry above precisely so a
+# green field-persistence row can never be mistaken for it.
+#
+# What IS established, from production data on 2026-09-23 (issue #59):
+#   - A line whose channel link is ABSENT does not fulfil on the storefront.
+#     Orders 607251 and 607529 both despatched in full from Linnworks; on
+#     Shopify each left exactly its orphaned line unfulfilled while every
+#     linked line on the same order fulfilled. 22 such orders, 1 Aug-19 Sep.
+#   - Mapping is NOT by the Linnworks SKU. On order 607251 the Bones bearings
+#     line carries Linnworks SKU 'BONES-SUPERREDS-master' against Shopify SKU
+#     'BNB-BEA-0006' -- they differ -- and that line fulfilled correctly.
+# What is NOT established: whether the matching key is ItemNumber or
+# ChannelSKU (on a substituted line BOTH differ from the storefront, so no
+# production order separates them), and whether an API-WRITTEN ItemNumber
+# despatches like a native one.
+DESPATCH_MAPPING_OBSERVED = UPDATE_ITEM_PROVEN
+
+# What the live-run warning is allowed to say. #78's AC11 keeps other
+# repositories out of runtime text, so the racing detail below -- which names
+# one -- stays in DESPATCH_MAPPING_EVIDENCE, for a human reading this file.
+# Nothing is softened by the split: the caller is still told the key is unknown.
+DESPATCH_MAPPING_WARNING_TEXT = (
+    "a despatch after an API write DID reach the storefront and mark its lines "
+    "fulfilled (live 2026-09-23, order 611697). But that run was raced by "
+    "another local service which added a line mid-experiment, so it does NOT "
+    "establish WHICH field despatch matches on: ItemNumber and ChannelSKU both "
+    "explain what was observed. Do not assume writing ItemNumber is what makes "
+    "a despatch land. NO TOOL IN THIS SERVER CAN DESPATCH AN ORDER -- "
+    "update_pick_wave refuses Complete/Packing/Shipped by design"
+)
+
+DESPATCH_MAPPING_EVIDENCE = (
+    "live 2026-09-23 on order 611697 / Shopify #11182593: after relink_order_line "
+    "wrote a line's ItemNumber, the order was despatched in the Linnworks UI and "
+    "Shopify created ONE fulfilment covering both of its lines, 1 unit each, "
+    "leaving nothing unfulfilled (displayFulfillmentStatus FULFILLED). So a "
+    "despatch does reach the storefront and does mark lines fulfilled after an "
+    "API write. TWO LIMITS ON THIS PROOF, both important. (1) The run was raced: "
+    "order-sync-service added a third line 18 seconds after the write, giving "
+    "BOTH storefront lines a claimant, so this order cannot show which Linnworks "
+    "line drove which storefront fulfilment. (2) It therefore does NOT isolate "
+    "the matching KEY -- ItemNumber and ChannelSKU both predict the observed "
+    "outcome. What is separately established is that a line with NO channel link "
+    "does not fulfil (22 orders, 1 Aug-19 Sep 2026) and that matching is not by "
+    "the Linnworks SKU. NOTE no tool in this server can despatch an order: "
+    "update_pick_wave refuses Complete/Packing/Shipped by design, so any repeat "
+    "needs a Linnworks UI despatch, and order-sync-service paused first"
+)
+
+
+# Which FIELD despatch matches on is still unknown, and is deliberately its
+# own value so no reader infers it from DESPATCH_MAPPING_OBSERVED above. A
+# repair that writes ItemNumber is only known to work because the whole line
+# fulfilled, not because ItemNumber was shown to be the key.
+DESPATCH_MAPPING_KEY = None
+DESPATCH_MAPPING_KEY_CANDIDATES = ("ItemNumber", "ChannelSKU")
+
+
+def _update_order_item_proven_fields() -> str:
+    """The fields THIS repo has itself observed to persist, for interpolation
+    into runtime messages. Never retype this list -- see
+    UPDATE_ORDER_ITEM_FIELDS -- and never widen it to the whole registry:
+    fields marked UPDATE_ITEM_PROVEN_ELSEWHERE are another repository's
+    evidence, which #78's AC11 keeps out of runtime text."""
+    return ", ".join(
+        name for name, entry in UPDATE_ORDER_ITEM_FIELDS.items()
+        if entry["state"] != UPDATE_ITEM_NEVER_ATTEMPTED
+        and entry["proven_by"] == UPDATE_ITEM_PROVEN_HERE
+    )
+
+
+def _assert_update_order_item_observations_consistent() -> None:
+    """Hold the per-field registry to its vocabulary, at import time.
+
+    Raised at import rather than asserted in a test, for the same reason as
+    `_assert_push_observations_consistent`: a registry that contradicts itself
+    is a programming error in this file, and failing fast beats serving a tool
+    whose warnings misstate what has been proven about a live-order write.
+    """
+    for field, entry in UPDATE_ORDER_ITEM_FIELDS.items():
+        state = entry.get("state")
+        if state not in UPDATE_ITEM_OBSERVED_STATES:
+            raise ValueError(
+                f"UPDATE_ORDER_ITEM_FIELDS['{field}'].state={state!r} is not one "
+                f"of {UPDATE_ITEM_OBSERVED_STATES}"
+            )
+        if state != UPDATE_ITEM_NEVER_ATTEMPTED and not entry.get("evidence"):
+            raise ValueError(
+                f"UPDATE_ORDER_ITEM_FIELDS['{field}'] is {state} but carries no "
+                "evidence; the warning text is interpolated from it"
+            )
+        if state != UPDATE_ITEM_NEVER_ATTEMPTED and entry.get(
+                "proven_by") not in UPDATE_ITEM_PROVENANCES:
+            raise ValueError(
+                f"UPDATE_ORDER_ITEM_FIELDS['{field}'] is {state} but its "
+                f"proven_by={entry.get('proven_by')!r} is not one of "
+                f"{UPDATE_ITEM_PROVENANCES}; the runtime warning may only name "
+                "fields proven in THIS repo"
+            )
+    if DESPATCH_MAPPING_OBSERVED not in UPDATE_ITEM_OBSERVED_STATES:
+        raise ValueError(
+            f"DESPATCH_MAPPING_OBSERVED={DESPATCH_MAPPING_OBSERVED!r} is not one "
+            f"of {UPDATE_ITEM_OBSERVED_STATES}"
+        )
+    if not DESPATCH_MAPPING_EVIDENCE:
+        raise ValueError("DESPATCH_MAPPING_OBSERVED carries no evidence text")
+    # The trap this guard exists for: ItemNumber persisting is NOT despatch
+    # mapping. If a future edit marks the mapping proven, ItemNumber must be
+    # proven too, or the claim rests on nothing.
+    if (DESPATCH_MAPPING_OBSERVED == UPDATE_ITEM_PROVEN
+            and UPDATE_ORDER_ITEM_FIELDS["ItemNumber"]["state"]
+            == UPDATE_ITEM_NEVER_ATTEMPTED):
+        raise ValueError(
+            "DESPATCH_MAPPING_OBSERVED claims proven while ItemNumber was never "
+            "written: despatch mapping cannot be proven without the write"
+        )
+
+
+_assert_update_order_item_observations_consistent()
+
+
+# The live-run warning carried on every relink_order_line write. It is now
+# DERIVED from UPDATE_ORDER_ITEM_FIELDS above rather than restating what is
+# proven -- issues #45 and #47 both drifted because the same fact was retyped
+# in prose in several places, and #59's acceptance criteria require this to be
+# recorded in exactly one machine-readable place.
+#
+# It still separates the two unknowns #78 established, because they remain
+# genuinely different questions: whether the FIELDS persist on Linnworks' own
+# record (this tool's read-back answers that per run) and whether DESPATCH then
+# maps the line to its storefront line (no read of Linnworks can answer it).
 _RELINK_ORDER_LINE_UNPROVEN_WARNING = (
-    "⚠️ Orders/UpdateOrderItem is UNPROVEN on this tenant — it has only ever "
-    "been probed for existence with a deliberately invalid payload against "
-    "the zero GUID (issue #52); this repo has never fired it against a "
-    "real order, so ItemNumber/ItemSource persistence is not established "
-    "here. Two separate things are unknown. First, whether the values "
-    "persist on Linnworks' own order record — this tool re-reads the order "
-    "after the write and reports that as the outcome, so check it is "
-    "'relinked', not 'not_persisted' or 'unconfirmed'. Second, even when they "
-    "do persist, whether despatch then maps this line back to its storefront "
-    "line — a read-back of Linnworks' record is not proof of that. A 2xx "
-    "response here is NOT proof the channel link was restored. Re-run "
-    "find_unlinked_order_lines on this SAME order afterwards to confirm the "
-    "line now reads as linked, and after despatch check the storefront order "
-    "shows this line fulfilled."
+    "⚠️ Orders/UpdateOrderItem writes are PROVEN on this tenant, by this repo, "
+    f"to persist for: {_update_order_item_proven_fields()} — see "
+    "UPDATE_ORDER_ITEM_FIELDS for the evidence per field. Note ItemSource "
+    "persists only for a NON-EMPTY "
+    "value: writing an empty string is silently discarded behind a 200, so a "
+    "2xx is still NOT proof on its own. This tool re-reads the order after "
+    "the write, so check the outcome is 'relinked', not 'not_persisted' or "
+    "'unconfirmed', and check unexpected_field_changes is empty — this "
+    "endpoint takes the whole line, so price, quantity and tax ride on the "
+    "same object. "
+    f"SEPARATELY ({DESPATCH_MAPPING_OBSERVED}, with a caveat): whether despatch "
+    "then maps this line back to its storefront line. Persisting the fields "
+    "and despatch honouring them are different claims — "
+    f"{DESPATCH_MAPPING_WARNING_TEXT}. "
+    "What IS established is that a line with NO channel link does not fulfil "
+    "on the storefront (22 orders, 1 Aug-19 Sep 2026), and that matching is "
+    "not done by the Linnworks SKU. Whether the key is ItemNumber or "
+    "ChannelSKU is not yet known. So: re-run find_unlinked_order_lines on this "
+    "SAME order to confirm the line reads as linked — bearing in mind that "
+    "check only sees a MISSING link, never a link pointing at the WRONG "
+    "storefront line — and after despatch check the storefront order shows "
+    "this line, and only this line, fulfilled."
 )
 
 

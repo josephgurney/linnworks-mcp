@@ -402,3 +402,88 @@ def test_no_version_note_still_calls_delete_extended_properties_unproven():
             "a version note still claims delete_extended_properties was never "
             "fired live, outside a strike-through: " + note[:120]
         )
+
+
+# --- Orders/UpdateOrderItem per-field proof (issue #59) ---------------------
+#
+# AC14: the prose in CLAUDE.md and README.md must agree with the ONE
+# machine-readable record in server.py. #45 and #47 each drifted because the
+# same fact was retyped in several documents; these are the guards that stop a
+# third occurrence, modelled on the revise-proven guards above.
+
+def _update_order_item_endpoint_row() -> str:
+    for line in CLAUDE_MD.splitlines():
+        if line.startswith("| `Orders/UpdateOrderItem`"):
+            return line
+    raise AssertionError("CLAUDE.md has no Orders/UpdateOrderItem endpoint row")
+
+
+def _relink_claude_row() -> str:
+    for line in CLAUDE_MD.splitlines():
+        if line.startswith("| `relink_order_line("):
+            return line
+    raise AssertionError("CLAUDE.md has no relink_order_line tool row")
+
+
+def _relink_readme_row() -> str:
+    for line in README_MD.splitlines():
+        if line.startswith("| `relink_order_line`"):
+            return line
+    raise AssertionError("README.md has no relink_order_line row")
+
+
+def test_no_doc_still_calls_update_order_item_never_fired_live():
+    """It WAS fired live, from this build, on 2026-09-23. Any doc still saying
+    otherwise is telling a reader the opposite of the registry."""
+    assert server.UPDATE_ORDER_ITEM_FIELDS["ItemNumber"]["state"] != (
+        server.UPDATE_ITEM_NEVER_ATTEMPTED)
+    for name, row in (("CLAUDE.md endpoint row", _update_order_item_endpoint_row()),
+                      ("CLAUDE.md tool row", _relink_claude_row()),
+                      ("README.md row", _relink_readme_row())):
+        low = row.lower()
+        for stale in ("never fired it against a real order",
+                      "never fired live from this build",
+                      "not live-run from this build",
+                      "⚠️ unproven endpoint"):
+            assert stale not in low, f"{name} still says '{stale}'"
+
+
+def test_docs_state_the_empty_item_source_trap():
+    """The single most misusable finding: ItemSource persists for a non-empty
+    value but an empty one is silently dropped behind a 200. A doc that records
+    ItemSource as flatly proven would licence a caller to blank it."""
+    assert server.UPDATE_ORDER_ITEM_FIELDS["ItemSource"]["state"] == (
+        server.UPDATE_ITEM_PROVEN_NON_EMPTY_ONLY)
+    for name, row in (("CLAUDE.md endpoint row", _update_order_item_endpoint_row()),
+                      ("README.md row", _relink_readme_row())):
+        assert "silently discarded" in row.lower(), (
+            f"{name} omits that an empty ItemSource is silently discarded")
+
+
+def test_docs_do_not_claim_the_despatch_mapping_key_is_known():
+    """DESPATCH_MAPPING_KEY is None: the #59 run was raced and could not
+    isolate ItemNumber from ChannelSKU. No doc may present ItemNumber as the
+    established key while that is so."""
+    assert server.DESPATCH_MAPPING_KEY is None
+    for name, row in (("CLAUDE.md tool row", _relink_claude_row()),
+                      ("README.md row", _relink_readme_row())):
+        assert "ChannelSKU" in row, (
+            f"{name} does not name ChannelSKU as the unexcluded alternative")
+
+
+def test_docs_record_that_the_detector_cannot_see_a_mispointed_link():
+    """Found during #59's live run. A caller told to 'confirm it reads as
+    linked' without this caveat will accept a false pass."""
+    row = _relink_claude_row().lower()
+    assert "mis-pointed" in row or "mispointed" in row
+    assert "mis-pointed" in _relink_readme_row().lower()
+
+
+def test_runtime_warning_does_not_name_another_repository():
+    """#78 AC11, re-asserted at the docs layer: the racing detail names
+    order-sync-service and must stay in DESPATCH_MAPPING_EVIDENCE, never in the
+    text a caller is shown."""
+    assert "order-sync-service" in server.DESPATCH_MAPPING_EVIDENCE
+    for forbidden in ("order-sync-service", "ordersync"):
+        assert forbidden not in server._RELINK_ORDER_LINE_UNPROVEN_WARNING
+        assert forbidden not in server.DESPATCH_MAPPING_WARNING_TEXT
