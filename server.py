@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.62.0"
+__version__ = "1.62.1"
 
 import json
 import os
@@ -3969,6 +3969,180 @@ def _assert_update_order_item_observations_consistent() -> None:
 
 
 _assert_update_order_item_observations_consistent()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Orders/RemoveOrderItem — what the 23 Sep 2026 run established, per
+# observation, and WHOSE run it was (issue #106)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# order-sync-service fired this endpoint live against real customer order
+# 611288 at 07:16:30 on 23 Sep 2026, sending the exact payload shape this
+# repo documents. That settles three questions and leaves three open, so it
+# is recorded per observation rather than as one flag -- the same reason
+# UPDATE_ORDER_ITEM_FIELDS is per field rather than "UpdateOrderItem works".
+#
+# It is ANOTHER REPOSITORY'S evidence. Issue #78's AC11 keeps other repos'
+# notes out of runtime text, so `_REMOVE_ORDER_ITEM_UNPROVEN_WARNING` is
+# deliberately untouched by this: it says THIS BUILD never fired the
+# endpoint, which is still true. Issue #89 is the route to a proof here, and
+# the only thing that may reword that warning. The validator below enforces
+# both halves, so neither can drift quietly.
+REMOVE_ORDER_ITEM_OBSERVATIONS: dict[str, dict] = {
+    "endpoint_removes_a_line": {
+        "state": UPDATE_ITEM_PROVEN, "proven_by": UPDATE_ITEM_PROVEN_ELSEWHERE,
+        "evidence": "live 2026-09-23 07:16:30 on order 611288, order-sync-service: "
+                    "the Jessup_10inch_35 line was gone on a direct re-read, and "
+                    "the two untouched lines kept their channel reference",
+    },
+    "lowercase_rowid_key": {
+        "state": UPDATE_ITEM_PROVEN, "proven_by": UPDATE_ITEM_PROVEN_ELSEWHERE,
+        "evidence": "live 2026-09-23 on order 611288, order-sync-service: the "
+                    "payload sent the documented-but-unverified lowercase "
+                    "'rowid' key and the removal took effect",
+    },
+    "order_total_recalculated": {
+        "state": UPDATE_ITEM_PROVEN, "proven_by": UPDATE_ITEM_PROVEN_ELSEWHERE,
+        "evidence": "live 2026-09-23 on order 611288, order-sync-service: "
+                    "TotalCharge went 82.30 -> 75.85, matching Shopify's "
+                    "currentTotalPriceSet. ONE observation, on ONE Shopify "
+                    "order, after a Shopify order edit -- not a general rule, "
+                    "which is why order_total_before/after is still reported",
+    },
+    # The three below are NOT 'no' answers. They are questions the 23 Sep run
+    # could not reach, and each has to stay visible: an unknown that is simply
+    # absent from the registry reads as one nobody thought of.
+    "non_default_fulfilment_center": {
+        "state": UPDATE_ITEM_NEVER_ATTEMPTED, "proven_by": None,
+        "evidence": "",
+        "why_not": "order 611288 sits at the Default location, which on this "
+                   "tenant IS the zero GUID -- so the hard-coded ZERO_GUID "
+                   "order-sync-service sends and the FulfilmentLocationId this "
+                   "tool derives were identical bytes. The run says nothing "
+                   "about a non-Default order. Same gap as issue #105.",
+    },
+    "removing_the_last_line": {
+        "state": UPDATE_ITEM_NEVER_ATTEMPTED, "proven_by": None,
+        "evidence": "",
+        "why_not": "611288 had three lines and kept two. What Linnworks does "
+                   "to an order emptied of its last line is untested, which is "
+                   "why remove_order_item still refuses it without "
+                   "allow_empty_order=True.",
+    },
+    "channel_sync_re_adds_a_removed_line": {
+        "state": UPDATE_ITEM_NEVER_ATTEMPTED, "proven_by": None,
+        "evidence": "",
+        "why_not": "issue #57's checklist asked for a re-read hours later; the "
+                   "23 Sep confirmation was immediate. Whether a channel sync "
+                   "silently puts the line back is unknown.",
+    },
+}
+
+# Named separately so a future edit cannot quietly DELETE an unknown to make
+# the registry read clean. Dropping a row is the same drift as flipping it.
+_REMOVE_ORDER_ITEM_REQUIRED_OBSERVATIONS = (
+    "endpoint_removes_a_line",
+    "lowercase_rowid_key",
+    "order_total_recalculated",
+    "non_default_fulfilment_center",
+    "removing_the_last_line",
+    "channel_sync_re_adds_a_removed_line",
+)
+
+# Phrases that would carry another repository's evidence into runtime text.
+# #78 AC11: a caller may read whose run it was in CLAUDE.md, never in a tool
+# response.
+_OTHER_REPO_MARKERS = ("order-sync-service", "611288")
+
+# The sentence that may only be dropped once THIS build has fired the
+# endpoint. Kept as a constant so the invariant below and the warning cannot
+# drift apart.
+_REMOVE_ORDER_ITEM_NEVER_FIRED_HERE = "never fired it against a real order"
+
+
+def _assert_remove_order_item_observations_consistent() -> None:
+    """Hold the observation registry, and the runtime warning it governs, to
+    their vocabulary at import time.
+
+    Raised at import for the same reason as
+    `_assert_update_order_item_observations_consistent`: a registry that
+    contradicts itself is a programming error in this file, and failing fast
+    beats serving a tool whose warning misstates what has been proven about a
+    live-order write.
+
+    The last two invariants are the point of this function. The pinned test in
+    tests/test_relink_order_line.py can be edited to match a softened warning
+    and CI stays green -- that is exactly the drift #78's AC11 was written
+    for. These cannot be satisfied that way: the warning may only drop its
+    never-fired-here claim when a row is actually proven HERE, and it may
+    never name the other repository's run.
+    """
+    for name in _REMOVE_ORDER_ITEM_REQUIRED_OBSERVATIONS:
+        if name not in REMOVE_ORDER_ITEM_OBSERVATIONS:
+            raise ValueError(
+                f"REMOVE_ORDER_ITEM_OBSERVATIONS is missing '{name}'; an "
+                "unknown that is absent reads as one nobody thought of"
+            )
+    for name, entry in REMOVE_ORDER_ITEM_OBSERVATIONS.items():
+        state = entry.get("state")
+        if state not in UPDATE_ITEM_OBSERVED_STATES:
+            raise ValueError(
+                f"REMOVE_ORDER_ITEM_OBSERVATIONS['{name}'].state={state!r} is "
+                f"not one of {UPDATE_ITEM_OBSERVED_STATES}"
+            )
+        if state == UPDATE_ITEM_NEVER_ATTEMPTED:
+            if entry.get("proven_by") is not None:
+                raise ValueError(
+                    f"REMOVE_ORDER_ITEM_OBSERVATIONS['{name}'] is "
+                    f"never_attempted but names proven_by="
+                    f"{entry.get('proven_by')!r}; a provenance on an "
+                    "unattempted observation reads as proof"
+                )
+            continue
+        if not entry.get("evidence"):
+            raise ValueError(
+                f"REMOVE_ORDER_ITEM_OBSERVATIONS['{name}'] is {state} but "
+                "carries no evidence; a proof nobody can check is not one"
+            )
+        if entry.get("proven_by") not in UPDATE_ITEM_PROVENANCES:
+            raise ValueError(
+                f"REMOVE_ORDER_ITEM_OBSERVATIONS['{name}'] is {state} but its "
+                f"proven_by={entry.get('proven_by')!r} is not one of "
+                f"{UPDATE_ITEM_PROVENANCES}"
+            )
+    proven_here = any(
+        entry.get("proven_by") == UPDATE_ITEM_PROVEN_HERE
+        for entry in REMOVE_ORDER_ITEM_OBSERVATIONS.values()
+    )
+    if (not proven_here
+            and _REMOVE_ORDER_ITEM_NEVER_FIRED_HERE
+            not in _REMOVE_ORDER_ITEM_UNPROVEN_WARNING):
+        raise ValueError(
+            "_REMOVE_ORDER_ITEM_UNPROVEN_WARNING no longer says this build "
+            f"{_REMOVE_ORDER_ITEM_NEVER_FIRED_HERE!r}, but no "
+            "REMOVE_ORDER_ITEM_OBSERVATIONS row is proven_by this repo. "
+            "Another repository's run does not soften this build's warning "
+            "(#78 AC11); issue #89 is the route to a proof here"
+        )
+    if (proven_here
+            and _REMOVE_ORDER_ITEM_NEVER_FIRED_HERE
+            in _REMOVE_ORDER_ITEM_UNPROVEN_WARNING):
+        raise ValueError(
+            "a REMOVE_ORDER_ITEM_OBSERVATIONS row is proven_by this repo, but "
+            "_REMOVE_ORDER_ITEM_UNPROVEN_WARNING still says this build "
+            f"{_REMOVE_ORDER_ITEM_NEVER_FIRED_HERE!r}"
+        )
+    for marker in _OTHER_REPO_MARKERS:
+        if marker in _REMOVE_ORDER_ITEM_UNPROVEN_WARNING:
+            raise ValueError(
+                f"_REMOVE_ORDER_ITEM_UNPROVEN_WARNING names {marker!r}: "
+                "another repository's evidence must not reach runtime text "
+                "(#78 AC11). It belongs in CLAUDE.md and in "
+                "REMOVE_ORDER_ITEM_OBSERVATIONS"
+            )
+
+
+_assert_remove_order_item_observations_consistent()
 
 
 # The live-run warning carried on every relink_order_line write. It is

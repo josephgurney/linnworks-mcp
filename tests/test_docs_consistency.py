@@ -595,3 +595,155 @@ def test_docs_do_not_claim_update_order_item_proven_beyond_default_location():
                 f"FULFILMENT_CENTER_EFFECT_OBSERVED is "
                 f"{server.FULFILMENT_CENTER_EFFECT_OBSERVED!r}"
             )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Issue #106 — Orders/RemoveOrderItem is proven, but by ANOTHER repository.
+# The docs must say both halves: that it works, and whose run showed it.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _remove_order_item_endpoint_row() -> str:
+    for line in CLAUDE_MD.splitlines():
+        if line.startswith("| `Orders/RemoveOrderItem`"):
+            return line
+    raise AssertionError("CLAUDE.md has no Orders/RemoveOrderItem endpoint row")
+
+
+def _remove_order_item_claude_row() -> str:
+    for line in CLAUDE_MD.splitlines():
+        if line.startswith("| `remove_order_item("):
+            return line
+    raise AssertionError("CLAUDE.md has no remove_order_item tool row")
+
+
+def _remove_order_item_readme_row() -> str:
+    for line in README_MD.splitlines():
+        if line.startswith("| `remove_order_item`"):
+            return line
+    raise AssertionError("README.md has no remove_order_item row")
+
+
+def _remove_order_item_proven(name: str) -> bool:
+    entry = server.REMOVE_ORDER_ITEM_OBSERVATIONS[name]
+    return entry["state"] != server.UPDATE_ITEM_NEVER_ATTEMPTED
+
+
+def test_the_endpoint_row_no_longer_calls_remove_order_item_unproven():
+    """AC6. The registry says the endpoint removes a line; a doc that still
+    says nothing has confirmed it contradicts the code."""
+    row = _remove_order_item_endpoint_row()
+    if _remove_order_item_proven("endpoint_removes_a_line"):
+        assert "STILL UNPROVEN" not in row, (
+            "CLAUDE.md's Orders/RemoveOrderItem row still says STILL UNPROVEN "
+            "while REMOVE_ORDER_ITEM_OBSERVATIONS records the endpoint proven"
+        )
+
+
+def test_the_endpoint_row_names_the_run_that_proved_it():
+    """AC8(c). Guard the positive facts too — a row reworded to some other
+    unsupported claim passes a bare 'STILL UNPROVEN' check."""
+    row = _remove_order_item_endpoint_row()
+    assert "611288" in row, "the endpoint row does not name the proving order"
+    assert "23 Sep 2026" in row, "the endpoint row does not date the proof"
+    assert "order-sync-service" in row, (
+        "the endpoint row does not name whose run this was; other-repo "
+        "evidence that reads as this repo's is the drift #78 AC11 guards"
+    )
+
+
+def test_the_endpoint_row_still_names_what_the_run_did_not_establish():
+    """AC6. A row that only reports the win reads as a full proof."""
+    row = _remove_order_item_endpoint_row()
+    for unknown in ("non-Default", "last", "re-add"):
+        assert unknown in row, (
+            f"the endpoint row does not say {unknown!r} remains untested, but "
+            "REMOVE_ORDER_ITEM_OBSERVATIONS records it never attempted"
+        )
+
+
+def test_no_doc_claims_this_build_fired_remove_order_item():
+    """AC7/AC8(b). CLAUDE.md's tools-table row claimed a live run from this
+    build under issue #59. #59's own scope excluded it ('The
+    remove_order_item proof (#89)'), and #89 is still open."""
+    proven_here = [
+        name for name, entry in server.REMOVE_ORDER_ITEM_OBSERVATIONS.items()
+        if entry.get("proven_by") == server.UPDATE_ITEM_PROVEN_HERE
+    ]
+    if proven_here:
+        return
+    stale = ("Live-run from this build 23 Sep 2026 (issue #59), with exactly "
+             "that checklist followed")
+    for doc_name, doc in (("CLAUDE.md", CLAUDE_MD), ("README.md", README_MD)):
+        assert stale not in doc, (
+            f"{doc_name} claims this build fired remove_order_item, but every "
+            "proven REMOVE_ORDER_ITEM_OBSERVATIONS row is another "
+            "repository's (issue #89 is the route to a proof here)"
+        )
+    # Guard the positive fact too: a row that merely drops the false claim
+    # leaves a reader with no idea whose run the proof came from.
+    row = _remove_order_item_claude_row()
+    assert "#89" in row, (
+        "the remove_order_item tools row does not point at #89, the route to "
+        "a proof from this build"
+    )
+    assert "order-sync-service" in row, (
+        "the remove_order_item tools row does not name whose run proved the "
+        "endpoint"
+    )
+
+
+def test_the_readme_row_agrees_with_the_registry():
+    """AC7. 'Unproven endpoint' is no longer true of the endpoint itself."""
+    row = _remove_order_item_readme_row()
+    if _remove_order_item_proven("endpoint_removes_a_line"):
+        assert "⚠️ Unproven endpoint" not in row, (
+            "README still calls Orders/RemoveOrderItem an unproven endpoint "
+            "while the registry records it proven"
+        )
+        assert "not from this build" in row or "another repo" in row, (
+            "README must say whose run proved it, or the reader takes it as ours"
+        )
+
+
+def test_the_runtime_warning_is_not_quoted_into_the_docs_as_a_proof_claim():
+    """The warning stays as it is (#89 owns rewording it). A doc that says
+    the warning has been updated would be the drift, not the warning."""
+    assert "never fired it against a real order" in server._REMOVE_ORDER_ITEM_UNPROVEN_WARNING
+
+
+# Claims about the ENDPOINT that the 23 Sep run retired. Claims about THIS
+# BUILD never having fired it are still true and must survive untouched --
+# that distinction is the whole point of the provenance split.
+_STALE_REMOVE_ORDER_ITEM_ENDPOINT_CLAIMS = (
+    "STILL UNPROVEN",
+    "only ever been probed for existence",
+    "also unproven",
+    "Unproven endpoint",
+    "recalculated into the total is unknown",
+)
+
+
+def test_no_doc_line_still_calls_the_remove_order_item_endpoint_unproven():
+    """AC8(a) says ANY doc, not just the confirmed-endpoints row.
+
+    QA round 1 caught exactly this: the endpoint row was corrected while the
+    tools-table row still opened by calling the endpoint existence-probed-only
+    and still said total recalculation was unknown, and the
+    Orders/UpdateOrderItem row still called RemoveOrderItem 'also unproven'.
+    A row-scoped guard passed all three, and the result was a docs table that
+    contradicted itself -- the defect this issue was raised to fix.
+    """
+    if not _remove_order_item_proven("endpoint_removes_a_line"):
+        return
+    offenders = []
+    for doc_name, doc in (("CLAUDE.md", CLAUDE_MD), ("README.md", README_MD)):
+        for number, line in enumerate(doc.splitlines(), 1):
+            if "RemoveOrderItem" not in line and "remove_order_item" not in line:
+                continue
+            for claim in _STALE_REMOVE_ORDER_ITEM_ENDPOINT_CLAIMS:
+                if claim in line:
+                    offenders.append(f"{doc_name}:{number} still says {claim!r}")
+    assert not offenders, (
+        "REMOVE_ORDER_ITEM_OBSERVATIONS records the endpoint proven, but these "
+        "lines still call it unproven:\n  " + "\n  ".join(offenders)
+    )

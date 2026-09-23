@@ -1145,8 +1145,15 @@ class TestUpdateOrderItemFieldRegistry:
 
 class TestRemoveOrderItemWarningUntouched:
     def test_remove_order_item_warning_is_character_for_character_unchanged(self):
-        """Orders/RemoveOrderItem genuinely has never been fired — an
-        over-broad edit to the neighbouring relink constant must fail here."""
+        """Orders/RemoveOrderItem has never been fired BY THIS BUILD — an
+        over-broad edit to the neighbouring relink constant must fail here.
+        The endpoint itself was proven by another repository on 23 Sep 2026
+        (issue #106), which is exactly why this pin still stands: #78's AC11
+        keeps that evidence out of runtime text, and issue #89 is the only
+        thing that may reword this warning. Note this pin alone cannot
+        enforce that — it can be edited to match a softened warning with CI
+        staying green, which is what
+        server._assert_remove_order_item_observations_consistent() is for."""
         assert server._REMOVE_ORDER_ITEM_UNPROVEN_WARNING == (
             "⚠️ Orders/RemoveOrderItem is UNPROVEN on this tenant — it has only ever "
             "been probed with a deliberately invalid payload (issue #52); this build "
