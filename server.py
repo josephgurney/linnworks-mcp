@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.60.0"
+__version__ = "1.60.1"
 
 import json
 import os
@@ -7401,10 +7401,12 @@ def find_unlinked_order_lines(
 #     for a COMPLETE wave (confirmed 23 Sep 2026, wave 3556, returned in full
 #     the same day it finished). It returns nothing for a SHIPPED wave, an
 #     EMPTIED one, or an unknown id. "Finished" is therefore not the dividing
-#     line it was once written as. Note the Complete sighting is same-day: it
-#     does NOT prove a Complete wave stays readable once it later moves on to
-#     Packing or Shipped. The v1.54.0 probes (wave 3520, wave 5) only ever hit
-#     shipped or emptied waves, which is why they came back empty. get_pick_wave_detail
+#     line it was once written as. ⚠️ A Complete wave is readable ONLY WHILE
+#     COMPLETE — proven 23 Sep 2026 (v1.60.1): waves 3554-3556 were returned
+#     while Complete and, once they moved to Shipped later the same morning,
+#     GetPickingWave returned nothing for them. Do not cache a wave id and
+#     expect to re-read it. The v1.54.0 probes (wave 3520, wave 5) only ever
+#     hit shipped or emptied waves, which is why they came back empty. get_pick_wave_detail
 #     (#67) wraps it. GetAllPickingWaves is still unused. get_pick_waves wraps
 #     GetAllPickingWaveHeaders, which returns finished waves too and carries
 #     OrderCount, enough for the post-merge "compare order count and state
@@ -7446,14 +7448,13 @@ def find_unlinked_order_lines(
 #   - InProgress: seen live on wave 3531 (22 Sep 2026), shown as "In Progress"
 #     in the UI.
 #   - Abandoned / Shipped: confirmed via the header list (see get_pick_waves).
-#   - Complete: seen live on waves 3554, 3555 and 3556 via
-#     GetAllPickingWaveHeaders (23 Sep 2026), and wave 3556 was additionally
-#     returned in full by GetPickingWave the same day. ⚠️ ADMITTED ON API
-#     EVIDENCE ALONE: unlike Unallocated, this has NOT yet been confirmed on
-#     screen in the Linnworks UI. It is the one entry here held to a lower bar
-#     than the rest, recorded so the exception is visible rather than assumed.
-#     The UI check is still owed (issue #108); when it happens, replace this
-#     paragraph with the sighting date.
+#   - Complete: confirmed ON SCREEN by the owner on the Linnworks Pickingwaves
+#     board (wave 3559, 23 Sep 2026), which is the bar this dict is held to.
+#     First seen via GetAllPickingWaveHeaders the same day on waves 3554-3556,
+#     and wave 3556 was returned in full by GetPickingWave while it was still
+#     Complete. It shipped v1.60.0 on that API evidence alone, with the
+#     exception flagged here; the on-screen check landed in v1.60.1 and the
+#     entry now meets the same standard as the rest.
 # Packing and Paused are valid per the documented enum (and valid FILTER
 # values — see get_pick_waves) but have never been seen on a real wave row, so
 # they are deliberately still unlabelled. A human confirming one of those
@@ -8066,7 +8067,8 @@ def check_orders_pickable(order_ids: list[str]) -> dict:
 #   - Picking/GetPickingWave returns full order + item detail for a LIVE wave,
 #     and for a COMPLETE one (confirmed live 23 Sep 2026, wave 3556, same day
 #     it finished — this does not prove it stays readable once the wave moves
-#     on to Packing or Shipped). It returns NOTHING for a SHIPPED wave, or an
+#     on to Packing or Shipped — and it does NOT: proven 23 Sep 2026, see
+#     v1.60.1). It returns NOTHING for a SHIPPED wave, or an
 #     EMPTIED wave (removing a wave's last order auto-abandons it — confirmed
 #     live 22 Sep 2026, see the #67 contained test). An ABANDONED wave that
 #     still holds orders IS returned by it. The v1.54.0 note that it "returns
@@ -8082,8 +8084,9 @@ _PICK_WAVE_EMPTY_DETAIL_NOTE = (
     "both confirmed live 22 Sep 2026 — or for an id that doesn't exist. It is "
     "NOT every FINISHED wave: a COMPLETE wave IS returned in full (confirmed "
     "live 23 Sep 2026, wave 3556, the same day it finished), as is an "
-    "ABANDONED wave that still holds orders. A wave that has since moved on "
-    "to Packing or Shipped may no longer be readable. An empty response here "
+    "ABANDONED wave that still holds orders. A COMPLETE wave is readable ONLY "
+    "WHILE COMPLETE: once it moves on to Shipped it returns nothing here "
+    "(proven 23 Sep 2026 on waves 3554-3556). An empty response here "
     "does NOT mean the wave has no orders. Use get_pick_waves(state='Shipped' "
     "or 'Abandoned') to see a finished wave's header counts."
 )
