@@ -16,8 +16,6 @@ os.environ.setdefault("LINNWORKS_INSTALLATION_TOKEN", "test-install-token")
 
 import pytest
 
-import server as _server
-
 
 @pytest.fixture(autouse=True)
 def _shopify_scopes_fully_granted(request, monkeypatch):
@@ -35,7 +33,14 @@ def _shopify_scopes_fully_granted(request, monkeypatch):
        now genuinely exercises the path a correctly-configured token takes.
 
     Tests that are ABOUT the probe opt out with @pytest.mark.real_scope_probe.
+
+    `server` is imported HERE, not at module level: conftest.py loads before
+    pytest puts the repo root on sys.path, so a top-level `import server`
+    survives `python -m pytest` (which adds the cwd) and dies under a bare
+    `pytest`, which is what CI runs.
     """
+    import server as _server
+
     _server._SHOPIFY_SCOPE_CACHE.clear()
     if "real_scope_probe" not in request.keywords:
         monkeypatch.setattr(
