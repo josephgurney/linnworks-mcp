@@ -229,6 +229,19 @@ class TestGetPickWaveDetail:
             out = server.get_pick_wave_detail(9001)
         assert out["user_id"] is None
 
+    # #108 — a COMPLETE wave is returned in full, not treated as "finished
+    # and therefore empty". Waves 3554-3556 were seen Complete on 23 Sep 2026
+    # and GetPickingWave returned 3556 the same day.
+    def test_a_complete_wave_is_returned_in_full_and_labelled(self):
+        fake = FakeLinnworks(waves={3556: _wave_resp(
+            wave_id=3556, state="Complete", orders=[_wave_order(1, GUID_A)])})
+        with fake.active():
+            out = server.get_pick_wave_detail(3556)
+        assert out["found"] is True
+        assert out["state"] == "Complete"
+        assert out["state_label"] == "Complete"
+        assert out["state_confirmed"] is True
+
     def test_uses_the_shared_state_labeller(self):
         fake = FakeLinnworks(waves={9001: _wave_resp(state="Paused")})
         with fake.active():

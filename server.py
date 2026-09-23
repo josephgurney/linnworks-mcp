@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.59.0"
+__version__ = "1.60.0"
 
 import json
 import os
@@ -7397,9 +7397,14 @@ def find_unlinked_order_lines(
 #     anyway because it is a real, documented, harmless parameter.
 #
 #   - GetPickingWave (the "detailed", order-level variant) returns full detail
-#     for a LIVE wave (confirmed 22 Sep 2026, wave 3549, 8 orders) and nothing
-#     for a finished one. The v1.54.0 probes (wave 3520, wave 5) only ever hit
-#     finished waves, which is why they came back empty. get_pick_wave_detail
+#     for a LIVE wave (confirmed 22 Sep 2026, wave 3549, 8 orders), and also
+#     for a COMPLETE wave (confirmed 23 Sep 2026, wave 3556, returned in full
+#     the same day it finished). It returns nothing for a SHIPPED wave, an
+#     EMPTIED one, or an unknown id. "Finished" is therefore not the dividing
+#     line it was once written as. Note the Complete sighting is same-day: it
+#     does NOT prove a Complete wave stays readable once it later moves on to
+#     Packing or Shipped. The v1.54.0 probes (wave 3520, wave 5) only ever hit
+#     shipped or emptied waves, which is why they came back empty. get_pick_wave_detail
 #     (#67) wraps it. GetAllPickingWaves is still unused. get_pick_waves wraps
 #     GetAllPickingWaveHeaders, which returns finished waves too and carries
 #     OrderCount, enough for the post-merge "compare order count and state
@@ -7441,12 +7446,20 @@ def find_unlinked_order_lines(
 #   - InProgress: seen live on wave 3531 (22 Sep 2026), shown as "In Progress"
 #     in the UI.
 #   - Abandoned / Shipped: confirmed via the header list (see get_pick_waves).
-# Complete, Packing and Paused are valid per the documented enum (and valid
-# FILTER values — see get_pick_waves) but have never been seen on a real wave
-# row, so they are deliberately still unlabelled. A human confirming one of
-# those against the Linnworks UI screen (per CLAUDE.md's post-merge
-# verification steps) is what would extend this dict — never a guess from the
-# enum name alone. This is deliberately module-level, not nested in a tool,
+#   - Complete: seen live on waves 3554, 3555 and 3556 via
+#     GetAllPickingWaveHeaders (23 Sep 2026), and wave 3556 was additionally
+#     returned in full by GetPickingWave the same day. ⚠️ ADMITTED ON API
+#     EVIDENCE ALONE: unlike Unallocated, this has NOT yet been confirmed on
+#     screen in the Linnworks UI. It is the one entry here held to a lower bar
+#     than the rest, recorded so the exception is visible rather than assumed.
+#     The UI check is still owed (issue #108); when it happens, replace this
+#     paragraph with the sighting date.
+# Packing and Paused are valid per the documented enum (and valid FILTER
+# values — see get_pick_waves) but have never been seen on a real wave row, so
+# they are deliberately still unlabelled. A human confirming one of those
+# against the Linnworks UI screen (per CLAUDE.md's post-merge verification
+# steps) is what would extend this dict — never a guess from the enum name
+# alone. This is deliberately module-level, not nested in a tool,
 # so #67's write tools import it rather than minting a second, possibly-
 # divergent state map (the mistake this repo already made once with
 # _ORDER_STATUS_LABELS vs _PAYMENT_STATUS_LABELS, and does not want to repeat
@@ -7457,6 +7470,7 @@ _PICK_WAVE_STATE_LABELS: dict[str, str] = {
     "InProgress": "In Progress",
     "Abandoned": "Abandoned",
     "Shipped": "Shipped",
+    "Complete": "Complete",
 }
 
 # The exact live error text (lowercased, substring-matched) Linnworks returns
@@ -8049,25 +8063,29 @@ def check_orders_pickable(order_ids: list[str]) -> dict:
 #
 # Live facts this section relies on (confirmed read-only, 22 Sep 2026 — see
 # docs/superpowers/specs/2026-09-22-pickwave-write-tools-design.md):
-#   - Picking/GetPickingWave returns full order + item detail for a LIVE wave.
-#     It returns NOTHING for a SHIPPED wave, or an EMPTIED wave (removing a
-#     wave's last order auto-abandons it — confirmed live 22 Sep 2026, see the
-#     #67 contained test). An ABANDONED wave that still holds orders IS
-#     returned by it. The v1.54.0 note that it "returns zero waves" was only
-#     ever tested on waves that were already shipped or emptied.
+#   - Picking/GetPickingWave returns full order + item detail for a LIVE wave,
+#     and for a COMPLETE one (confirmed live 23 Sep 2026, wave 3556, same day
+#     it finished — this does not prove it stays readable once the wave moves
+#     on to Packing or Shipped). It returns NOTHING for a SHIPPED wave, or an
+#     EMPTIED wave (removing a wave's last order auto-abandons it — confirmed
+#     live 22 Sep 2026, see the #67 contained test). An ABANDONED wave that
+#     still holds orders IS returned by it. The v1.54.0 note that it "returns
+#     zero waves" was only ever tested on waves already shipped or emptied.
 #   - The wave row carries UserId/EmailAddress only while the wave is assigned
 #     (the keys are ABSENT, not null, when unassigned).
 #   - Bins[] on that response carries real bin codes (e.g. "10-A-03"), even
 #     though GetItemBinracks errors on every item here (non-WMS locations).
 
 _PICK_WAVE_EMPTY_DETAIL_NOTE = (
-    "Linnworks returned no wave for this id. It does this for some FINISHED "
-    "waves: a SHIPPED wave, or an EMPTIED wave (removing a wave's last order "
-    "auto-abandons it) — confirmed live 22 Sep 2026 — or for an id that "
-    "doesn't exist. An ABANDONED wave that still holds orders IS returned. "
-    "An empty response here does NOT mean the wave has no orders. Use "
-    "get_pick_waves(state='Shipped' or 'Abandoned') to see a finished wave's "
-    "header counts."
+    "Linnworks returned no wave for this id. It does this for a SHIPPED wave, "
+    "for an EMPTIED wave (removing a wave's last order auto-abandons it) — "
+    "both confirmed live 22 Sep 2026 — or for an id that doesn't exist. It is "
+    "NOT every FINISHED wave: a COMPLETE wave IS returned in full (confirmed "
+    "live 23 Sep 2026, wave 3556, the same day it finished), as is an "
+    "ABANDONED wave that still holds orders. A wave that has since moved on "
+    "to Packing or Shipped may no longer be readable. An empty response here "
+    "does NOT mean the wave has no orders. Use get_pick_waves(state='Shipped' "
+    "or 'Abandoned') to see a finished wave's header counts."
 )
 
 # (output name, Linnworks order flag) — an order with any of these set can't
@@ -8094,8 +8112,10 @@ def _format_pick_wave_detail(resp: dict, picking_wave_id: int | None = None) -> 
     """
     Normalise a GetPickingWave response into header + orders + blockers.
 
-    Returns None when the response holds no wave (a finished wave, or an
-    unknown id — see _PICK_WAVE_EMPTY_DETAIL_NOTE). With picking_wave_id, the
+    Returns None when the response holds no wave (a SHIPPED wave, an EMPTIED/
+    auto-abandoned one, or an unknown id — see _PICK_WAVE_EMPTY_DETAIL_NOTE).
+    Not every finished wave: a COMPLETE wave is returned in full (confirmed
+    live 23 Sep 2026, wave 3556). With picking_wave_id, the
     wave whose PickingWaveId matches is used, and None is returned if none
     does — a response for another wave is never treated as this one. Without
     it, the first wave is used. The header comes from _format_pick_wave, so
