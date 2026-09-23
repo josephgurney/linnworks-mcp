@@ -826,28 +826,66 @@ class TestChannelPushWarning:
 
         return side_effect
 
-    def test_refund_order_carries_warning_on_live_channel_push(self):
+    @staticmethod
+    def _order_on(source):
+        """#86 made the push proof PER CHANNEL, so a test must say which
+        channel it exercises rather than relying on the fixture's default."""
+        import copy
+        o = copy.deepcopy(PROCESSED_ORDER)
+        o["GeneralInfo"]["Source"] = source
+        return o
+
+    def test_no_warning_on_shopify_now_the_push_is_proven_there(self):
+        """#86: proven live on Shopify 23 Sep 2026 (order 611711). A caller
+        refunding a Shopify order is owed no caution, and carrying one anyway
+        would train people to ignore it on the channels that still need it."""
         import server
 
         with patch("server.call_linnworks",
-                   side_effect=self._live_refund_side_effect(PROCESSED_ORDER)):
+                   side_effect=self._live_refund_side_effect(self._order_on("Shopify"))):
+            result = server.refund_order(GUID, dry_run=False, push_to_channel=True)
+
+        assert "channel_push_warning" not in result
+
+    def test_warning_still_carried_on_amazon_and_ebay(self):
+        """The reason this is per-channel and not one flag. #86 proved SHOPIFY
+        only; Amazon and eBay are untested, and #45/#47 both ended with
+        Linnworks accepting a push that never reached the channel. Flipping a
+        single boolean on Shopify's evidence would silence the warning exactly
+        where a caller wrongly believing the customer was paid costs money."""
+        import server
+
+        for source in ("Amazon", "eBay"):
+            with patch("server.call_linnworks",
+                       side_effect=self._live_refund_side_effect(self._order_on(source))):
+                result = server.refund_order(GUID, dry_run=False, push_to_channel=True)
+            assert "channel_push_warning" in result, source
+            w = result["channel_push_warning"]
+            assert "NEVER been tested on AMAZON or EBAY" in w, source
+            assert "not evidence the customer has been paid" in w.lower(), source
+
+    def test_an_unknown_channel_is_treated_as_unproven(self):
+        """The safe direction. A source we have no record for must not inherit
+        Shopify's proof by silence."""
+        import server
+
+        with patch("server.call_linnworks",
+                   side_effect=self._live_refund_side_effect(self._order_on("Etsy"))):
             result = server.refund_order(GUID, dry_run=False, push_to_channel=True)
 
         assert "channel_push_warning" in result
-        assert "never been shown to actually reach a channel" in result["channel_push_warning"]
-        assert "not evidence the customer has been paid" in result["channel_push_warning"].lower()
 
-    def test_refund_order_lines_carries_warning_on_live_channel_push(self):
+    def test_refund_order_lines_carries_warning_on_an_unproven_channel(self):
         import server
 
         with patch("server.call_linnworks",
-                   side_effect=self._live_refund_side_effect(PROCESSED_ORDER)):
+                   side_effect=self._live_refund_side_effect(self._order_on("Amazon"))):
             result = server.refund_order_lines(
                 GUID, lines=[{"row_id": ROW_ID_1}], dry_run=False, push_to_channel=True,
             )
 
         assert "channel_push_warning" in result
-        assert "never been shown to actually reach a channel" in result["channel_push_warning"]
+        assert "NEVER been tested on AMAZON or EBAY" in result["channel_push_warning"]
 
     def test_no_warning_when_push_to_channel_is_false(self):
         """No channel push was attempted, so no push warning is owed."""
@@ -869,7 +907,7 @@ class TestChannelPushWarning:
         custom_text = "CUSTOM-WARNING-MARKER-6f3a9c"
         with patch("server.REFUND_CHANNEL_PUSH_WARNING", custom_text), \
              patch("server.call_linnworks",
-                   side_effect=self._live_refund_side_effect(PROCESSED_ORDER)):
+                   side_effect=self._live_refund_side_effect(self._order_on("Amazon"))):
             r1 = server.refund_order(GUID, dry_run=False, push_to_channel=True)
             r2 = server.refund_order_lines(
                 GUID, lines=[{"row_id": ROW_ID_1}], dry_run=False, push_to_channel=True,
@@ -878,28 +916,44 @@ class TestChannelPushWarning:
         assert r1["channel_push_warning"] == custom_text
         assert r2["channel_push_warning"] == custom_text
 
-    def test_flipping_the_single_proven_flag_removes_the_warning_from_both(self):
-        """The other half of AC4 -- the PROVEN flag is also derived from one
-        place. Flipping it removes the warning from both tools at once."""
+    def test_marking_a_channel_proven_removes_the_warning_for_that_channel_only(self):
+        """The successor to the old single-flag test, which patched
+        REFUND_CHANNEL_PUSH_PROVEN. That constant is now DERIVED and no longer
+        consulted, so patching it would pass while proving nothing. The single
+        source of truth is the per-channel registry, so drive that -- and
+        assert the other channels are UNAFFECTED, which is the whole point."""
         import server
 
-        with patch("server.REFUND_CHANNEL_PUSH_PROVEN", True), \
+        proven_amazon = {**server.REFUND_PUSH_CHANNELS,
+                         "AMAZON": {"state": "proven", "evidence": "test"}}
+        with patch.dict(server.REFUND_PUSH_CHANNELS, proven_amazon, clear=True), \
              patch("server.call_linnworks",
-                   side_effect=self._live_refund_side_effect(PROCESSED_ORDER)):
-            r1 = server.refund_order(GUID, dry_run=False, push_to_channel=True)
-            r2 = server.refund_order_lines(
-                GUID, lines=[{"row_id": ROW_ID_1}], dry_run=False, push_to_channel=True,
-            )
+                   side_effect=self._live_refund_side_effect(self._order_on("Amazon"))):
+            amazon = server.refund_order(GUID, dry_run=False, push_to_channel=True)
+        assert "channel_push_warning" not in amazon
 
-        assert "channel_push_warning" not in r1
-        assert "channel_push_warning" not in r2
+        # eBay must still be warned: proving one channel proves only that one.
+        with patch.dict(server.REFUND_PUSH_CHANNELS, proven_amazon, clear=True), \
+             patch("server.call_linnworks",
+                   side_effect=self._live_refund_side_effect(self._order_on("eBay"))):
+            ebay = server.refund_order(GUID, dry_run=False, push_to_channel=True)
+        assert "channel_push_warning" in ebay
+
+    def test_the_derived_proven_flag_requires_every_channel(self):
+        """REFUND_CHANNEL_PUSH_PROVEN is kept as a name but derived, so it can
+        never quietly claim more than has been shown. Today Shopify is proven
+        and the other two are not, so it must read False."""
+        import server
+
+        assert server.REFUND_PUSH_CHANNELS["SHOPIFY"]["state"] == "proven"
+        assert server.REFUND_CHANNEL_PUSH_PROVEN is False
+        assert server.REFUND_PUSH_CHANNELS["SHOPIFY"]["evidence"]
+        assert "611711" in server.REFUND_PUSH_CHANNELS["SHOPIFY"]["evidence"]
 
 
 # ── actioned keeps its meaning; a new key flags the True+Errors contradiction
 # (AC9) ───────────────────────────────────────────────────────────────────────
-
 class TestActionedWithErrorsContradiction:
-
     ACTION_REFUND_TRUE_WITH_ERRORS = {
         "SuccessfullyActioned": True,
         "RefundHeaderId": 42,
@@ -908,6 +962,7 @@ class TestActionedWithErrorsContradiction:
         "CannotRefundReason": "None",
         "Errors": [{"Error": "Channel push partially failed"}],
     }
+
 
     def _side_effect(self, order):
         def side_effect(path, payload, **kwargs):

@@ -289,32 +289,53 @@ def test_refund_rows_no_longer_claim_spec_based_not_live_tested():
             )
 
 
-def test_refund_rows_agree_with_the_code_on_the_channel_push_proof_flag():
-    """Fails the moment REFUND_CHANNEL_PUSH_PROVEN is flipped without the
-    docs being updated to match, or vice versa -- the same guard this file
-    already applies to GLT_CHANNELS' Amazon/TikTok revise claims."""
-    proven = server.REFUND_CHANNEL_PUSH_PROVEN
+def test_refund_rows_agree_with_the_code_per_channel_on_the_push_proof():
+    """Rewritten by #86. The proof is PER CHANNEL now, so a single
+    proven/unproven assertion can no longer express it: Shopify is proven and
+    Amazon/eBay are not, and a row that states only one half misleads.
+
+    The old version keyed off REFUND_CHANNEL_PUSH_PROVEN. That constant is now
+    DERIVED (True only when every channel is proven) and would keep this guard
+    green while the docs said 'never been shown to reach a channel' -- which is
+    exactly the drift it exists to catch.
+    """
+    assert server.REFUND_PUSH_CHANNELS["SHOPIFY"]["state"] == "proven"
+    assert server.REFUND_PUSH_CHANNELS["AMAZON"]["state"] == "never_attempted"
+    assert server.REFUND_PUSH_CHANNELS["EBAY"]["state"] == "never_attempted"
+
     for tool_name in ("refund_order", "refund_order_lines"):
         for doc_name, row in (
             ("README.md", _readme_row(tool_name)),
             ("CLAUDE.md", _claude_md_tools_table_row(tool_name)),
         ):
-            assert "ActionRefund" in row, (
-                f"{doc_name}'s {tool_name} row must name ActionRefund"
-            )
-            unproven_claim = (
-                "not proven" in row.lower() or "never been shown" in row.lower()
-            )
-            if proven:
-                assert not unproven_claim, (
-                    f"{doc_name}'s {tool_name} row still claims the channel "
-                    "push is unproven, but REFUND_CHANNEL_PUSH_PROVEN is now True"
-                )
-            else:
-                assert unproven_claim, (
-                    f"{doc_name}'s {tool_name} row does not state the channel "
-                    "push is unproven, but REFUND_CHANNEL_PUSH_PROVEN is False"
-                )
+            where = f"{doc_name}'s {tool_name} row"
+            assert "ActionRefund" in row, f"{where} must name ActionRefund"
+            # The blanket denial is now false and must be gone.
+            assert "never been shown to actually reach a channel" not in row.lower(), (
+                f"{where} still says the push has never reached a channel, but "
+                "#86 proved it on Shopify")
+            # Both halves must be stated: the proof AND its limit.
+            assert "611711" in row, (
+                f"{where} does not cite the order the Shopify push was proven on")
+            assert "Amazon" in row and "eBay" in row, (
+                f"{where} does not record that Amazon and eBay are still untested")
+
+
+def test_refund_rows_do_not_generalise_the_shopify_proof():
+    """#45 and #47 both ended with Linnworks accepting a push that never
+    reached the channel. A row implying Shopify's result carries over to them
+    is the single most costly thing these docs could say."""
+    for tool_name in ("refund_order", "refund_order_lines"):
+        for doc_name, row in (
+            ("README.md", _readme_row(tool_name)),
+            ("CLAUDE.md", _claude_md_tools_table_row(tool_name)),
+        ):
+            low = row.lower()
+            for overclaim in ("proven on all channels", "proven for every channel",
+                              "actionrefund is proven**", "push is proven."):
+                assert overclaim not in low, (
+                    f"{doc_name}'s {tool_name} row over-generalises the "
+                    f"Shopify-only proof: {overclaim!r}")
 
 
 def test_get_refund_headers_row_documents_the_readback_use():

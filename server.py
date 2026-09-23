@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.58.0"
+__version__ = "1.59.0"
 
 import json
 import os
@@ -3022,25 +3022,74 @@ def find_orders_by_reference(
 # created DIRECT order has no channel to push to), only by refunding a real
 # Shopify/Amazon/eBay order and watching the channel's own admin. Flip this to
 # True only once that has genuinely been done and recorded on the issue.
-REFUND_CHANNEL_PUSH_PROVEN = False
+# PER CHANNEL, not a single flag. Issue #86 proved the push reaches SHOPIFY
+# (23 Sep 2026); Amazon and eBay remain completely untested -- and the two
+# prior channel-push investigations on this tenant, #45 (Amazon GLT revise)
+# and #47 (eBay), BOTH ended with Linnworks accepting a push that never
+# reached the storefront. So a boolean here would be actively dangerous:
+# flipping it on Shopify's evidence would silence the warning for the two
+# channels most likely to swallow a refund, and those are the ones where a
+# caller wrongly believing the customer has been paid costs real money.
+#
+# Same vocabulary and the same reasoning as GLT_CHANNELS/EBAY_CHANNELS
+# (PUSH_OBSERVED_STATES), applied one layer over.
+REFUND_PUSH_CHANNELS: dict[str, dict] = {
+    "SHOPIFY": {
+        "state": "proven",
+        "evidence": "live 2026-09-23, order 611711 / Shopify #11182602 (issue "
+                    "#86): ActionRefund returned PROCESSED and the refund "
+                    "appeared on Shopify as Refund 984554373366 for the full "
+                    "GBP 1.90, both lines, with the Linnworks note propagated "
+                    "verbatim -- and the Linnworks refund header rewrote its "
+                    "ExternalReference to that same Shopify refund id, which "
+                    "ties the two records together",
+    },
+    "AMAZON": {"state": "never_attempted", "evidence": None},
+    "EBAY": {"state": "never_attempted", "evidence": None},
+}
+
+# Kept as a name because callers and tests read it, but DERIVED: it is only
+# True when every channel above is proven, so it can never quietly claim more
+# than has been shown. Today that is False, and correctly so.
+REFUND_CHANNEL_PUSH_PROVEN = all(
+    c["state"] == "proven" for c in REFUND_PUSH_CHANNELS.values())
+
 REFUND_CHANNEL_PUSH_WARNING = (
     "⚠️ Pushing this refund to the sales channel (ReturnsRefunds/ActionRefund) "
-    "has never been shown to actually reach a channel on this tenant. "
-    "Linnworks accepting the call (a 2xx response, or even "
-    "SuccessfullyActioned=True) is NOT evidence the customer has been paid, "
-    "or that any money has left the store. The only way to know is to check "
-    "that channel's own admin (Shopify/Amazon/eBay), not Linnworks."
+    "is PROVEN to reach SHOPIFY (live 2026-09-23, order 611711: the refund "
+    "appeared on the storefront for the full amount, both lines, and the "
+    "Linnworks header carries the Shopify refund id). It has NEVER been tested "
+    "on AMAZON or EBAY, and do not assume it carries over: the two previous "
+    "channel-push investigations on this tenant both ended with Linnworks "
+    "accepting a push that never reached the channel. On any channel other "
+    "than Shopify, Linnworks accepting the call (a 2xx, or even "
+    "SuccessfullyActioned=True) is NOT evidence the customer has been paid. "
+    "Check that channel's own admin, not Linnworks. Proven on Shopify only for "
+    "a FULL refund via refund_order; a partial refund via refund_order_lines, "
+    "and the postage component of any refund, are still untested."
 )
 
 
-def _refund_channel_push_warning() -> Optional[str]:
+def _refund_push_state(order_source: Optional[str]) -> str:
+    """The recorded state for an order's channel. An unrecognised or missing
+    source is treated as unproven -- the safe direction, since the whole point
+    is to avoid telling a caller the money moved when nobody has checked."""
+    key = (order_source or "").strip().upper()
+    entry = REFUND_PUSH_CHANNELS.get(key)
+    return entry["state"] if entry else "never_attempted"
+
+
+def _refund_channel_push_warning(order_source: Optional[str] = None) -> Optional[str]:
     """
-    The one place every refund tool derives the channel-push-unproven
-    warning from -- never retype REFUND_CHANNEL_PUSH_WARNING directly.
-    Returns None once REFUND_CHANNEL_PUSH_PROVEN is flipped True, so a caller
-    can always `if warning:` without a separate proven check.
+    The one place every refund tool derives the channel-push warning from --
+    never retype REFUND_CHANNEL_PUSH_WARNING directly.
+
+    Returns None only for a channel whose push is PROVEN, so a caller can
+    still write `if warning:`. Called without a source it stays cautious and
+    returns the warning, because "which channel is this?" is exactly the
+    question that decides whether the caution applies.
     """
-    if REFUND_CHANNEL_PUSH_PROVEN:
+    if _refund_push_state(order_source) == "proven":
         return None
     return REFUND_CHANNEL_PUSH_WARNING
 
@@ -5602,7 +5651,8 @@ def refund_order(
                 "reconciled this itself — do not treat SuccessfullyActioned "
                 "alone as proof the refund reached the channel."
             )
-        push_warning = _refund_channel_push_warning()
+        push_warning = _refund_channel_push_warning(
+            (raw.get("GeneralInfo") or {}).get("Source"))
         if push_warning:
             result["channel_push_warning"] = push_warning
 
@@ -5897,7 +5947,8 @@ def refund_order_lines(
                 "reconciled this itself — do not treat SuccessfullyActioned "
                 "alone as proof the refund reached the channel."
             )
-        push_warning = _refund_channel_push_warning()
+        push_warning = _refund_channel_push_warning(
+            (raw.get("GeneralInfo") or {}).get("Source"))
         if push_warning:
             result["channel_push_warning"] = push_warning
 
