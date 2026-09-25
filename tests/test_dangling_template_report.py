@@ -14,6 +14,8 @@ So there is deliberately no `healthy` verdict. The vocabulary is
 `dangling_proven` vs `not_proven_dangling`, and the second one means
 "unproven", never "fine".
 """
+from unittest.mock import patch
+
 import pytest
 
 import server
@@ -60,3 +62,85 @@ def test_template_row_unwraps_the_type_value_envelope():
         "status": "Not deleted",
         "verdict": "dangling_proven",
     }
+
+
+def test_template_row_handles_missing_info_key():
+    # Defensive branch: `Info` absent entirely must not raise, and every
+    # unwrapped field must come back None rather than crashing on `.get`.
+    t = {"Id": 1, "ConfiguratorId": 2}
+    row = server._template_row(t)
+    assert row == {
+        "template_id": 1,
+        "configurator_id": 2,
+        "active_listing_id": None,
+        "status": None,
+        "verdict": "not_proven_dangling",
+    }
+
+
+def test_template_row_handles_non_dict_info():
+    # Defensive branch: `Info` present but not a dict (e.g. malformed/partial
+    # API response) must degrade the same way as it being absent.
+    t = {"Id": 1, "ConfiguratorId": 2, "Info": "not-a-dict"}
+    row = server._template_row(t)
+    assert row == {
+        "template_id": 1,
+        "configurator_id": 2,
+        "active_listing_id": None,
+        "status": None,
+        "verdict": "not_proven_dangling",
+    }
+
+
+# ---------- _open_item_templates ----------
+
+_FAKE_CHANNEL = {"channel_type": "GenericStore", "channel_name": "SHOPIFY"}
+
+
+def test_open_item_templates_ignores_total_entries_trap():
+    # The single highest-risk rule in this task: TotalEntries echoes the input
+    # count and will claim a template exists where none does. A response that
+    # carries both TemplatesInfo and a misleading, non-matching TotalEntries
+    # must yield ONLY TemplatesInfo.
+    fake_response = {
+        "TemplatesInfo": [{"Id": 1}, {"Id": 2}],
+        "TotalEntries": 99,
+    }
+    with patch.object(server, "call_linnworks", return_value=fake_response):
+        result = server._open_item_templates(_FAKE_CHANNEL, 42, "abc-123")
+    assert result == [{"Id": 1}, {"Id": 2}]
+
+
+@pytest.mark.parametrize("fake_response", [
+    None,
+    [],
+    "",
+    0,
+    False,
+    ["not", "a", "dict"],
+    {},                          # dict but no TemplatesInfo key at all
+    {"TemplatesInfo": None},     # key present but null
+])
+def test_open_item_templates_degrades_to_empty_list_on_bad_response(fake_response):
+    with patch.object(server, "call_linnworks", return_value=fake_response):
+        result = server._open_item_templates(_FAKE_CHANNEL, 42, "abc-123")
+    assert result == []
+
+
+def test_open_item_templates_sends_correct_request_payload():
+    with patch.object(
+        server, "call_linnworks", return_value={"TemplatesInfo": []}
+    ) as mock_call:
+        server._open_item_templates(_FAKE_CHANNEL, 42, "abc-123")
+
+    assert mock_call.call_count == 1
+    method_path, payload = mock_call.call_args[0]
+    assert method_path == "GenericListings/OpenTemplatesByInventory"
+
+    request = payload["request"]
+    assert request["ChannelType"] == "GenericStore"
+    assert request["ChannelName"] == "SHOPIFY"
+
+    params = request["Parameters"]
+    assert params["ChannelId"] == 42
+    assert params["InventoryItemIds"] == ["abc-123"]
