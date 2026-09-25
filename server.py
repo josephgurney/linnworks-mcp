@@ -16537,11 +16537,30 @@ def _dangling_verdict(status) -> str:
 
 
 def _template_row(t: dict) -> dict:
-    """Flatten one raw TemplatesInfo entry into our reporting shape."""
+    """Flatten one raw TemplatesInfo entry into our reporting shape.
+
+    `Id` is coerced to int when possible, so every downstream comparison
+    lands on stable ground. Linnworks does not consistently type it, and
+    before this coercion one call site compared it via `int(...) ==` (gate 1
+    in delete_dangling_glt_template, hardened round 1) while another compared
+    it raw (`siblings = [... if r["template_id"] != wanted]`, and the Task 4
+    outcome classifier's `wanted not in {...}` membership test) — so a string
+    `Id` could pass gate 1 correctly, then fail to match `wanted` (an int)
+    anywhere downstream: the target itself would score as its own sibling,
+    and a delete that landed would read as `delete_refused_by_linnworks`
+    (#115 Task 4 round 1, C2). A non-numeric or missing `Id` is left as-is —
+    `None` stays `None` rather than becoming a coerced sentinel that could
+    accidentally match another malformed row.
+    """
     info = t.get("Info") if isinstance(t.get("Info"), dict) else {}
     status = _glt_field(info, "Status")
+    raw_id = t.get("Id")
+    try:
+        template_id = int(raw_id)
+    except (TypeError, ValueError):
+        template_id = raw_id
     return {
-        "template_id":       t.get("Id"),
+        "template_id":       template_id,
         "configurator_id":   t.get("ConfiguratorId"),
         "active_listing_id": _glt_field(info, "ActiveListingId"),
         "status":            status,
@@ -16771,11 +16790,53 @@ def _rows_kept_across(before_by_id: dict, after_by_id: dict) -> bool:
     only the named SKU's own `sid` produced (#115 Task 4 review, deferred
     item A): the parent's table could be emptied while `sid`'s own (already
     zero, or merely unrelated) count reported no change.
+
+    ⚠️  The caller MUST feed this UNFILTERED, item-wide row counts — not
+    counts filtered down to the one store this call targets (#115 Task 4
+    round 1, C3). Filtering both sides identically hides an item-wide wipe
+    that reaches every OTHER channel/sub_source the item is mapped to
+    (issue #36's documented failure mode is item-wide, not per-store) behind
+    a before-count of 0 *on this store*, which is then permanently exempt.
+    This is also what makes the parent-id snapshot (deferred item A) genuinely
+    load-bearing rather than defence in depth: gate 3 already forces the
+    parent's on-STORE rows to read as not-live before any write is allowed,
+    so a store-filtered parent count can never move — only an unfiltered one
+    can still catch a wipe of the parent's rows on a channel gate 3 made no
+    promise about.
     """
     return all(
         before_by_id.get(i, 0) == 0 or after_by_id.get(i, 0) >= before_by_id.get(i, 0)
         for i in before_by_id
     )
+
+
+def _reference_ids_kept_across(before_refs_by_id: dict, after_refs_by_id: dict) -> bool:
+    """True unless some snapshotted stock item's channel-reference-id SET
+    lost a member that was there before.
+
+    Stronger than counting (#115 Task 4 round 1, M2): a row that is removed
+    and a DIFFERENT row recreated in its place holds the COUNT steady while
+    still being a real loss of the original mapping — `_rows_kept_across`
+    alone cannot see that. A new reference id appearing is not itself a
+    problem (rows are additive-safe); only a reference id disappearing is.
+    """
+    return all(
+        before_refs_by_id.get(i, set()) <= after_refs_by_id.get(i, set())
+        for i in before_refs_by_id
+    )
+
+
+def _append_warning(existing: str | None, addition: str) -> str:
+    """Add a warning line without discarding one already on the response.
+
+    Every post-write early return in delete_dangling_glt_template builds its
+    dict fresh via `{**out, ...}`; a bare `"warning": text` there silently
+    replaces `out["warning"]` if gate 2's `allow_unproven_delete` override
+    warning was already sitting on it. That is the one combination — override
+    plus an inconclusive write — where losing "this template was never proven
+    dead" matters most (#115 Task 4 round 1, M3).
+    """
+    return f"{existing}\n\n{addition}" if existing else addition
 
 
 @mcp.tool()
@@ -16821,6 +16882,23 @@ def delete_dangling_glt_template(
                                        unverifiable — see `unknown_siblings`)
                                        members
       no_sibling_use_unpublish      — only one template; use unpublish_channel_listing
+
+    A further safety check, evaluated after the four gates above (not
+    renumbered into them — it is evidentiary, not a scope/safety gate on the
+    target itself): before_snapshot_incomplete — a stock item this delete
+    could affect (the named SKU, or the variation parent the template lives
+    on) was OMITTED from the before-write channel-SKU read entirely, not
+    just returned empty. An omission is indistinguishable from "confirmed
+    zero rows" by count alone, and a confirmed zero is exempt from the
+    mapping-lost check — so an omission here would silently disable the
+    very check this tool exists to run. Refuses before any write is sent.
+
+    On a live run `out["outcome"]` is one of: orphan_removed_siblings_intact,
+    orphan_removed_sibling_mapping_lost, orphan_removed_sibling_template_lost
+    (a sibling TEMPLATE — not just its rows — is gone from the read-back;
+    worse than mapping_lost and reported separately), delete_refused_by_linnworks,
+    unconfirmed (the write's or the read-back's outcome could not be
+    confirmed — treat as "may have happened").
 
     Args:
         sku:                   ONE SKU. No lists — the signature is the safety limit.
@@ -17019,17 +17097,48 @@ def delete_dangling_glt_template(
     # snapshotting only `sid` leaves the tool blind to a wipe on the
     # PARENT's table on that path (#115 Task 4 review, deferred item A).
     # Snapshot every distinct id and compare each one after the write.
+    #
+    # The counts and reference-id sets used for the pass/fail decision are
+    # UNFILTERED — every channel/sub_source the item has, not just this one
+    # (#115 Task 4 round 1, C3). #36's documented failure mode is the item's
+    # WHOLE channel-SKU table emptying, not just this store's rows; filtering
+    # both before and after identically would hide a wipe on every OTHER
+    # channel behind "0 rows on THIS store", which is then permanently
+    # exempt from the loss check. The filtered, this-store rows are kept
+    # separately (`before_rows`/`before["channel_sku_row_count"]`) purely for
+    # the human-readable evidence — they no longer drive any decision.
     snapshot_ids = sorted({sid, template_sid})
     try:
         before_snap = _fetch_channel_skus_for_ids(snapshot_ids)
-        before_by_id = {i: len(_rows_on_store(before_snap.get(i.lower(), [])))
-                        for i in snapshot_ids}
-        before_rows = [_format_channel_sku_row(r) for i in snapshot_ids
-                       for r in _rows_on_store(before_snap.get(i.lower(), []))]
     except RateLimitError as exc:
         return {**base, "blocked_reason": "rate_limited", "complete": False, "error": str(exc)}
     except RuntimeError as exc:
         return {**base, "blocked_reason": "channel_read_failed", "error": str(exc)}
+
+    # An id MISSING from the response is not the same as a CONFIRMED zero
+    # rows, and the two must not be conflated (#115 Task 4 round 1, I2 — the
+    # same distinction gate 3 already makes via `unknown_siblings`). A count
+    # of 0 is exempt from the loss check below, so an omission silently
+    # disables the check for that id. Refuse before any write is sent rather
+    # than guess — this is the one direction (before-snapshot, not after)
+    # where "couldn't read it" must never be read as "nothing to lose".
+    missing_before = [i for i in snapshot_ids if i.lower() not in before_snap]
+    if missing_before:
+        return {**base, "blocked_reason": "before_snapshot_incomplete",
+                "missing_stock_item_ids": missing_before,
+                "error": (f"the channel-SKU batch read did not return an entry for "
+                          f"{missing_before} before any write — an omission cannot be told "
+                          "apart from a confirmed zero, and a confirmed zero is exempt from "
+                          "the mapping-lost check. Refusing rather than write blind.")}
+
+    before_by_id = {i: len(before_snap.get(i.lower(), [])) for i in snapshot_ids}
+    before_ref_ids_by_id = {
+        i: {r.get("ChannelReferenceId") for r in before_snap.get(i.lower(), [])
+            if r.get("ChannelReferenceId")}
+        for i in snapshot_ids
+    }
+    before_rows = [_format_channel_sku_row(r) for i in snapshot_ids
+                   for r in _rows_on_store(before_snap.get(i.lower(), []))]
 
     before = {
         "channel_sku_row_count": len(before_rows),
@@ -17073,35 +17182,73 @@ def delete_dangling_glt_template(
             }},
         )
         out["processed"] = True
-    except (RateLimitError, RuntimeError) as exc:
+    except RateLimitError as exc:
+        # The REQUEST never got past Linnworks's rate limiter — 429s all the
+        # way through the retry ladder — so nothing was ever handed to the
+        # code that would apply a delete. Safely `processed: False`, unlike
+        # the branch below (#115 Task 4 round 1, I4).
         return {**out, "success": False, "processed": False, "outcome": "unconfirmed",
                 "settles": "neither", "complete": False,
                 "error": f"ProcessTemplates (Delete) failed: {exc}",
-                "warning": ("the delete may or may not have been sent — re-read the item's "
-                            "templates before trying again.")}
+                "warning": _append_warning(
+                    out.get("warning"),
+                    "the request was rate-limited and never reached Linnworks's processing "
+                    "— not sent, safe to retry once the quota window clears.")}
+    except (RuntimeError, OSError) as exc:
+        # RuntimeError here means `call_linnworks` received a non-2xx
+        # response — the request DEFINITIVELY reached Linnworks and may have
+        # applied server-side before it answered with an error. OSError
+        # covers a transport failure (timeout/connection drop from
+        # `requests`, which subclasses OSError) — the canonical "the POST
+        # went out and we never found out what happened" case, previously
+        # uncaught here and left to escape as a raw traceback with nothing
+        # recorded (#115 Task 4 round 1, I3). Neither case is the benign
+        # "not sent" of RateLimitError, so `processed` is "unknown", not
+        # False (I4) — False would flatly contradict the warning below.
+        return {**out, "success": False, "processed": "unknown", "outcome": "unconfirmed",
+                "settles": "neither", "complete": False,
+                "error": f"ProcessTemplates (Delete) failed: {exc}",
+                "warning": _append_warning(
+                    out.get("warning"),
+                    "THE REQUEST MAY HAVE REACHED LINNWORKS AND ALREADY APPLIED — this was "
+                    "either a non-2xx response (the request WAS received and evaluated) or a "
+                    "transport failure (timeout/connection drop) AFTER the POST was sent. Do "
+                    "NOT assume nothing happened. Re-open this item's templates and read its "
+                    "channel-SKU rows by hand before doing anything else, including retrying.")}
 
     # ── Read-back: the whole point of this tool ──────────────────────────────
     # Mirrors the before-snapshot: every distinct id from `snapshot_ids` is
     # re-read, not just `sid` — see the before-snapshot comment above and
-    # deferred item A.
+    # deferred item A — and the counts/reference-ids used for the decision
+    # are UNFILTERED, matching the before-snapshot (C3). Unlike the before
+    # side, an id OMITTED from this response is left to read as a count of 0
+    # rather than refused: that is the safe direction of the asymmetry the
+    # I2 finding names — an after-side omission reads as a loss (a false
+    # alarm), never as a false all-clear.
     try:
         after_snap = _fetch_channel_skus_for_ids(snapshot_ids)
-        after_by_id = {i: len(_rows_on_store(after_snap.get(i.lower(), [])))
-                       for i in snapshot_ids}
+        after_by_id = {i: len(after_snap.get(i.lower(), [])) for i in snapshot_ids}
+        after_ref_ids_by_id = {
+            i: {r.get("ChannelReferenceId") for r in after_snap.get(i.lower(), [])
+                if r.get("ChannelReferenceId")}
+            for i in snapshot_ids
+        }
         after_rows_raw = [r for i in snapshot_ids
                           for r in _rows_on_store(after_snap.get(i.lower(), []))]
         after_templates = [_template_row(t) for t in
                            _open_item_templates(ch, channel_id, template_sid)]
-    except (RateLimitError, RuntimeError) as exc:
+    except (RateLimitError, RuntimeError, OSError) as exc:
         # The write HAS been sent. Saying "unchanged" or "failed" here would
         # invite a re-run of a delete that may well have succeeded (the #88
         # precedent in set_order_status).
         return {**out, "success": False, "outcome": "unconfirmed", "settles": "neither",
                 "complete": False, "error": str(exc),
-                "warning": ("THE DELETE WAS ALREADY SENT and may have succeeded — the "
-                            "read-back could not complete. Do NOT re-run on the assumption "
-                            "it failed. Re-open this item's templates and read its "
-                            "channel-SKU rows by hand before doing anything else.")}
+                "warning": _append_warning(
+                    out.get("warning"),
+                    "THE DELETE WAS ALREADY SENT and may have succeeded — the "
+                    "read-back could not complete. Do NOT re-run on the assumption "
+                    "it failed. Re-open this item's templates and read its "
+                    "channel-SKU rows by hand before doing anything else.")}
 
     after_rows = [_format_channel_sku_row(r) for r in after_rows_raw]
     out["after"] = {
@@ -17110,56 +17257,133 @@ def delete_dangling_glt_template(
         "templates": {r["template_id"]: r["status"] for r in after_templates},
         "by_stock_item_id": after_by_id,
     }
+    # The read-back completed — every outcome from here has full evidence,
+    # even a refusal (#115 Task 4 round 1, M4; find_dangling_glt_templates
+    # sets `complete` the same unconditional way once its own read succeeds).
+    out["complete"] = True
 
-    target_gone = wanted not in out["after"]["templates"]
-    siblings_present = [r["template_id"] for r in siblings
-                        if r["template_id"] in out["after"]["templates"]]
-    # rows_kept now considers EVERY snapshotted stock item, not just `sid` —
-    # see `_rows_kept_across` and deferred item A. Below, `before_count` /
-    # `len(after_rows)` stay as the combined totals for the human-readable
-    # message; they no longer drive the pass/fail decision.
-    before_count = before["channel_sku_row_count"]
-    rows_kept = _rows_kept_across(before_by_id, after_by_id)
+    after_templates_by_id = out["after"]["templates"]
+    target_gone = wanted not in after_templates_by_id
+    # Both compared as the SAME `template_id` values `_template_row` now
+    # produces (int-coerced where possible) — see the C2 fix on
+    # `_template_row`. Before that fix this comparison, and the `siblings`
+    # list itself, were a silent trap: a string `Id` could clear gate 1 (int-
+    # normalised there) and still fail to match `wanted` here, or count the
+    # TARGET as its own sibling.
+    siblings_before_ids = [r["template_id"] for r in siblings]
+    siblings_present = [tid for tid in siblings_before_ids if tid in after_templates_by_id]
+    # A sibling TEMPLATE missing from the read-back entirely — not merely a
+    # row-count question — is checked before rows_kept and reported as its
+    # own, louder outcome (#115 Task 4 round 1, C1). Previously
+    # `siblings_present` was computed and then never read by any branch: the
+    # final `else` fired on `target_gone and rows_kept` alone, so a run that
+    # deleted the orphan AND wiped the sibling's template — or one where the
+    # read-back simply came back empty for any reason — scored as the ideal
+    # outcome with a success message naming an empty sibling list as "still
+    # present". This also covers the "empty TemplatesInfo read-back" case
+    # named in C1 without a special case: an empty `after_templates_by_id`
+    # makes every sibling "lost" here, same as this branch handling any
+    # other cause.
+    siblings_lost = [tid for tid in siblings_before_ids if tid not in after_templates_by_id]
+    out["siblings_still_present"] = siblings_present
+
+    # rows_kept and the reference-id check both run on the UNFILTERED,
+    # item-wide counts (C3) — see `_rows_kept_across` and
+    # `_reference_ids_kept_across` for why, and the docstring note above
+    # about the parent snapshot only becoming load-bearing here.
+    rows_kept = (_rows_kept_across(before_by_id, after_by_id)
+                and _reference_ids_kept_across(before_ref_ids_by_id, after_ref_ids_by_id))
     live_siblings_present = any(r["verdict"] == "not_proven_dangling" for r in siblings)
     out["live_siblings_present"] = live_siblings_present
-    out["siblings_still_present"] = siblings_present
+
+    # A before-count of 0 on EVERY snapshotted id means this run cannot
+    # demonstrate anything about question B at all — there were no rows to
+    # show surviving (#115 Task 4 round 1, I1). Applied only to the plain
+    # "intact" branch below: a lost sibling template or lost rows are
+    # unambiguous bad evidence regardless of the before-count, and must not
+    # be softened by it.
+    before_all_zero = all(v == 0 for v in before_by_id.values())
+    # Rows APPEARING after a delete is anomalous, not something the count
+    # check alone should let pass in silence (#115 Task 4 round 1, M1) — it
+    # does not change `rows_kept` (a rise is, by definition, not a loss),
+    # but it is always worth a human's attention.
+    grown_ids = [i for i in before_by_id if after_by_id.get(i, 0) > before_by_id.get(i, 0)]
+
+    notes: list[str] = []
 
     if not target_gone:
         out.update({
             "success": False, "outcome": "delete_refused_by_linnworks", "settles": "A only",
             "message": (
                 f"Template {wanted} is STILL PRESENT, reading "
-                f"{out['after']['templates'].get(wanted)!r}. The delete did not land. This "
+                f"{after_templates_by_id.get(wanted)!r}. The delete did not land. This "
                 "answers question A (does Delete work on a dangling template) with NO, and "
                 "leaves question B (does it take the sibling's channel-SKU rows) untouched. "
                 "The GLT UI is the remediation route."),
         })
+    elif siblings_lost:
+        out.update({
+            "success": False, "outcome": "orphan_removed_sibling_template_lost",
+            "settles": "A and B",
+            "warning": _append_warning(out.get("warning"), (
+                f"⛔⛔ A SIBLING TEMPLATE IS GONE, not just its rows. Template {wanted} was "
+                f"deleted and sibling template id(s) {siblings_lost} are no longer present on "
+                f"this item at all — the read-back now shows {after_templates_by_id!r}. This "
+                "is worse than a lost channel-SKU mapping: the sibling's own LISTING TEMPLATE "
+                "may have just been removed by this delete. Treat the sibling as potentially "
+                "dead, check it on the channel immediately, and do NOT run this tool again "
+                "until this is understood.")),
+        })
     elif not rows_kept:
+        per_id = "; ".join(
+            f"{i}: {before_by_id.get(i, 0)} → {after_by_id.get(i, 0)}" for i in snapshot_ids)
         out.update({
             "success": False, "outcome": "orphan_removed_sibling_mapping_lost",
             "settles": "A and B",
-            "warning": (
+            # Quoted PER ID from by_stock_item_id, not the combined totals —
+            # on the variation path (or any run touching two ids) the
+            # combined before/after can hold steady while one id lost rows
+            # and another gained, which would let this message read as
+            # "went from 1 to 1" on the exact run it exists to flag
+            # (#115 Task 4 round 1, I5).
+            "warning": _append_warning(out.get("warning"), (
                 f"⛔ THE LIVE LISTING HAS lost its Linnworks mapping. Template {wanted} was "
-                f"deleted and the item's channel-SKU rows went from "
-                f"{before_count} to {len(after_rows)}. The sibling listing "
+                f"deleted and channel-SKU rows per stock item (item-wide, not filtered to "
+                f"this store) went from {per_id}. The sibling listing "
                 "is probably still up on the channel but no longer syncs stock or price, so "
                 "it can oversell with nothing flagging it. Restore the mapping via the "
-                "Linnworks UI and do NOT run this tool on any other SKU."),
+                "Linnworks UI and do NOT run this tool on any other SKU.")),
         })
     else:
+        settles = "A and B"
+        if before_all_zero:
+            settles = "A only"
+            notes.append(
+                "every snapshotted stock item had ZERO channel-SKU rows before the delete, "
+                "so this run demonstrates question A only (Delete lands on a dangling "
+                "template) — question B (does it also take the sibling's rows) is UNTESTABLE "
+                "on this SKU; rows that were never there cannot be shown to survive.")
         out.update({
-            "success": True, "outcome": "orphan_removed_siblings_intact", "settles": "A and B",
+            "success": True, "outcome": "orphan_removed_siblings_intact", "settles": settles,
             "message": (
                 f"Template {wanted} deleted; sibling template(s) {siblings_present} still "
-                f"present and the item's {len(after_rows)} channel-SKU row(s) intact. Verify "
-                "the sibling's product page on the channel, and check again after the next "
-                "stock sync that quantity still updates."),
+                f"present and the item's channel-SKU rows intact — checked item-wide, not "
+                f"just this store ({len(after_rows)} row(s) on this store specifically). "
+                "Verify the sibling's product page on the channel, and check again after "
+                "the next stock sync that quantity still updates."),
         })
 
     if not live_siblings_present:
-        out["note"] = (
+        notes.append(
             "no sibling on this item was proven live — every sibling template read as "
             "dangling too, so this run does not demonstrate that a LIVE listing survives.")
+    if grown_ids:
+        notes.append(
+            f"channel-SKU row count ROSE after the delete on stock item(s) {grown_ids} — "
+            "rows appearing after a delete is anomalous; the count/reference-id checks read "
+            "this as \"kept\", but it is worth a manual look.")
+    if notes:
+        out["note"] = "\n\n".join(notes)
     return out
 
 
