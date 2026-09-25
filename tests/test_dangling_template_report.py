@@ -270,3 +270,26 @@ def test_unknown_sku_lands_in_unresolved():
 
     assert out["unresolved"][0]["blocked_reason"] == "not_found"
     assert out["complete"] is False
+
+
+def test_rate_limit_in_variation_fallback_is_bucketed_not_raised():
+    """Fix round 1, finding 1. `_resolve_variation` can itself raise
+    RateLimitError (it calls call_linnworks_get up to several times); the
+    variation-child fallback's `except RuntimeError` does NOT catch it,
+    since RateLimitError does not subclass RuntimeError in this codebase.
+    Left uncaught, a 429 here would propagate out of the whole batch call
+    instead of bucketing just this SKU — the same failure mode the other
+    three call sites in this function already guard against."""
+    def _boom(sku, sid):
+        raise server.RateLimitError("429 throttled")
+
+    with patch.object(server, "_resolve_glt_target", _target), \
+         patch.object(server, "call_linnworks", lambda ep, p=None: {"StockItemId": SID, "ItemTitle": "T"}), \
+         patch.object(server, "_open_item_templates", lambda ch, cid, sid: []), \
+         patch.object(server, "_fetch_channel_skus_for_ids", lambda ids: {SID.lower(): []}), \
+         patch.object(server, "_resolve_variation", _boom):
+        out = server.find_dangling_glt_templates(["SKU-A"])
+
+    assert out["rate_limited"] and out["rate_limited"][0]["sku"] == "SKU-A"
+    assert out["items"] == []
+    assert out["complete"] is False

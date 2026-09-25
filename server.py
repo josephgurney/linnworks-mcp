@@ -16611,9 +16611,10 @@ def find_dangling_glt_templates(
         channel:    "Shopify" (default), "Amazon", "TikTok", Magento, Walmart.
 
     Returns:
-        items[] (per SKU: templates with verdicts, channel-SKU rows, sibling
-        summary, remediation), unresolved[], rate_limited[], the two counts,
-        items_examined, complete, and detector_note.
+        items[] (per SKU: templates with verdicts, channel-SKU rows,
+        template_source/parent_sku for a variation child, remediation),
+        unresolved[], rate_limited[], the two counts, items_examined,
+        complete, and detector_note.
     """
     target = _resolve_glt_target(channel, sub_source)
     if not target.get("ok"):
@@ -16679,6 +16680,9 @@ def find_dangling_glt_templates(
         if not raw_templates:
             try:
                 rel = _resolve_variation(sku, sid)
+            except RateLimitError as exc:
+                rate_limited.append({"sku": sku, "error": str(exc)})
+                continue
             except RuntimeError:
                 rel = {}
             if rel.get("role") == "child" and rel.get("parent_stock_item_id"):
