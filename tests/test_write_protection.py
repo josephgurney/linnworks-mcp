@@ -221,7 +221,15 @@ class TestWriteThresholds:
         assert inventory <= images, "Inventory threshold should be ≤ images threshold"
 
     def test_all_thresholds_are_positive_integers(self):
+        # delete_dangling_glt_template is the deliberate exception: 0 is not a
+        # typo. _write_guard proceeds unstaged when count <= threshold, and this
+        # tool's plan is always a single item — a threshold of 1 would let every
+        # live run through unstaged. 0 forces a staged manifest on EVERY run (#115).
+        exempt = {"delete_dangling_glt_template"}
         for op, val in server.WRITE_THRESHOLDS.items():
+            if op in exempt:
+                assert isinstance(val, int) and val == 0, f"{op}: exempt threshold must be exactly 0"
+                continue
             assert isinstance(val, int) and val > 0, f"{op}: threshold must be a positive int"
 
     def test_unpublish_channel_listing_is_destructive_tier(self):
