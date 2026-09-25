@@ -16703,8 +16703,10 @@ def find_dangling_glt_templates(
             except RateLimitError as exc:
                 rate_limited.append({"sku": sku, "error": str(exc)})
                 continue
-            except RuntimeError:
-                rel = {}
+            except RuntimeError as exc:
+                unresolved.append({"sku": sku, "blocked_reason": "channel_read_failed",
+                                   "error": f"variation lookup failed: {exc}"})
+                continue
             if rel.get("role") == "child" and rel.get("parent_stock_item_id"):
                 parent_sku = rel.get("parent_sku")
                 try:
@@ -16974,8 +16976,9 @@ def delete_dangling_glt_template(
             rel = _resolve_variation(sku, sid)
         except RateLimitError as exc:
             return {**base, "blocked_reason": "rate_limited", "complete": False, "error": str(exc)}
-        except RuntimeError:
-            rel = {}
+        except RuntimeError as exc:
+            return {**base, "blocked_reason": "channel_read_failed",
+                    "error": f"variation lookup failed: {exc}"}
         if rel.get("role") == "child" and rel.get("parent_stock_item_id"):
             group, via_parent = rel, True
             template_sid = rel["parent_stock_item_id"]

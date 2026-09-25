@@ -169,7 +169,12 @@ def test_a_non_numeric_sibling_id_is_a_non_match_not_a_crash():
     def _templates_with_a_non_numeric_sibling(ch, cid, sid):
         malformed = {"Id": "not-a-number", "ConfiguratorId": 1,
                      "Info": {"ActiveListingId": {"Value": "x"}, "Status": {"Value": "Listed"}}}
-        return [_tpl(ORPHAN, "Not deleted"), malformed]
+        # Malformed row FIRST: production uses
+        # `next((r for r in rows if _row_matches(r)), None)`, which
+        # short-circuits on the first match. With the target at index 0 this
+        # test would pass even against the old, unfixed `int(...)` predicate
+        # (confirmed below), because the malformed row is never evaluated.
+        return [malformed, _tpl(ORPHAN, "Not deleted")]
 
     out = _run(_fixtures={"templates": _templates_with_a_non_numeric_sibling})
     assert out.get("blocked_reason") != "template_not_on_item"

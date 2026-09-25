@@ -295,6 +295,33 @@ def test_rate_limit_in_variation_fallback_is_bucketed_not_raised():
     assert out["complete"] is False
 
 
+def test_runtime_error_in_variation_fallback_is_unresolved_not_swallowed():
+    """RuntimeError twin of test_rate_limit_in_variation_fallback_is_bucketed_not_raised.
+    The old code swallowed a plain RuntimeError from `_resolve_variation` itself
+    (`except RuntimeError: rel = {}`), which let the SKU fall through as if it
+    were simply a standalone item with no templates — reported as
+    `template_source: "none"` / `no_templates: True` / `dangling_proven: []`
+    with `complete` still True. That is exactly the "clean bill of health for
+    a SKU that was never examined" the surrounding comment warns against: we
+    never actually learned whether this SKU is a variation child whose
+    template hangs off an unexamined parent. It must land in `unresolved`
+    with `channel_read_failed` instead, and `complete` must go False."""
+    def _boom(sku, sid):
+        raise RuntimeError("500 resolving variation relationship")
+
+    with patch.object(server, "_resolve_glt_target", _target), \
+         patch.object(server, "call_linnworks", lambda ep, p=None: {"StockItemId": SID, "ItemTitle": "T"}), \
+         patch.object(server, "_open_item_templates", lambda ch, cid, sid: []), \
+         patch.object(server, "_fetch_channel_skus_for_ids", lambda ids: {SID.lower(): []}), \
+         patch.object(server, "_resolve_variation", _boom):
+        out = server.find_dangling_glt_templates(["SKU-A"])
+
+    assert out["items"] == []
+    assert out["unresolved"] and out["unresolved"][0]["sku"] == "SKU-A"
+    assert out["unresolved"][0]["blocked_reason"] == "channel_read_failed"
+    assert out["complete"] is False
+
+
 def test_runtime_error_reading_the_parents_templates_is_unresolved_not_swallowed():
     """Final review, Important finding 1. The RuntimeError twin of
     test_rate_limit_in_variation_fallback_is_bucketed_not_raised above: once a
