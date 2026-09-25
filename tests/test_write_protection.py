@@ -225,9 +225,15 @@ class TestWriteThresholds:
         # typo. _write_guard proceeds unstaged when count <= threshold, and this
         # tool's plan is always a single item — a threshold of 1 would let every
         # live run through unstaged. 0 forces a staged manifest on EVERY run (#115).
-        # The membership assertion below is load-bearing: without it, a future
-        # task could quietly add a second name to `exempt` and pull another
-        # write tool's threshold out of this invariant unnoticed.
+        # The membership assertion below is a tautology (it compares `exempt`
+        # to a literal copy of its own definition) and is NOT a guard against a
+        # future task adding a second name to `exempt` — anyone doing that would
+        # naturally edit both lines together, so there is no invariant here that
+        # such a change could silently violate. What it actually does is
+        # document, in a form the diff makes visible, that this set is meant to
+        # stay a singleton — a reviewer sees the intended membership spelled out
+        # explicitly on its own line, rather than having to trust the variable
+        # name `exempt` alone.
         exempt = {"delete_dangling_glt_template"}
         assert exempt == {"delete_dangling_glt_template"}
         for op, val in server.WRITE_THRESHOLDS.items():

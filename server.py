@@ -16713,8 +16713,10 @@ def find_dangling_glt_templates(
                 except RateLimitError as exc:
                     rate_limited.append({"sku": sku, "error": str(exc)})
                     continue
-                except RuntimeError:
-                    raw_templates = []
+                except RuntimeError as exc:
+                    unresolved.append({"sku": sku, "blocked_reason": "channel_read_failed",
+                                       "error": str(exc)})
+                    continue
                 template_source = "variation_parent"
                 note = (f"variation child — the group's template(s) hang off parent "
                         f"'{parent_sku}' and serve every member")
@@ -17001,9 +17003,24 @@ def delete_dangling_glt_template(
     except (TypeError, ValueError):
         return {**base, "blocked_reason": "template_not_on_item",
                 "error": f"template_id {template_id!r} is not a template id."}
-    target_row = next(
-        (r for r in rows
-         if r["template_id"] is not None and int(r["template_id"]) == wanted), None)
+
+    def _row_matches(r: dict) -> bool:
+        # A malformed row's `Id` is preserved as-is by `_template_row`
+        # (deliberately, so it is visible rather than silently coerced) —
+        # which means it can be a genuinely non-numeric string here. That
+        # must make the row a non-match, not an uncaught ValueError: this
+        # row was never the one the CALLER named, so a malformed sibling
+        # must not be able to abort a well-formed request for the target
+        # (final review, Minor finding 1). Precedent: the identical
+        # try/except four lines above guarding `int(template_id)`.
+        if r["template_id"] is None:
+            return False
+        try:
+            return int(r["template_id"]) == wanted
+        except (TypeError, ValueError):
+            return False
+
+    target_row = next((r for r in rows if _row_matches(r)), None)
     if target_row is None:
         return {**base, "blocked_reason": "template_not_on_item",
                 "templates_on_item": [r["template_id"] for r in rows],
@@ -17158,6 +17175,12 @@ def delete_dangling_glt_template(
            "plan": plan, "before": before, "warning": warning}
 
     if dry_run:
+        # `complete` is omitted from `base`, so leaving it unset here reads
+        # as `None` — while every live path sets it explicitly (True once
+        # the read-back succeeds, False on a failed read) (final review,
+        # Minor finding 2). The dry-run plan/before capture above did not
+        # fail, so it is complete too.
+        out["complete"] = True
         out["message"] = (
             f"DRY RUN — nothing sent. Would delete template {wanted} and leave "
             f"{len(siblings)} sibling template(s) in place. Re-run with dry_run=False "
@@ -17293,8 +17316,16 @@ def delete_dangling_glt_template(
     # about the parent snapshot only becoming load-bearing here.
     rows_kept = (_rows_kept_across(before_by_id, after_by_id)
                 and _reference_ids_kept_across(before_ref_ids_by_id, after_ref_ids_by_id))
-    live_siblings_present = any(r["verdict"] == "not_proven_dangling" for r in siblings)
-    out["live_siblings_present"] = live_siblings_present
+    # NAMED FOR WHAT IT ACTUALLY PROVES, not what a reader might assume
+    # (final review, I3). `not_proven_dangling` means UNPROVEN — the whole
+    # reason there is no `healthy` verdict anywhere in this module and the
+    # detector's recall gap is real and quantified (~4 of 145 known dangling
+    # templates carry some other status). A key called `live_siblings_present`
+    # would read as fact to anyone consuming this output, and a run could
+    # then report that a live listing survived a delete when no live listing
+    # was ever proven to be in the experiment at all.
+    siblings_not_proven_dangling = any(r["verdict"] == "not_proven_dangling" for r in siblings)
+    out["siblings_not_proven_dangling"] = siblings_not_proven_dangling
 
     # A before-count of 0 on EVERY snapshotted id means this run cannot
     # demonstrate anything about question B at all — there were no rows to
@@ -17303,6 +17334,17 @@ def delete_dangling_glt_template(
     # unambiguous bad evidence regardless of the before-count, and must not
     # be softened by it.
     before_all_zero = all(v == 0 for v in before_by_id.values())
+    # A SEPARATE guard, checking a different thing (final review, I2).
+    # `before_all_zero` is item-wide/unfiltered across every channel (C3) —
+    # an item with zero rows on THIS store but live rows on eBay/Amazon
+    # passes it, and the run then scores "A and B" even though the SHOPIFY
+    # sibling had no mapping to lose here and question B was never tested on
+    # it. This is not hypothetical — the v1.63.1 note records the Echo SKUs
+    # as exactly that shape. `before_rows`/`before["channel_sku_row_count"]`
+    # is the store-filtered figure (`_rows_on_store`) kept for human-readable
+    # evidence above; it is now ALSO load-bearing here, independently of the
+    # item-wide check.
+    before_store_zero = len(before_rows) == 0
     # Rows APPEARING after a delete is anomalous, not something the count
     # check alone should let pass in silence (#115 Task 4 round 1, M1) — it
     # does not change `rows_kept` (a rise is, by definition, not a loss),
@@ -17359,10 +17401,20 @@ def delete_dangling_glt_template(
         if before_all_zero:
             settles = "A only"
             notes.append(
-                "every snapshotted stock item had ZERO channel-SKU rows before the delete, "
-                "so this run demonstrates question A only (Delete lands on a dangling "
-                "template) — question B (does it also take the sibling's rows) is UNTESTABLE "
-                "on this SKU; rows that were never there cannot be shown to survive.")
+                "every snapshotted stock item had ZERO channel-SKU rows before the delete "
+                "(item-wide, across every channel), so this run demonstrates question A only "
+                "(Delete lands on a dangling template) — question B (does it also take the "
+                "sibling's rows) is UNTESTABLE on this SKU; rows that were never there cannot "
+                "be shown to survive.")
+        if before_store_zero:
+            settles = "A only"
+            notes.append(
+                "this store had ZERO channel-SKU rows before the delete for the snapshotted "
+                "stock item(s), so this run demonstrates question A only (Delete lands on a "
+                "dangling template) — question B (does it also take the LIVE sibling's "
+                "mapping ON THIS STORE) is UNTESTABLE on this SKU, even where the item has "
+                "rows on another channel; a mapping that was never there on this store cannot "
+                "be shown to survive.")
         out.update({
             "success": True, "outcome": "orphan_removed_siblings_intact", "settles": settles,
             "message": (
@@ -17373,7 +17425,7 @@ def delete_dangling_glt_template(
                 "the next stock sync that quantity still updates."),
         })
 
-    if not live_siblings_present:
+    if not siblings_not_proven_dangling:
         notes.append(
             "no sibling on this item was proven live — every sibling template read as "
             "dangling too, so this run does not demonstrate that a LIVE listing survives.")

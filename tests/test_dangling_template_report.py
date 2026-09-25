@@ -293,3 +293,38 @@ def test_rate_limit_in_variation_fallback_is_bucketed_not_raised():
     assert out["rate_limited"] and out["rate_limited"][0]["sku"] == "SKU-A"
     assert out["items"] == []
     assert out["complete"] is False
+
+
+def test_runtime_error_reading_the_parents_templates_is_unresolved_not_swallowed():
+    """Final review, Important finding 1. The RuntimeError twin of
+    test_rate_limit_in_variation_fallback_is_bucketed_not_raised above: once a
+    SKU is identified as a variation child, the read of the PARENT's
+    templates (`_open_item_templates` on `parent_stock_item_id`) can itself
+    fail with a plain RuntimeError. The old code swallowed it
+    (`except RuntimeError: raw_templates = []`), which then reported the SKU
+    as `template_source: "none"` / `no_templates: True` with `complete` still
+    True — exactly the "clean bill of health for a SKU that was never
+    examined" the comment two lines above explicitly warns against, and a
+    silent violation of the "complete must be False when any read failed"
+    rule. The child's own template read (first `_open_item_templates` call)
+    still legitimately returns [] here — that is what makes it look like a
+    variation child in the first place — only the PARENT read fails."""
+    def _open(ch, cid, sid):
+        if sid == SID:
+            return []
+        raise RuntimeError("500 on parent template read")
+
+    with patch.object(server, "_resolve_glt_target", _target), \
+         patch.object(server, "call_linnworks", lambda ep, p=None: {"StockItemId": SID, "ItemTitle": "T"}), \
+         patch.object(server, "_open_item_templates", _open), \
+         patch.object(server, "_fetch_channel_skus_for_ids", lambda ids: {SID.lower(): [_row()]}), \
+         patch.object(server, "_resolve_variation",
+                      lambda sku, sid: {"role": "child", "parent_sku": "PARENT-A",
+                                        "parent_stock_item_id": PSID,
+                                        "group_name": "G", "siblings": []}):
+        out = server.find_dangling_glt_templates(["SKU-A"])
+
+    assert out["items"] == []
+    assert out["unresolved"] and out["unresolved"][0]["sku"] == "SKU-A"
+    assert out["unresolved"][0]["blocked_reason"] == "channel_read_failed"
+    assert out["complete"] is False

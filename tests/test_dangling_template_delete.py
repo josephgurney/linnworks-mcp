@@ -86,8 +86,8 @@ def _assert_never_wrote(mock_cl):
     writes at all."""
     sent = [c.args[0] for c in mock_cl.call_args_list if c.args]
     assert _PROCESS_TEMPLATES not in sent, (
-        f"delete_dangling_glt_template must never call {_PROCESS_TEMPLATES} in "
-        f"Task 3 — calls were: {sent}")
+        f"delete_dangling_glt_template must never call {_PROCESS_TEMPLATES} on a "
+        f"refusal path — calls were: {sent}")
 
 
 def _run(**kw):
@@ -156,6 +156,24 @@ def test_a_template_row_with_a_missing_id_can_never_be_selected():
                _fixtures={"templates": _templates_with_a_malformed_row})
     assert out["blocked_reason"] == "template_not_on_item"
     assert out["success"] is False
+
+
+def test_a_non_numeric_sibling_id_is_a_non_match_not_a_crash():
+    """Final review, Minor finding 1. `_template_row` deliberately preserves
+    a genuinely non-numeric `Id` as-is rather than coercing it, so gate 1's
+    `int(r["template_id"]) == wanted` scan can hit a row it cannot int().
+    That is fail-safe in the sense that it raises before any write — but it
+    crashes the one tool whose value IS its structured output, and it fires
+    on a row the caller never named: a malformed SIBLING must not be able to
+    abort a well-formed request for the real, well-formed TARGET."""
+    def _templates_with_a_non_numeric_sibling(ch, cid, sid):
+        malformed = {"Id": "not-a-number", "ConfiguratorId": 1,
+                     "Info": {"ActiveListingId": {"Value": "x"}, "Status": {"Value": "Listed"}}}
+        return [_tpl(ORPHAN, "Not deleted"), malformed]
+
+    out = _run(_fixtures={"templates": _templates_with_a_non_numeric_sibling})
+    assert out.get("blocked_reason") != "template_not_on_item"
+    assert out["plan"]["template_id"] == ORPHAN
 
 
 def test_template_id_as_string_matches_a_row_whose_id_is_also_a_string():
@@ -503,7 +521,7 @@ def test_all_siblings_dangling_does_not_claim_a_live_sibling_survived():
     # or a change that broke the actual outcome here would pass silently.
     assert res["outcome"] == "orphan_removed_siblings_intact"
     assert res["success"] is True
-    assert res["live_siblings_present"] is False
+    assert res["siblings_not_proven_dangling"] is False
     assert "no sibling on this item was proven live" in res["note"]
 
 
@@ -744,6 +762,51 @@ def test_before_count_of_zero_settles_A_only_not_A_and_B():
 
     assert res["outcome"] == "orphan_removed_siblings_intact"
     assert res["settles"] == "A only"
+    assert "UNTESTABLE" in res["note"]
+
+
+def test_before_count_zero_on_this_store_settles_A_only_even_with_rows_elsewhere():
+    """Final review, Important finding 2. `before_all_zero` was written to
+    mean "this run had no rows on this store, so it proves nothing about
+    question B" — but a later fix (C3) correctly changed `before_by_id` from
+    store-filtered to UNFILTERED item-wide counts, which silently broke that
+    guard: an item with zero rows on THIS store but live rows on eBay passes
+    `before_all_zero` (item-wide count is 1, not 0) and the run then scores
+    "A and B" even though the SHOPIFY sibling had no mapping to lose here and
+    B was never tested on it. This is the exact shape the v1.63.1 note
+    records for the Echo SKUs. The store-filtered before-count
+    (`before["channel_sku_row_count"]`, built from `_rows_on_store`) must
+    ALSO downgrade to "A only", independently of the item-wide check."""
+    def _rows(ids):
+        other_channel_row = {**_row(), "SubSource": "EBAY0", "Source": "EBAY"}
+        return {i.lower(): [other_channel_row] for i in ids}
+
+    def _open(ch, cid, sid):
+        return _both_templates(ch, cid, sid) if _open.phase == "before" else [_tpl(LIVE, "Listed")]
+    _open.phase = "before"
+
+    def _call(ep, p=None):
+        if ep == _PROCESS_TEMPLATES:
+            _open.phase = "after"
+            return {}
+        return _item(ep, p)
+
+    mock_cl = Mock(side_effect=_call)
+    with patch.object(server, "_resolve_glt_target", _target), \
+         patch.object(server, "call_linnworks", mock_cl), \
+         patch.object(server, "_open_item_templates", _open), \
+         patch.object(server, "_fetch_channel_skus_for_ids", _rows):
+        res = server.delete_dangling_glt_template(
+            "SKU-A", ORPHAN, dry_run=False, confirmed_count=1)
+
+    # Item-wide before-count is NOT zero (the EBAY row counts toward it) —
+    # proof that `before_all_zero` alone would not have caught this.
+    assert res["before"]["by_stock_item_id"] == {SID: 1}
+    # But this store's own filtered count is zero — nothing here to lose.
+    assert res["before"]["channel_sku_row_count"] == 0
+    assert res["outcome"] == "orphan_removed_siblings_intact"
+    assert res["settles"] == "A only"
+    assert "this store" in res["note"].lower()
     assert "UNTESTABLE" in res["note"]
 
 
