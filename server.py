@@ -16573,6 +16573,188 @@ def _open_item_templates(ch: dict, channel_id: int, stock_item_id: str) -> list[
 
 
 @mcp.tool()
+def find_dangling_glt_templates(
+    skus: list[str],
+    sub_source: str = "SWH Shopify",
+    channel: str = "Shopify",
+) -> dict:
+    """
+    Report which of a SKU's GLT templates are PROVABLY dangling — pointing at a
+    listing that no longer exists on the channel. Read-only; writes nothing.
+
+    A dangling template is invisible to `get_channel_listings`: the channel-SKU
+    mapping can look perfectly healthy while the template's stored
+    ActiveListingId points at a deleted product. It breaks pushes in a nasty way
+    (Linnworks batches listing ids into one Shopify `nodes(ids:)` call and throws
+    on the null slot, failing every healthy template batched with it — issue #52).
+
+    ⚠️  THIS CAN PROVE A TEMPLATE IS DANGLING. IT CAN NEVER PROVE ONE IS FINE.
+    Proof of death is `Info.Status == "Not deleted"`, which is Linnworks
+    recording that it tried to remove a listing already gone. That signal is
+    precise (141/141 and 42/42 across two sweeps) but not complete (~4 of 145
+    dangling templates carry another status; "Listed" templates have never been
+    swept). So the verdicts are `dangling_proven` and `not_proven_dangling` —
+    the second means UNPROVEN, not healthy. There is no `healthy` verdict.
+
+    This is a VERIFICATION tool, not a discovery tool: scope is per-SKU, so you
+    must already know which SKU to ask about. Discovery is the catalogue sweep
+    whose output is `docs/dangling-templates-swh-shopify.md`.
+
+    Remediation for a dangling template is a HUMAN step in the Linnworks GLT UI
+    (open the listing so the template re-points at the surviving product). See
+    `delete_dangling_glt_template` for the provisional, experimental API route
+    and why it may not work.
+
+    Args:
+        skus:       SKUs to examine.
+        sub_source: Store/account name, e.g. "SWH Shopify".
+        channel:    "Shopify" (default), "Amazon", "TikTok", Magento, Walmart.
+
+    Returns:
+        items[] (per SKU: templates with verdicts, channel-SKU rows, sibling
+        summary, remediation), unresolved[], rate_limited[], the two counts,
+        items_examined, complete, and detector_note.
+    """
+    target = _resolve_glt_target(channel, sub_source)
+    if not target.get("ok"):
+        return {"success": False, "error": target.get("error"),
+                "available_sub_sources": target.get("available_sub_sources")}
+
+    ch = target["channel"]
+    channel_id = target["channel_id"]
+    channel_source = ch["source"]
+
+    def _rows_on_store(rows) -> list:
+        return [
+            r for r in (rows if isinstance(rows, list) else [])
+            if _norm_conf_name(r.get("Source")) == _norm_conf_name(channel_source)
+            and _norm_conf_name(r.get("SubSource")) == _norm_conf_name(sub_source)
+        ]
+
+    items: list[dict] = []
+    unresolved: list[dict] = []
+    rate_limited: list[dict] = []
+
+    for raw in skus:
+        sku = (raw or "").strip()
+        if not sku:
+            unresolved.append({"sku": raw, "blocked_reason": "empty_sku", "error": "empty SKU"})
+            continue
+        _check_injection("skus", sku)
+        try:
+            item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+        except RateLimitError as exc:
+            rate_limited.append({"sku": sku, "error": str(exc)})
+            continue
+        except RuntimeError as exc:
+            unresolved.append({"sku": sku, "blocked_reason": "not_found",
+                               "error": f"not found: {exc}"})
+            continue
+
+        sid = item.get("StockItemId")
+        if not sid:
+            unresolved.append({"sku": sku, "blocked_reason": "not_found",
+                               "error": "item found but StockItemId was missing"})
+            continue
+
+        try:
+            raw_templates = _open_item_templates(ch, channel_id, sid)
+            rows = _rows_on_store(_fetch_channel_skus_for_ids([sid]).get(sid.lower(), []))
+        except RateLimitError as exc:
+            rate_limited.append({"sku": sku, "error": str(exc)})
+            continue
+        except RuntimeError as exc:
+            unresolved.append({"sku": sku, "blocked_reason": "channel_read_failed",
+                               "error": str(exc)})
+            continue
+
+        template_source = "item"
+        parent_sku = None
+        note = None
+
+        # A Shopify variation CHILD holds channel-SKU rows but no template of its
+        # own — the template hangs off the PARENT and serves every variant (#26).
+        # Reporting "no templates" here would read as a clean bill of health for
+        # a SKU that was never actually examined.
+        if not raw_templates:
+            try:
+                rel = _resolve_variation(sku, sid)
+            except RuntimeError:
+                rel = {}
+            if rel.get("role") == "child" and rel.get("parent_stock_item_id"):
+                parent_sku = rel.get("parent_sku")
+                try:
+                    raw_templates = _open_item_templates(
+                        ch, channel_id, rel["parent_stock_item_id"])
+                except RateLimitError as exc:
+                    rate_limited.append({"sku": sku, "error": str(exc)})
+                    continue
+                except RuntimeError:
+                    raw_templates = []
+                template_source = "variation_parent"
+                note = (f"variation child — the group's template(s) hang off parent "
+                        f"'{parent_sku}' and serve every member")
+
+        rows_out = [_format_channel_sku_row(r) for r in rows]
+        template_rows = [_template_row(t) for t in raw_templates]
+        if not template_rows:
+            template_source = "none"
+            note = note or (
+                f"no GLT template on {ch['channel_type']} / {sub_source} for this SKU — "
+                "nothing to report either way; this is NOT a clean bill of health for the SKU")
+
+        items.append({
+            "sku": sku,
+            "stock_item_id": sid,
+            "title": item.get("ItemTitle"),
+            "channel": ch["channel_type"],
+            "sub_source": sub_source,
+            "channel_id": channel_id,
+            "template_source": template_source,
+            "parent_sku": parent_sku,
+            "no_templates": not template_rows,
+            "templates": template_rows,
+            "dangling_proven": [t["template_id"] for t in template_rows
+                                if t["verdict"] == "dangling_proven"],
+            "channel_sku_rows": {
+                "count": len(rows_out),
+                "channel_reference_ids": [r["channel_reference_id"] for r in rows_out],
+                "rows": rows_out,
+            },
+            "remediation": (
+                "Rebuild or remove the template in the Linnworks GLT UI — opening the "
+                "listing re-points the template at the surviving product. This is the "
+                "human step v1.50.0 recommended; the API route is provisional, see "
+                "delete_dangling_glt_template."
+            ),
+            "note": note,
+        })
+
+    proven = sum(len(i["dangling_proven"]) for i in items)
+    total = sum(len(i["templates"]) for i in items)
+    return {
+        "success": True,
+        "channel": ch["channel_type"],
+        "sub_source": sub_source,
+        "sub_source_resolution": target.get("resolution"),
+        "items": items,
+        "unresolved": unresolved,
+        "rate_limited": rate_limited,
+        "items_examined": len(items),
+        "dangling_proven_count": proven,
+        "not_proven_dangling_count": total - proven,
+        "complete": not unresolved and not rate_limited,
+        "detector_note": (
+            "PRECISION, NOT RECALL. `Not deleted` proves a template is dangling "
+            "(141/141 and 42/42 across two sweeps). It does NOT prove the others are "
+            "fine — ~4 of 145 known dangling templates carry another status, and "
+            "`Listed` templates have never been swept. `not_proven_dangling` means "
+            "UNPROVEN, not a clean bill of health."
+        ),
+    }
+
+
+@mcp.tool()
 def get_channel_listings(sku: str) -> dict:
     """
     Read the existing channel listings for ONE inventory item — answers

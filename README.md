@@ -1,7 +1,7 @@
 # Linnworks MCP Server
 
 ![Version](https://img.shields.io/badge/version-1.63.1-blue)
-![Tools](https://img.shields.io/badge/tools-98-blue)
+![Tools](https://img.shields.io/badge/tools-99-blue)
 
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
 
@@ -149,6 +149,7 @@ Once installed, Claude gets access to these tools:
 |---|---|
 | `get_channel_listings` | Check whether a SKU is listed, and on which channel/store |
 | `get_channel_listings_bulk` | The same listing check across many SKUs at once. Pass `stock_item_ids` instead of SKUs for large batches — it skips per-SKU resolution entirely (5,391 items: 15.6s vs 187s). Rate-limited lookups are reported separately from genuinely-missing ones |
+| `find_dangling_glt_templates` | **Read-only.** Reports which of a SKU's GLT templates are PROVABLY dangling — pointing at a listing that no longer exists on the channel, invisible to `get_channel_listings` and known to break pushes (#52). Proof of death is `Info.Status == "Not deleted"` only; no Shopify credentials used. ⚠️ Precision, not recall — it can prove a template IS dangling, never that one is fine. Verdicts are `dangling_proven` / `not_proven_dangling`; there is deliberately no `healthy` verdict. Per-SKU verification, not catalogue discovery. Variation-aware — a Shopify child reports the parent's template rather than "no templates" |
 | `list_to_shopify` | List existing inventory to Shopify via a saved configurator. Two dedupe layers: the same item already listed, **and** a different SKU with the same title already live (the SKU-migration case that created 177 duplicate products) — the latter is excluded unless `allow_duplicate_titles=True` |
 | `refresh_channel_listing` | Re-push edited item data to a live listing on any GLT channel (Shopify, Amazon, TikTok) — revise; pre-flight staleness check scoped to the channel being refreshed, plus a dangling-listing check (Shopify) that excludes templates whose stored ActiveListingId no longer exists on the channel — one such template fails every healthy template batched with it (issue #52). Amazon: fired live twice, accepted, no observable change (tried and ineffective, issue #45). TikTok: never attempted live |
 | `unpublish_channel_listing` | Take down / end a live listing on one channel and store — Shopify, Amazon, TikTok, Magento or Walmart. Each template is verified individually after the delete, so a template that survived is never reported as taken down. A variation child is retired via its parent's template only when no other member of the group would lose a listing; otherwise it is blocked with the parent and its live siblings named |

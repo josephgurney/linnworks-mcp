@@ -36,7 +36,7 @@ class TestRegistration:
 
     def test_total_tool_count(self):
         registered = asyncio.run(server.mcp.list_tools())
-        assert len(registered) == 98
+        assert len(registered) == 99  # +1: find_dangling_glt_templates (#115)
 
 
 # ── AC2: no write-tool machinery on any of the four ─────────────────────────
