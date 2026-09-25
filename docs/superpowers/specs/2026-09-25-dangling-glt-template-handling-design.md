@@ -239,7 +239,11 @@ delete_dangling_glt_template(
 ```
 
 Singular by construction — one SKU, one template id, no lists. The signature *is* the
-safety limit. `WRITE_THRESHOLDS["delete_dangling_glt_template"] = 1`.
+safety limit. `WRITE_THRESHOLDS["delete_dangling_glt_template"] = 0`. **Corrected during planning:**
+a threshold of 1 would never fire — `_write_guard` returns `None` when
+`count <= threshold` (`server.py:643`), so a one-item list against a threshold of 1
+proceeds unstaged. `0` makes every live run stage a manifest and echo `confirmed_count=1`,
+which is the two-deliberate-acts behaviour this spec intended.
 
 ### Refusal gates
 
@@ -289,8 +293,16 @@ success means the *sibling survives*.
 |---|---|---|---|
 | `orphan_removed_siblings_intact` | target gone, siblings present, rows unchanged | The ideal. Unlocks the brief's full tool. | A **and** B |
 | `orphan_removed_sibling_mapping_lost` | target gone, siblings present, rows gone or reduced | **Failure, with a loud warning.** The live listing has lost its Linnworks mapping — restore via the UI and stop. | A **and** B |
+| `orphan_removed_sibling_template_lost` | target gone, and the sibling's own TEMPLATE (not just its channel-SKU rows) is gone from the after read-back | **Worse than `orphan_removed_sibling_mapping_lost`.** A missing mapping row can potentially be restored; a missing template cannot be re-opened the same way. Distinct remediation, so it earns its own value rather than folding into the mapping-lost case. | A **and** B |
 | `delete_refused_by_linnworks` | target still present | The delete did not land. Per §3, the most likely result. | A only |
 | `unconfirmed` | read-back failed | Prove by hand. | neither |
+
+**Added during implementation:** the table above originally listed four outcomes.
+`orphan_removed_sibling_template_lost` was added as a fifth because the after read-back
+can lose a sibling's own template entry outright, not just empty its channel-SKU rows —
+a different failure from `orphan_removed_sibling_mapping_lost`, with a different
+remediation path, so it was given its own value rather than being folded into the
+mapping-lost case above.
 
 A `RateLimitError` at any point yields `rate_limited` with `complete: false`, and is
 never reported as `template_not_on_item` or as dangling.
@@ -356,11 +368,12 @@ internals, small `_tpl(tid, status)` builders.
 8–11. Each refusal gate, each asserting no `ProcessTemplates` call is made
 12. Every non-`"Not deleted"` status refused (parametrised)
 13. `allow_unproven_delete=True` bypasses gate 2; response names the listing that would end
-14. `dry_run=True` by default; a live run requires `confirmed_count` at threshold 1
+14. `dry_run=True` by default; a live run requires `confirmed_count=1` against the threshold-0 staging gate
 15. **`ProcessTemplates` receives only the named `TemplateId`; the sibling id appears in
     no write payload.** The brief's criterion 7, and the most important test here.
-16–19. Each of the four outcomes, including the warning on `orphan_removed_sibling_mapping_lost`
-20. `RateLimitError` mid-run → `rate_limited`, `complete: false`
+16–20. Each of the five outcomes, including the warnings on `orphan_removed_sibling_mapping_lost`
+    and `orphan_removed_sibling_template_lost`
+21. `RateLimitError` mid-run → `rate_limited`, `complete: false`
 
 **`tests/test_delist_readback.py`** gains one regression test: `unpublish_channel_listing`'s
 result on a two-template fixture is unchanged, pinning D2.
