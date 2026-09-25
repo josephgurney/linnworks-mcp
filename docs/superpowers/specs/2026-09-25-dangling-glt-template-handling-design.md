@@ -241,7 +241,7 @@ delete_dangling_glt_template(
 Singular by construction — one SKU, one template id, no lists. The signature *is* the
 safety limit. `WRITE_THRESHOLDS["delete_dangling_glt_template"] = 0`. **Corrected during planning:**
 a threshold of 1 would never fire — `_write_guard` returns `None` when
-`count <= threshold` (`server.py:643`), so a one-item list against a threshold of 1
+`count <= threshold` (`server.py:645`), so a one-item list against a threshold of 1
 proceeds unstaged. `0` makes every live run stage a manifest and echo `confirmed_count=1`,
 which is the two-deliberate-acts behaviour this spec intended.
 
@@ -254,16 +254,35 @@ Evaluated in order; each returns its own `blocked_reason` and makes **no**
 |---|---|---|
 | `template_id` is not among templates opened for this SKU on the resolved `ChannelId` | `template_not_on_item` | A raw id could belong to another SKU or another store; deleting by it bypasses both SKU and store scoping. |
 | `Info.Status != "Not deleted"` | `dangling_not_proven` | D1. Covers "still live" and "cannot tell" alike. |
-| The item has only this one template | `no_sibling_use_unpublish` | **A scope gate, not a safety gate** — see below. |
 | Variation child whose group has live siblings | `variation_child_live_siblings` | The whole-group gate still applies — the template serves every member, so a single-template delete could end a group listing. |
+| The item has only this one template | `no_sibling_use_unpublish` | **A scope gate, not a safety gate** — see below. |
+| A stock item this delete could affect was omitted from the before-write channel-SKU read entirely | `before_snapshot_incomplete` | Evidentiary, not scope/safety — see below. |
+
+**Corrected during implementation: gates 3 and 4 are swapped from the order above.**
+The table originally listed `no_sibling_use_unpublish` before `variation_child_live_siblings`.
+In the standard Shopify variation shape the child has no template of its own and the
+parent's ONE template serves every member, so `siblings` (template siblings, not
+variation siblings) comes back empty — running the scope gate first would misdirect a
+variation child to `unpublish_channel_listing`, which refuses that exact shape. Safety is
+evaluated before scope; the code and the tool's own docstring carry this corrected order,
+and this table is now brought into line with them.
 
 `allow_unproven_delete=True` is the only bypass, and only of gate 2. The response then
 carries a warning naming the listing that would end.
 
-**On gate 3, and an unknown that could not be resolved.** This gate is about *purpose*,
+**On gate 4, and an unknown that could not be resolved.** This gate is about *purpose*,
 not danger. With no sibling there is nothing for this tool to protect, its entire outcome
 vocabulary ("siblings intact") is vacuous, and `unpublish_channel_listing` — live-proven
 for exactly that shape — is the correct tool. So it refuses rather than warns.
+
+**Added during implementation:** the table above originally listed four gates.
+`before_snapshot_incomplete` was added as a fifth, evidentiary check, run after the four
+scope/safety gates above (not renumbered into them — it is not a judgement about the
+target itself). An id the delete could affect (the named SKU, or the variation parent the
+template lives on) omitted from the before-write channel-SKU read is indistinguishable
+from "confirmed zero rows" by count alone, and a confirmed zero is exempt from the
+mapping-lost check (§ Evidence capture) — so an omission here would silently disable the
+very check this tool exists to run. It refuses before any write is sent.
 
 ⚠️ **How much of the population that excludes is unknown.**
 `docs/dangling-templates-swh-shopify.md` records 145 dangling templates across 145
