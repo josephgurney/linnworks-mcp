@@ -16505,6 +16505,73 @@ def _fetch_channel_skus_for_ids(stock_item_ids: list[str]) -> dict[str, list]:
     return out
 
 
+# ---------- Dangling GLT templates (issue #115) ----------
+#
+# A template is DANGLING when its stored ActiveListingId points at a listing
+# that no longer exists on the channel. "Does this listing still exist?" is a
+# CHANNEL fact, so no Linnworks endpoint answers it directly — but Linnworks
+# carries a free proxy for it, and this repo is Linnworks-centric by design
+# (see the SCOPE section in CLAUDE.md): Info.Status == "Not deleted", which is
+# Linnworks recording that it tried to remove a listing that was already gone.
+#
+# PRECISION, NOT RECALL. 141/141 (9 Sep 2026 census) and 42/42 (24 Sep 2026
+# re-verification, fresh 5,000-item sample against a live control) "Not deleted"
+# templates were dangling. But ~4 of the census's 145 dangling templates carry
+# some OTHER status, and "Listed" templates have never been swept. So this
+# detector can prove a template IS dangling and can never prove one is fine —
+# which is why there is no `healthy` verdict anywhere below.
+
+_DANGLING_STATUS = "Not deleted"
+
+
+def _dangling_verdict(status) -> str:
+    """Proof-of-death verdict for one GLT template status.
+
+    Surrounding whitespace is tolerated (a transport artefact); case is NOT
+    (a different string from the API, which must not be guessed at).
+    """
+    if isinstance(status, str) and status.strip() == _DANGLING_STATUS:
+        return "dangling_proven"
+    return "not_proven_dangling"
+
+
+def _template_row(t: dict) -> dict:
+    """Flatten one raw TemplatesInfo entry into our reporting shape."""
+    info = t.get("Info") if isinstance(t.get("Info"), dict) else {}
+    status = _glt_field(info, "Status")
+    return {
+        "template_id":       t.get("Id"),
+        "configurator_id":   t.get("ConfiguratorId"),
+        "active_listing_id": _glt_field(info, "ActiveListingId"),
+        "status":            status,
+        "verdict":           _dangling_verdict(status),
+    }
+
+
+def _open_item_templates(ch: dict, channel_id: int, stock_item_id: str) -> list[dict]:
+    """Open one item's GLT templates on one channel. Read-only.
+
+    ⚠️ Returns `TemplatesInfo` ONLY. `TotalEntries` echoes the input count and
+    will claim a template exists for a variation child that has none — reading
+    it would invent templates. Confirmed trap, see the 24 Sep 2026 commit notes.
+    """
+    resp = call_linnworks(
+        "GenericListings/OpenTemplatesByInventory",
+        {"request": {
+            "ChannelType": ch["channel_type"],
+            "ChannelName": ch["channel_name"],
+            "Parameters": {
+                "SelectedRegions": [],
+                "Token": _ZERO_GUID,
+                "InventoryItemIds": [stock_item_id],
+                "ChannelId": channel_id,
+            },
+            "PaginationParameters": {"PageNumber": 1, "EntriesPerPage": 20},
+        }},
+    )
+    return (resp.get("TemplatesInfo") if isinstance(resp, dict) else None) or []
+
+
 @mcp.tool()
 def get_channel_listings(sku: str) -> dict:
     """
