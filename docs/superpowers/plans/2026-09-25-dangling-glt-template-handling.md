@@ -224,7 +224,7 @@ def _open_item_templates(ch: dict, channel_id: int, stock_item_id: str) -> list[
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_dangling_template_report.py -v`
-Expected: PASS (7 passed, 1 skipped)
+Expected: PASS (9 passed)
 
 - [ ] **Step 5: Commit**
 
