@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.63.1"
+__version__ = "1.64.0"
 
 import json
 import os
@@ -18900,6 +18900,8 @@ def unpublish_channel_listing(
     channel: str = "Shopify",
     allow_variation_parent_takedown: bool = True,
     also_retiring_skus: list[str] | None = None,
+    template_ids: list[int] | None = None,
+    allow_live_listing_delete: bool = False,
     confirmed_count: int | None = None,
     dry_run: bool = True,
 ) -> dict:
@@ -18907,6 +18909,64 @@ def unpublish_channel_listing(
     Take an EXISTING channel listing DOWN — unpublish/retire the listing so it
     stops selling. Works on any GLT-managed channel: Shopify, Amazon, TikTok
     (also Magento/Walmart where a tenant lists through the GLT).
+
+    TARGETED DELETE (issue #115). By default this plans EVERY template on the
+    item — the right behaviour when the goal is "end this item's listing
+    everywhere". When an item carries an orphaned dangling template ALONGSIDE a
+    live one (issue #52/#92 — the ActiveListingId a template stores can go
+    dangling while a sibling template on the same item still serves a live
+    product), that is the wrong behaviour: it plans the live sibling too.
+
+    Pass `template_ids=[<id>, ...]` to narrow the plan to ONLY those template
+    ids. A requested id that was not opened for any of the given SKUs on the
+    resolved channel/store is refused (`blocked_reason="template_not_on_item"`)
+    rather than silently ignored — it may belong to a different SKU or store.
+    The response also names every UNTOUCHED sibling template on each targeted
+    item (`untouched_siblings`), so you can confirm the live one is being left
+    alone before running live.
+
+    ⚠️  SAFETY GATE ON A TARGETED DELETE: by default a targeted template is
+    refused unless its stored listing is PROVEN gone. `active_listing_id` is
+    checked against Shopify via the same null-safe probe `refresh_channel_listing`
+    uses (`_glt_listing_existence` / `_shopify_listings_exist`, issue #52):
+      - confirmed still live  → refused, `blocked_reason="listing_still_live"`.
+      - cannot be verified (no Shopify Admin credentials configured — the
+        current state of this tenant, see #92 — insufficient token scope, a
+        failed check, or a non-Shopify channel with no cheap probe available)
+        → refused, `blocked_reason="listing_existence_unverified"`. An UNKNOWN
+        result is never treated as dead.
+      - confirmed gone        → planned, no gate.
+    Pass `allow_live_listing_delete=True` to override EITHER refusal — the
+    response then carries a `warning` per overridden row naming the listing
+    that will end, and `override_warnings` at the top level. This gate ONLY
+    applies when `template_ids` is given; the untargeted "end every template on
+    the item" path is unaffected and unchanged.
+
+    ⚠️  WHAT A TARGETED DELETE DOES TO THE SIBLING'S CHANNEL-SKU ROWS IS NOT
+    KNOWN. Channel-SKU rows belong to the ITEM on a store, not to one template,
+    and deleting the orphan may or may not touch the row the live sibling
+    depends on. The live-run read-back below is built to DETECT this, not to
+    prevent it — see `outcome` below and CLAUDE.md's v1.64.0 version note
+    (issue #115) before running this on more than one throwaway SKU.
+
+    On a targeted live run the read-back is classified specifically for this
+    shape — target gone / siblings intact / channel-SKU rows intact — with its
+    own `outcome` values on each result row: `target_deleted` (the target
+    template is gone, every known sibling template still exists, and the
+    item's channel-SKU rows for this store are still present — the ideal
+    case), `target_deleted_mapping_lost` (the target is gone and siblings are
+    intact, but the item's channel-SKU rows vanished too — reported as a
+    FAILURE with a `warning` that the live listing has lost its Linnworks
+    mapping and will silently stop syncing stock/price), `target_deleted_sibling_also_gone`
+    (the target is gone but a sibling template that existed at plan time is
+    also gone — unexpected, reported as a failure), `target_delete_failed`
+    (the target template was not actually deleted — `Status: "Not deleted"` is
+    still treated as a failure here), and `unconfirmed` (the read-back itself
+    could not be completed). These outcome values are DISTINCT from the
+    untargeted path's (`taken_down` / `listing_gone_template_orphaned` /
+    `delete_failed` / `template_deleted_listing_row_remains` / `unconfirmed`)
+    because the success condition is inverted: on a targeted delete the
+    channel-SKU rows are EXPECTED to remain (a sibling still serves them).
 
     This is the destructive counterpart to `list_to_shopify` (which CREATES
     listings) and `refresh_channel_listing` (which REVISES them). It ends the
@@ -18998,8 +19058,21 @@ def unpublish_channel_listing(
             variation parent is safe to take down — needed when a group is split
             across chunks, or when a caller delegates one SKU at a time (as
             delist_all_channel_listings does). They are NOT themselves delisted.
+        template_ids: Narrow the plan to ONLY these GLT template ids (issue
+            #115). None (default) plans every template on the item, matching
+            the pre-#115 behaviour exactly. Every id must belong to a template
+            actually opened for one of the given SKUs on the resolved channel —
+            an id that doesn't is refused (`template_not_on_item`), never
+            deleted. Also activates the dead-listing safety gate (see above)
+            and the per-item `untouched_siblings` report.
+        allow_live_listing_delete: Only meaningful with `template_ids`. False
+            (default) refuses any targeted template whose listing is confirmed
+            live, or whose liveness cannot be verified. True overrides both
+            refusals — use only once you have manually confirmed the listing
+            the template covers, or the caller's intent is deliberately drastic.
         confirmed_count: For batches > 10 SKUs, pass len(skus) after reviewing the
-            plan to confirm the write.
+            plan to confirm the write. With `template_ids`, this is instead the
+            number of PLANNED template rows (post-narrowing and post-gate).
         dry_run: If True (default), returns the plan without taking anything down.
             Set to False to delete the listings on the channel.
 
@@ -19017,11 +19090,20 @@ def unpublish_channel_listing(
           - unresolved: per-SKU rows, each with a `blocked_reason` code —
             not_found · channel_read_failed · not_listed · no_glt_template ·
             variation_child_live_siblings · variation_parent_has_no_template ·
-            variation_child_parent_takedown_disabled · template_locked
+            variation_child_parent_takedown_disabled · template_locked ·
+            (template_ids only) template_not_on_item · listing_still_live ·
+            listing_existence_unverified
           - blocked_summary / blocked_count / retirable_sku_count — so a small
             plan against a large request cannot read as success
+          - rate_limited / complete — a RateLimitError while opening templates
+            lands here, never as a blocked_reason
+          - (template_ids only) untouched_siblings: per-item list of the
+            item's OTHER templates NOT targeted for delete (template_id,
+            active_listing_id, status); override_warnings: one entry per row
+            whose refusal was overridden by allow_live_listing_delete
           - results: per-template outcome (live run only — processed, taken_down,
-            still_listed, outcome, error)
+            still_listed, outcome, error; with template_ids the outcome
+            vocabulary is the targeted-delete one described above)
     """
     if not skus:
         raise ValueError("skus must contain at least one SKU.")
@@ -19185,26 +19267,46 @@ def unpublish_channel_listing(
     # Amazon: a merchant template and an ".FBA" template on one StockItemId), so
     # templates are collected as a LIST per item — keying by id would drop all
     # but the last and leave the other listing live after a "successful" run.
+    #
+    # A RateLimitError here must never be silently absorbed into "this item has
+    # no template" (issue #115, AC11) — that would misclassify a rate-limited
+    # item as no_glt_template today, or as template_not_on_item / a dead
+    # listing under the #115 targeted-delete gate. Affected items are pulled
+    # OUT of `resolved`-driven classification below and reported only under
+    # `rate_limited`.
     templates_by_sid: dict[str, list[dict]] = {}
+    open_rate_limited_sids: set[str] = set()
+    sku_by_sid = {r["stock_item_id"].lower(): r["sku"] for r in resolved}
     ids = [r["stock_item_id"] for r in resolved]
     for i in range(0, len(ids), 200):
         chunk = ids[i:i + 200]
-        resp = call_linnworks(
-            "GenericListings/OpenTemplatesByInventory",
-            {"request": {
-                "ChannelType": ch["channel_type"],
-                "ChannelName": ch["channel_name"],
-                "Parameters": {
-                    "SelectedRegions":  [],
-                    "Token":            _ZERO_GUID,
-                    "InventoryItemIds": chunk,
-                    "ChannelId":        target_channel_id,
-                },
-                # One item can return several templates, so ask for headroom
-                # rather than exactly len(chunk) entries.
-                "PaginationParameters": {"PageNumber": 1, "EntriesPerPage": max(len(chunk) * 4, 10)},
-            }},
-        )
+        try:
+            resp = call_linnworks(
+                "GenericListings/OpenTemplatesByInventory",
+                {"request": {
+                    "ChannelType": ch["channel_type"],
+                    "ChannelName": ch["channel_name"],
+                    "Parameters": {
+                        "SelectedRegions":  [],
+                        "Token":            _ZERO_GUID,
+                        "InventoryItemIds": chunk,
+                        "ChannelId":        target_channel_id,
+                    },
+                    # One item can return several templates, so ask for headroom
+                    # rather than exactly len(chunk) entries.
+                    "PaginationParameters": {"PageNumber": 1, "EntriesPerPage": max(len(chunk) * 4, 10)},
+                }},
+            )
+        except RateLimitError as exc:
+            for sid in chunk:
+                open_rate_limited_sids.add(sid.lower())
+                rate_limited.append({
+                    "sku": sku_by_sid.get(sid.lower(), sid),
+                    "stock_item_id": sid,
+                    "stage": "opening_templates",
+                    "error": str(exc),
+                })
+            continue
         for t in (resp.get("TemplatesInfo") if isinstance(resp, dict) else None) or []:
             tsid = t.get("StockItemId")
             if tsid:
@@ -19232,6 +19334,8 @@ def unpublish_channel_listing(
     _group_live_cache: dict[str, list[str]] = {}
     parent_sids_to_open: list[str] = []
     for r in resolved:
+        if r["stock_item_id"].lower() in open_rate_limited_sids:
+            continue                          # already captured in rate_limited
         if templates_by_sid.get(r["stock_item_id"].lower()) or r.get("is_variation_parent"):
             continue
         grp = _group_of_child(r["sku"], r["stock_item_id"])
@@ -19278,20 +19382,29 @@ def unpublish_channel_listing(
     parent_sids_to_open = list(dict.fromkeys(parent_sids_to_open))
     for i in range(0, len(parent_sids_to_open), 200):
         chunk = parent_sids_to_open[i:i + 200]
-        resp = call_linnworks(
-            "GenericListings/OpenTemplatesByInventory",
-            {"request": {
-                "ChannelType": ch["channel_type"],
-                "ChannelName": ch["channel_name"],
-                "Parameters": {
-                    "SelectedRegions":  [],
-                    "Token":            _ZERO_GUID,
-                    "InventoryItemIds": chunk,
-                    "ChannelId":        target_channel_id,
-                },
-                "PaginationParameters": {"PageNumber": 1, "EntriesPerPage": max(len(chunk) * 4, 10)},
-            }},
-        )
+        try:
+            resp = call_linnworks(
+                "GenericListings/OpenTemplatesByInventory",
+                {"request": {
+                    "ChannelType": ch["channel_type"],
+                    "ChannelName": ch["channel_name"],
+                    "Parameters": {
+                        "SelectedRegions":  [],
+                        "Token":            _ZERO_GUID,
+                        "InventoryItemIds": chunk,
+                        "ChannelId":        target_channel_id,
+                    },
+                    "PaginationParameters": {"PageNumber": 1, "EntriesPerPage": max(len(chunk) * 4, 10)},
+                }},
+            )
+        except RateLimitError as exc:
+            for sid in chunk:
+                open_rate_limited_sids.add(sid.lower())
+                rate_limited.append({
+                    "sku": None, "stock_item_id": sid,
+                    "stage": "opening_parent_templates", "error": str(exc),
+                })
+            continue
         for t in (resp.get("TemplatesInfo") if isinstance(resp, dict) else None) or []:
             tsid = t.get("StockItemId")
             if tsid:
@@ -19304,12 +19417,16 @@ def unpublish_channel_listing(
     plan: list[dict] = []
     plan_by_template: dict = {}
     for r in resolved:
+        if r["stock_item_id"].lower() in open_rate_limited_sids:
+            continue                          # already captured in rate_limited
         key = r["sku"].strip().lower()
         templates = templates_by_sid.get(r["stock_item_id"].lower()) or []
         via = None
         if not templates:
             via = child_fallback.get(key)
             if via:
+                if via["parent_sid"].lower() in open_rate_limited_sids:
+                    continue                  # already captured in rate_limited
                 templates = templates_by_sid.get(via["parent_sid"].lower()) or []
                 if not templates:
                     unresolved.append({
@@ -19443,6 +19560,216 @@ def unpublish_channel_listing(
             plan.append(row)
             plan_by_template[tid] = row
 
+    # ── Targeted delete: narrow to template_ids + dead-listing gate (#115) ─────
+    #
+    # Everything above is UNCHANGED and, with template_ids=None, produces the
+    # exact plan/unresolved this tool has always produced (AC1). Only when a
+    # caller narrows the delete to specific template ids does any of the
+    # following run.
+    targeted_mode = template_ids is not None
+    requested_ids: list[int] = []
+    untouched_siblings: list[dict] = []
+    override_warnings: list[str] = []
+    listing_existence_checked = None
+
+    if targeted_mode:
+        requested_ids = list(dict.fromkeys(int(t) for t in template_ids))
+
+        # A requested id must belong to a template actually opened for one of
+        # the given SKUs on this channel/store — never trust a raw id (AC3).
+        # If ANY item's templates failed to open (rate-limited), an id not
+        # found among the SUCCESSFULLY-opened ones cannot be confidently
+        # called "not on the item" — it might belong to the item that
+        # couldn't be checked. Route it to rate_limited instead (AC11), never
+        # to the template_not_on_item blocked_reason.
+        opened_ids = {t.get("Id") for tlist in templates_by_sid.values() for t in tlist}
+        for tid in requested_ids:
+            if tid in opened_ids:
+                continue
+            if open_rate_limited_sids:
+                rate_limited.append({
+                    "template_id": tid,
+                    "stage": "checking_template_id_after_rate_limited_open",
+                    "error": (
+                        f"template {tid} was not found among the templates opened so far, "
+                        f"but opening templates for {len(open_rate_limited_sids)} item(s) "
+                        "was rate-limited — cannot confirm whether this id belongs to one "
+                        "of them."
+                    ),
+                })
+                continue
+            unresolved.append({
+                "template_id": tid,
+                "blocked_reason": "template_not_on_item",
+                "error": (
+                    f"template {tid} is not among the {ch['channel_type']} templates opened "
+                    f"for the given SKU(s) on '{sub_source}' (ChannelId {target_channel_id}). "
+                    "It may belong to a different SKU, a different store, or not exist at all "
+                    "— refusing to delete it."
+                ),
+            })
+
+        targeted_rows = [row for row in plan if row["template_id"] in requested_ids]
+        # Scoped to items that actually HAVE a targeted template — a sibling
+        # row from a wholly-untargeted item must never appear in the report
+        # (QA round 1: "items with no targeted template also appear in it").
+        targeted_sids = {row["template_stock_item_id"] for row in targeted_rows}
+        sibling_rows  = [
+            row for row in plan
+            if row["template_id"] not in requested_ids
+            and row["template_stock_item_id"] in targeted_sids
+        ]
+
+        # Per-item report of every template on the item NOT being touched, so a
+        # caller can confirm the live sibling is being left alone (AC2).
+        siblings_by_item: dict[str, dict] = {}
+
+        def _sibling_entry(sid: str, sku: str | None) -> dict:
+            entry = siblings_by_item.get(sid)
+            if entry is None:
+                entry = {"sku": sku, "stock_item_id": sid, "siblings": []}
+                siblings_by_item[sid] = entry
+            elif sku and not entry.get("sku"):
+                entry["sku"] = sku
+            return entry
+
+        for row in sibling_rows:
+            entry = _sibling_entry(row["template_stock_item_id"], row["sku"])
+            entry["siblings"].append({
+                "template_id":       row["template_id"],
+                "active_listing_id": row.get("active_listing_id"),
+                "status":            row.get("status"),
+            })
+
+        # Also surface siblings that never made it into `plan` at all (e.g. a
+        # locked template) by reading templates_by_sid directly, scoped to the
+        # items the targeted rows actually cover.
+        targeted_items = {row["template_stock_item_id"]: row["sku"] for row in targeted_rows}
+        for sid, sku in targeted_items.items():
+            for t in templates_by_sid.get(sid.lower(), []):
+                tid = t.get("Id")
+                if tid in requested_ids:
+                    continue
+                entry = _sibling_entry(sid, sku)
+                if any(s["template_id"] == tid for s in entry["siblings"]):
+                    continue
+                info = t.get("Info") if isinstance(t.get("Info"), dict) else {}
+                entry["siblings"].append({
+                    "template_id":       tid,
+                    "active_listing_id": _glt_field(info, "ActiveListingId"),
+                    "status":            _glt_field(info, "Status"),
+                })
+
+        untouched_siblings = list(siblings_by_item.values())
+        for row in targeted_rows:
+            entry = siblings_by_item.get(row["template_stock_item_id"])
+            row["sibling_template_ids"] = (
+                [s["template_id"] for s in entry["siblings"]] if entry else []
+            )
+
+        # ── Dead-listing safety gate. Reuses _glt_listing_existence / the
+        # null-safe Shopify probe refresh_channel_listing already relies on
+        # (issue #52) — never modified here, per the brief. A targeted row is
+        # only planned when its stored listing is CONFIRMED gone; a confirmed
+        # live listing, or an unverifiable one, is refused by default (AC4/5).
+        #
+        # A quota failure while making that check must land in `rate_limited`
+        # (AC11), NEVER be reported as a data verdict. Two shapes to catch:
+        # a RateLimitError escaping the helper outright, and the RuntimeError
+        # `_shopify_graphql` itself raises once its own backoff ladder is
+        # exhausted ("quota pause, not a data problem") — that one surfaces
+        # through `_glt_listing_existence` as an ordinary check_failed reason,
+        # so it has to be recognised by its wording, not by its type. Only
+        # targeted rows that actually needed the Shopify call (i.e. carry a
+        # resolvable gid) are affected — a row with no listing id was never
+        # part of that call and keeps its normal "no_listing_id" handling.
+        existence_rate_limited = False
+        existence_rl_error = None
+        try:
+            existence = _glt_listing_existence(targeted_rows, sub_source, channel_source)
+        except RateLimitError as exc:
+            existence = {"checked": False, "reason": None, "by_row": {}}
+            existence_rate_limited = True
+            existence_rl_error = str(exc)
+        if (not existence_rate_limited and not existence["checked"]
+                and _is_shopify_quota_reason(existence.get("reason"))):
+            existence_rate_limited = True
+            existence_rl_error = existence["reason"]
+
+        listing_existence_checked = existence["checked"]
+        gated_plan: list[dict] = []
+        for row in targeted_rows:
+            gid = _shopify_product_gid(row.get("active_listing_id"))
+
+            if gid and existence_rate_limited:
+                rate_limited.append({
+                    "sku": row["sku"], "stock_item_id": row["stock_item_id"],
+                    "template_id": row["template_id"],
+                    "stage": "checking_listing_existence",
+                    "error": (
+                        existence_rl_error
+                        or "Shopify quota pause while checking listing existence."
+                    ),
+                })
+                continue
+
+            exists = None
+            if existence["checked"] and gid:
+                exists = existence["by_row"].get(gid, {}).get("exists")
+            row["listing_exists"] = exists
+
+            if exists is False:
+                row["listing_check"] = "gone"
+                gated_plan.append(row)
+                continue
+
+            if exists is True:
+                row["listing_check"] = "exists"
+                reason = "listing_still_live"
+                note = (
+                    f"template {row['template_id']}'s stored listing "
+                    f"({row.get('active_listing_id')}) is CONFIRMED still live on "
+                    f"{ch['channel_type']} '{sub_source}'. Refusing to delete a live listing "
+                    "by default — pass allow_live_listing_delete=True to override."
+                )
+            else:
+                if not existence["checked"]:
+                    cause = (existence["reason"] or "unknown").split(" — ")[0]
+                elif gid is None:
+                    cause = "no_listing_id"
+                else:
+                    cause = "unknown"
+                row["listing_check"] = cause
+                reason = "listing_existence_unverified"
+                note = (
+                    f"could not confirm template {row['template_id']}'s stored listing "
+                    f"({row.get('active_listing_id')}) is gone ({cause}). An UNVERIFIED "
+                    "listing is never treated as dead — refusing to delete it by default. "
+                    "Pass allow_live_listing_delete=True to override."
+                )
+
+            if allow_live_listing_delete:
+                row["override_applied"] = True
+                row["override_reason"] = reason
+                warn = (
+                    f"⚠️  OVERRIDE: deleting template {row['template_id']} "
+                    f"({row['sku']}) despite {reason} — this WILL end listing "
+                    f"{row.get('active_listing_id')}."
+                )
+                row["warning"] = warn
+                override_warnings.append(warn)
+                gated_plan.append(row)
+            else:
+                unresolved.append({
+                    "sku": row["sku"], "stock_item_id": row["stock_item_id"],
+                    "title": row.get("title"), "template_id": row["template_id"],
+                    "active_listing_id": row.get("active_listing_id"),
+                    "blocked_reason": reason,
+                    "error": note,
+                })
+
+        plan = gated_plan
+
     blocked_summary: dict[str, int] = {}
     for u in unresolved:
         code = u.get("blocked_reason") or "unknown"
@@ -19465,9 +19792,18 @@ def unpublish_channel_listing(
         "rate_limited":          rate_limited,
         "complete":              not rate_limited,
     }
+    if targeted_mode:
+        base_out["template_ids_requested"]      = requested_ids
+        base_out["untouched_siblings"]          = untouched_siblings
+        base_out["override_warnings"]           = override_warnings
+        base_out["listing_existence_checked"]   = listing_existence_checked
 
     # ── Write guard (threshold 10) ─────────────────────────────────────────────
-    guard = _write_guard("unpublish_channel_listing", skus, confirmed_count, dry_run)
+    # A targeted delete stages on the number of PLANNED template rows, not on
+    # the SKUs supplied — the natural unit for a scoped delete (issue #115,
+    # AC10). The untargeted path is unchanged: it still stages on `skus`.
+    guard_items = plan if targeted_mode else skus
+    guard = _write_guard("unpublish_channel_listing", guard_items, confirmed_count, dry_run)
     if guard is not None:
         return {**guard, **base_out}
 
@@ -19486,11 +19822,19 @@ def unpublish_channel_listing(
 
     # A small plan against a large request must never read as success (issue #35):
     # spell out how many SKUs are unretirable and WHY, in the message itself.
+    #
+    # In targeted mode an unresolved row may be a template_not_on_item block,
+    # which carries no "sku" at all (it was never resolved to one) — counting
+    # it against "N of M requested SKU(s)" would be a category error, so the
+    # denominator and unit switch to the requested TEMPLATE ids instead.
+    blocked_denominator = len(requested_ids) if targeted_mode else len(skus)
+    blocked_unit = "requested template id(s)" if targeted_mode else "requested SKU(s)"
     blocked_note = (
         ""
         if not unresolved
         else (
-            f" ⚠️  {len(unresolved)} of {len(skus)} requested SKU(s) CANNOT be taken down: "
+            f" ⚠️  {len(unresolved)} of {blocked_denominator} {blocked_unit} CANNOT be taken "
+            "down: "
             + ", ".join(f"{n}× {code}" for code, n in
                         sorted(blocked_summary.items(), key=lambda kv: -kv[1]))
             + ". See unresolved[] — each row carries blocked_reason and what to do instead "
@@ -19652,6 +19996,55 @@ def unpublish_channel_listing(
         r["template_deleted"] = template_gone
         r["template_status_after"] = remaining.get(tid)
 
+        if targeted_mode:
+            # Success is INVERTED here vs the untargeted path: the item's
+            # channel-SKU rows are EXPECTED to remain, because a sibling
+            # template still serves them (issue #115 Traps). Reusing the
+            # general outcomes below would score the correct result
+            # (template_deleted_listing_row_remains) as sync lag, and the
+            # disastrous one (sibling's mapping wiped) as a clean taken_down.
+            sibling_ids = row.get("sibling_template_ids") or []
+            siblings_still_present = [s for s in sibling_ids if s in remaining]
+            siblings_missing       = [s for s in sibling_ids if s not in remaining]
+            r["sibling_template_ids"]       = sibling_ids
+            r["siblings_still_present"]     = siblings_still_present
+            r["siblings_unexpectedly_gone"] = siblings_missing
+            r["siblings_intact"]            = not siblings_missing
+
+            if still_count is None:
+                r["taken_down"] = None
+                r["outcome"] = "unconfirmed"
+            elif not template_gone:
+                r["taken_down"] = False
+                r["outcome"] = "target_delete_failed"
+                r["warning"] = (
+                    f"Target template {tid} was NOT deleted (status "
+                    f"{r['template_status_after']!r}) — it may still be serving a live listing."
+                )
+            elif siblings_missing:
+                r["taken_down"] = False
+                r["outcome"] = "target_deleted_sibling_also_gone"
+                r["warning"] = (
+                    f"Template {tid} was deleted, but sibling template(s) {siblings_missing} "
+                    "that existed at plan time are ALSO gone now. Verify the sibling "
+                    "listing(s) are unaffected before assuming this was clean."
+                )
+            elif still_count == 0:
+                r["taken_down"] = False
+                r["outcome"] = "target_deleted_mapping_lost"
+                r["warning"] = (
+                    f"Template {tid} was deleted and its sibling template(s) still exist, "
+                    "but the item's channel-SKU rows for this store are GONE — THE LIVE "
+                    "LISTING HAS LOST ITS LINNWORKS MAPPING. Stock and price sync will "
+                    "silently stop. Restore the mapping via the Linnworks UI and verify the "
+                    "storefront listing is still correct."
+                )
+            else:
+                r["taken_down"] = True
+                r["outcome"] = "target_deleted"
+                taken += 1
+            continue
+
         if still_count is None:
             # The listing side could not be read — never score a take-down on
             # half the evidence.
@@ -19684,6 +20077,38 @@ def unpublish_channel_listing(
                 f"{r['template_status_after']!r}) and the listing row is still present — "
                 "the listing may still be live. Check the channel's admin."
             )
+
+    if targeted_mode:
+        mapping_lost = sum(1 for r in results if r.get("outcome") == "target_deleted_mapping_lost")
+        sibling_gone = sum(1 for r in results if r.get("outcome") == "target_deleted_sibling_also_gone")
+        failed_t     = sum(1 for r in results if r.get("outcome") == "target_delete_failed")
+        extra_t = ""
+        if mapping_lost:
+            extra_t += (
+                f" ⚠️ {mapping_lost} target template(s) were deleted but the LIVE SIBLING'S "
+                "channel-SKU mapping is now gone — see results[].warning."
+            )
+        if sibling_gone:
+            extra_t += (
+                f" ⚠️ {sibling_gone} target template(s) were deleted and an expected SIBLING "
+                "template also vanished — see results[].warning."
+            )
+        if failed_t:
+            extra_t += f" {failed_t} target template(s) were NOT deleted."
+        return {
+            "dry_run": False,
+            **base_out,
+            "results": results,
+            "taken_down_count": taken,
+            "mapping_lost_count": mapping_lost,
+            "sibling_also_gone_count": sibling_gone,
+            "target_delete_failed_count": failed_t,
+            "message": (
+                f"{taken}/{len(plan)} targeted {ch['channel_type']} template(s) on "
+                f"'{sub_source}' confirmed deleted with the sibling(s) and channel-SKU "
+                f"mapping intact.{extra_t}{blocked_note}{unproven_note}"
+            ),
+        }
 
     orphaned = sum(1 for r in results if r.get("outcome") == "listing_gone_template_orphaned")
     failed = sum(1 for r in results if r.get("outcome") == "delete_failed")
@@ -19940,6 +20365,16 @@ def delist_all_channel_listings(
             t["skus"].append(w["sku"])
     targets_work = list(by_target.values())
 
+    # A delegate's own `rate_limited` bucket must never be silently dropped
+    # here (issue #115, QA round 1 finding 2) — before this, only `plan` and
+    # `unresolved` were read back from each delegate call, so a SKU whose
+    # OpenTemplatesByInventory got throttled inside the delegate vanished
+    # without trace: it appeared in neither `plan` nor `unresolved`, and the
+    # fan-out reported a clean "nothing to take down" for it. Collected across
+    # BOTH delegation loops (dry-run planning AND the live run below), tagged
+    # with the (channel, sub_source) target it came from.
+    fan_rate_limited: list[dict] = []
+
     plan: list[dict] = []
     for w in targets_work:
         sub = unpublish_channel_listing(
@@ -19950,6 +20385,10 @@ def delist_all_channel_listings(
             # delegate must not stage a batch the caller has already confirmed.
             confirmed_count=len(w["skus"]), dry_run=True,
         )
+        for rl in sub.get("rate_limited") or []:
+            fan_rate_limited.append({
+                **rl, "channel": w["channel_type"], "sub_source": w["sub_source"],
+            })
         if sub.get("error"):
             unresolved.append({**w, "error": sub["error"]})
             continue
@@ -19979,12 +20418,16 @@ def delist_all_channel_listings(
         "skipped_channels": [
             {"sku": d["sku"], **s} for d in discovery for s in d["skipped_channels"]
         ],
+        # A live reference: entries the live-run loop below appends to
+        # `fan_rate_limited` after this dict is built are still visible
+        # through it, since dict values are references, not copies.
+        "rate_limited":     fan_rate_limited,
     }
 
     # ── Write guard (threshold 10) on the number of take-downs ─────────────────
     guard = _write_guard("delist_all_channel_listings", plan, confirmed_count, dry_run)
     if guard is not None:
-        return {**guard, **base_out}
+        return {**guard, **base_out, "complete": not fan_rate_limited}
 
     unproven = sorted({p["channel"] for p in plan if not p.get("delete_proven")})
     unproven_note = (
@@ -20017,17 +20460,24 @@ def delist_all_channel_listings(
         )
     )
 
+    rate_limit_note = (
+        f" ⚠️  {len(fan_rate_limited)} item(s) could not be checked (Linnworks quota) — "
+        "see rate_limited; re-run for those once the quota window has passed."
+        if fan_rate_limited else ""
+    )
+
     if dry_run:
         return {
             "dry_run": True,
             **base_out,
+            "complete": not fan_rate_limited,
             "take_down_count": len(plan),
             "message": (
                 f"Dry run — nothing taken down. {len(plan)} template(s) would be DELETED, "
                 f"covering {base_out['retirable_sku_count']} of {len(skus)} requested SKU(s); "
                 f"{len(base_out['skipped_channels'])} listing(s) on non-GLT channels stay up "
                 "(see skipped_channels). Review the plan, then set "
-                f"dry_run=False.{group_note}{blocked_note}{unproven_note}"
+                f"dry_run=False.{group_note}{blocked_note}{unproven_note}{rate_limit_note}"
             ),
         }
 
@@ -20040,6 +20490,10 @@ def delist_all_channel_listings(
             also_retiring_skus=batch_skus,
             confirmed_count=len(w["skus"]), dry_run=False,
         )
+        for rl in sub.get("rate_limited") or []:
+            fan_rate_limited.append({
+                **rl, "channel": w["channel_type"], "sub_source": w["sub_source"],
+            })
         results.extend(sub.get("results", []))
 
     # ── Honest read-back: which sub-sources are STILL listed per (sku, channel)?
@@ -20080,9 +20534,17 @@ def delist_all_channel_listings(
     if failed:
         extra += (f" ⚠️ {failed} template(s) were NOT deleted and still have a live listing row — "
                   "these may still be selling; check the channel's admin.")
+    # Recompute against the final fan_rate_limited: the live loop above may have
+    # added entries the dry-run planning loop never saw.
+    live_rate_limit_note = (
+        f" ⚠️  {len(fan_rate_limited)} item(s) could not be checked (Linnworks quota) — "
+        "see rate_limited; they were NOT taken down and are not counted above."
+        if fan_rate_limited else ""
+    )
     return {
         "dry_run": False,
         **base_out,
+        "complete": not fan_rate_limited,
         "results": results,
         "still_listed_sub_sources": still_listed,
         "taken_down_count": taken,
@@ -20094,7 +20556,7 @@ def delist_all_channel_listings(
             "left up (see skipped_channels) — those need ending in the channel's own admin. "
             "still_listed_sub_sources lists any store/region whose channel-SKU row survived; "
             "channel sync can lag, so re-check with get_channel_listings before concluding the "
-            f"take-down failed.{extra}{group_note}{blocked_note}{unproven_note}"
+            f"take-down failed.{extra}{group_note}{blocked_note}{unproven_note}{live_rate_limit_note}"
         ),
     }
 
@@ -21514,6 +21976,20 @@ def _shopify_listings_exist(store: dict, product_gids: list[str]) -> dict[str, d
             else:
                 out[gid] = {"exists": False, "title": None, "status": None}
     return out
+
+
+def _is_shopify_quota_reason(reason: str | None) -> bool:
+    """True when a `_glt_listing_existence` `reason` string is a Shopify quota
+    pause (`_shopify_graphql`'s own wording once its retry ladder is
+    exhausted), not a genuine check failure.
+
+    `_shopify_graphql` raises a plain RuntimeError for this case (it already
+    retried 5/10/20/30s internally; the eventual failure is one more
+    RuntimeError from the caller's point of view, same as every other Shopify
+    error) — so a quota pause can only be told apart from a real failure by
+    its wording, not by exception type (issue #115, AC11).
+    """
+    return bool(reason) and "quota pause, not a data problem" in reason
 
 
 def _glt_listing_existence(rows: list[dict], sub_source: str,

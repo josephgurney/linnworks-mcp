@@ -119,12 +119,19 @@ SKU_TO_SID = {"vnm_bearings_gold": SID_A, "RS-102201": SID_S,
               "vnm_bearings_silver": SID_B, "vnm_bearings_black": SID_C}
 
 
-def _mock(delete_clears=True, lock_template=None):
+def _mock(delete_clears=True, lock_template=None, open_rate_limit_on=None):
     """Mock the call layer.
 
     delete_clears: whether a processed Delete removes that channel's rows from
         the channel-SKU table (the read-back signal).
+    open_rate_limit_on: a stock_item_id whose OpenTemplatesByInventory call
+        should raise RateLimitError EVERY time it appears (a persistent quota
+        pause, not a one-off) — issue #115, QA round 1 finding 2: the fan-out
+        must surface this on both the dry-run planning pass and the live-run
+        pass, not silently drop the SKU on either.
     """
+    import server
+
     captured = {"process": [], "opened": []}
     # Mutable copy so a Delete can be reflected in the read-back.
     live = {sid: [dict(r) for r in rows] for sid, rows in CHANNEL_SKUS.items()}
@@ -150,8 +157,10 @@ def _mock(delete_clears=True, lock_template=None):
         if path.endswith("OpenTemplatesByInventory"):
             req = payload["request"]
             cid = req["Parameters"]["ChannelId"]
-            captured["opened"].append((req["ChannelType"], cid,
-                                       tuple(req["Parameters"]["InventoryItemIds"])))
+            ids = req["Parameters"]["InventoryItemIds"]
+            captured["opened"].append((req["ChannelType"], cid, tuple(ids)))
+            if open_rate_limit_on and open_rate_limit_on in ids:
+                raise server.RateLimitError("HTTP 429 — API calls quota exceeded!")
             out = []
             for sid in req["Parameters"]["InventoryItemIds"]:
                 for t in TEMPLATES.get((sid, cid), []):
@@ -558,6 +567,62 @@ def test_fanout_stages_above_threshold_and_writes_nothing():
     assert r.get("staged") is True
     assert not captured["process"]
     assert r["plan"]                      # the manifest is still returned
+
+
+# ── issue #115, QA round 1 finding 2: rate-limited SKUs must not vanish ──────
+
+def test_fanout_dry_run_reports_throttled_sku_not_a_clean_result():
+    """Before this fix, a delegate's own `rate_limited` bucket (from a
+    RateLimitError while opening templates inside unpublish_channel_listing)
+    was read from neither `plan` nor `unresolved` by the fan-out, so the
+    throttled SKU vanished without trace and the run reported a clean
+    'nothing to take down'."""
+    import server
+    patches, captured = _mock(open_rate_limit_on=SID_S)
+    with patches[0], patches[1]:
+        out = server.delist_all_shopify_listings(["RS-102201"], dry_run=True)
+
+    assert out["complete"] is False
+    assert any(
+        r.get("sku") == "RS-102201" or r.get("stock_item_id") == SID_S
+        for r in out["rate_limited"]
+    )
+    # It must not silently read as a completed, empty run either.
+    assert out["plan"] == []
+    assert out["unresolved"] == []
+
+
+def test_fanout_channel_listings_reports_throttled_sku_too():
+    """The same defect, exercised through delist_all_channel_listings
+    directly rather than the Shopify-scoped wrapper."""
+    import server
+    patches, captured = _mock(open_rate_limit_on=SID_S)
+    with patches[0], patches[1]:
+        out = server.delist_all_channel_listings(
+            ["RS-102201"], channels=["Shopify"], dry_run=True)
+
+    assert out["complete"] is False
+    assert any(
+        r.get("sku") == "RS-102201" or r.get("stock_item_id") == SID_S
+        for r in out["rate_limited"]
+    )
+
+
+def test_fanout_live_run_reports_throttled_sku_and_stays_incomplete():
+    """A live run must carry the same rate_limited/complete reporting — not
+    only the dry-run planning pass."""
+    import server
+    patches, captured = _mock(open_rate_limit_on=SID_S)
+    with patches[0], patches[1]:
+        out = server.delist_all_shopify_listings(["RS-102201"], dry_run=False)
+
+    assert out["complete"] is False
+    assert any(
+        r.get("sku") == "RS-102201" or r.get("stock_item_id") == SID_S
+        for r in out["rate_limited"]
+    )
+    # Nothing was ever deleted for the throttled item.
+    assert not captured["process"]
 
 
 def test_fanout_wrong_confirmed_count_blocks():
