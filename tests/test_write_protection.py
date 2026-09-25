@@ -220,8 +220,26 @@ class TestWriteThresholds:
         assert price <= inventory, "Price threshold should be ≤ inventory threshold"
         assert inventory <= images, "Inventory threshold should be ≤ images threshold"
 
-    def test_all_thresholds_are_positive_integers(self):
+    def test_all_thresholds_are_positive_integers_except_the_one_documented_zero(self):
+        # delete_dangling_glt_template is the deliberate exception: 0 is not a
+        # typo. _write_guard proceeds unstaged when count <= threshold, and this
+        # tool's plan is always a single item — a threshold of 1 would let every
+        # live run through unstaged. 0 forces a staged manifest on EVERY run (#115).
+        # The membership assertion below is a tautology (it compares `exempt`
+        # to a literal copy of its own definition) and is NOT a guard against a
+        # future task adding a second name to `exempt` — anyone doing that would
+        # naturally edit both lines together, so there is no invariant here that
+        # such a change could silently violate. What it actually does is
+        # document, in a form the diff makes visible, that this set is meant to
+        # stay a singleton — a reviewer sees the intended membership spelled out
+        # explicitly on its own line, rather than having to trust the variable
+        # name `exempt` alone.
+        exempt = {"delete_dangling_glt_template"}
+        assert exempt == {"delete_dangling_glt_template"}
         for op, val in server.WRITE_THRESHOLDS.items():
+            if op in exempt:
+                assert isinstance(val, int) and val == 0, f"{op}: exempt threshold must be exactly 0"
+                continue
             assert isinstance(val, int) and val > 0, f"{op}: threshold must be a positive int"
 
     def test_unpublish_channel_listing_is_destructive_tier(self):

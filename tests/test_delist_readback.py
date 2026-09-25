@@ -193,3 +193,16 @@ def test_single_template_item_still_works():
     assert len(out["results"]) == 1
     assert out["results"][0]["taken_down"] is True
     assert out["taken_down_count"] == 1
+
+
+def test_unpublish_signature_is_unchanged_by_issue_115():
+    """#115 added two new tools rather than a `template_ids` parameter here,
+    precisely so this 827-line live-proven destructive path stayed still.
+    A new parameter appearing on it means that decision was reversed by
+    accident — see the spec's D2."""
+    import inspect
+    params = list(inspect.signature(server.unpublish_channel_listing).parameters)
+    assert params == [
+        "skus", "sub_source", "channel", "allow_variation_parent_takedown",
+        "also_retiring_skus", "confirmed_count", "dry_run",
+    ]
