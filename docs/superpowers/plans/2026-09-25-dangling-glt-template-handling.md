@@ -569,12 +569,32 @@ def find_dangling_glt_templates(
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_dangling_template_report.py -v`
-Expected: PASS (13 passed, 1 skipped)
+Expected: PASS (13 passed)
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Document the new tool in the same commit**
+
+`tests/test_docs_consistency.py` asserts the tool count in three places and that every
+registered tool appears in BOTH docs. Registering a tool without documenting it leaves
+the suite red, so the docs move with the code.
+
+1. `CLAUDE.md:3` — `**Current version: 1.63.1** — 99 tools.`
+2. `CLAUDE.md` Tools section — the line reading `98 tools.` becomes `99 tools.`
+3. `README.md:4` — `![Tools](https://img.shields.io/badge/tools-99-blue)`
+4. Add this row to the tools table in **both** `CLAUDE.md` and `README.md`:
+
+```markdown
+| `find_dangling_glt_templates(skus, sub_source="SWH Shopify", channel="Shopify")` | `GenericListings/GetConfiguratorsInfoPaged` + `GenericListings/OpenTemplatesByInventory` + `Inventory/BatchGetInventoryItemChannelSKUs` (all reads) | — | **Read-only.** Reports which of a SKU's GLT templates are PROVABLY dangling — pointing at a listing that no longer exists on the channel, which is invisible to `get_channel_listings` and breaks pushes (#52). Proof of death is `Info.Status == "Not deleted"` and nothing else, per the SCOPE corollary: no Shopify credentials are used or needed. ⚠️ **PRECISION, NOT RECALL — it can prove a template IS dangling and can never prove one is fine.** Verdicts are `dangling_proven` / `not_proven_dangling`; there is deliberately no `healthy` verdict, because ~4 of the census's 145 dangling templates carry another status and `Listed` templates have never been swept. A VERIFICATION tool, not a discovery tool: per-SKU scope, so discovery remains the catalogue sweep (`docs/dangling-templates-swh-shopify.md`). Variation-aware — a Shopify child holds rows but no template of its own, so it reports the parent's template rather than "no templates". Trusts `TemplatesInfo`, never `TotalEntries`. |
+```
+
+- [ ] **Step 6: Run the docs suite to verify it stayed green**
+
+Run: `.venv/bin/python -m pytest tests/test_docs_consistency.py -q`
+Expected: PASS
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add server.py tests/test_dangling_template_report.py
+git add server.py tests/test_dangling_template_report.py CLAUDE.md README.md
 git commit -m "feat: find_dangling_glt_templates, read-only (#115)"
 ```
 
@@ -968,10 +988,38 @@ def delete_dangling_glt_template(
 Run: `.venv/bin/python -m pytest tests/test_dangling_template_delete.py -v`
 Expected: PASS (11 passed)
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Document the new tool and its threshold in the same commit**
+
+This task registers tool #100 **and** adds a `WRITE_THRESHOLDS` key.
+`tests/test_docs_consistency.py` asserts both: every registered tool must appear in both
+docs, and every threshold key must have a matching table row in both docs. So both move
+with the code.
+
+1. `CLAUDE.md:3` — `**Current version: 1.63.1** — 100 tools.`
+2. `CLAUDE.md` Tools section — `99 tools.` becomes `100 tools.`
+3. `README.md:4` — `![Tools](https://img.shields.io/badge/tools-100-blue)`
+4. Add this row to the threshold table in **both** `CLAUDE.md` and `README.md`. The row
+   format the test parses is `` | `name` | N | `` — the number must be exactly `0`:
+
+```markdown
+| `delete_dangling_glt_template` | 0 |
+```
+
+5. Add this row to the tools table in **both** `CLAUDE.md` and `README.md`:
+
+```markdown
+| `delete_dangling_glt_template(sku, template_id, sub_source="SWH Shopify", channel="Shopify", allow_unproven_delete=False, confirmed_count, dry_run=True)` | `GenericListings/OpenTemplatesByInventory` (read) → `GenericListings/ProcessTemplates` Action=`Delete` (write) → read-back | 0 | ⚠️ **PROVISIONAL AND EXPERIMENTAL — this tool exists to answer a question on ONE SKU, and two of its three plausible outcomes end with it being REMOVED from this server.** Deletes one named GLT template while leaving its siblings alone. Singular by construction: one SKU, one template id, no lists. **Two questions in sequence: (A) does `ProcessTemplates` Delete land at all on a template reading `Not deleted`** — unproven, and that status means Linnworks already tried and did not succeed, so re-firing one "returned a clean 2xx and changed nothing" (#36); **(B) if it lands, does it take the ITEM's channel-SKU rows and so the LIVE sibling's mapping with it** — the #36 read-back records that "the first successful delete empties that table for the whole item", and v1.50.0 declined to use `unpublish_channel_listing` on the Echo orphan for exactly this reason. B is reachable only if A is yes. Four gates, each refusing with no write sent: `template_not_on_item`, `dangling_not_proven`, `no_sibling_use_unpublish` (scope, not safety — use `unpublish_channel_listing`), `variation_child_live_siblings`. Captures channel-SKU rows before and after; outcomes are `orphan_removed_siblings_intact`, `orphan_removed_sibling_mapping_lost` (failure, loud warning — restore via the UI), `delete_refused_by_linnworks`, `unconfirmed`. A threshold of **0** means every live run stages a manifest and must echo `confirmed_count=1`. **Do not batch it. Run it once, on one low-value SKU, and record the result.** |
+```
+
+- [ ] **Step 7: Run the docs suite to verify it stayed green**
+
+Run: `.venv/bin/python -m pytest tests/test_docs_consistency.py -q`
+Expected: PASS
+
+- [ ] **Step 8: Commit**
 
 ```bash
-git add server.py tests/test_dangling_template_delete.py
+git add server.py tests/test_dangling_template_delete.py CLAUDE.md README.md
 git commit -m "feat: delete_dangling_glt_template gates and dry run (#115)"
 ```
 
@@ -1283,7 +1331,9 @@ Expected: a count of **100**
 
 - [ ] **Step 2: Bump the version in all four places**
 
-Set `1.64.0` (a feature release — two new tools) in:
+Tool counts and both tools-table rows are already correct — Tasks 2 and 3 added them
+alongside the code they document, so the docs suite has been green throughout. Only the
+version moves here. Set `1.64.0` (a feature release — two new tools) in:
 
 ```bash
 # pyproject.toml:3      version = "1.64.0"
@@ -1292,18 +1342,7 @@ Set `1.64.0` (a feature release — two new tools) in:
 # CLAUDE.md:3           **Current version: 1.64.0** — 100 tools. …
 ```
 
-Also update both tool-count badges: `README.md` `badge/tools-100-blue`, and the CLAUDE.md tools-section line that reads `98 tools.`
-
-- [ ] **Step 3: Add the two tools-table rows to README.md and CLAUDE.md**
-
-```markdown
-| `find_dangling_glt_templates(skus, sub_source="SWH Shopify", channel="Shopify")` | `GenericListings/GetConfiguratorsInfoPaged` + `GenericListings/OpenTemplatesByInventory` + `Inventory/BatchGetInventoryItemChannelSKUs` (all reads) | — | **Read-only.** Reports which of a SKU's GLT templates are PROVABLY dangling — pointing at a listing that no longer exists on the channel, which is invisible to `get_channel_listings` and breaks pushes (#52). Proof of death is `Info.Status == "Not deleted"` and nothing else, per the SCOPE corollary: no Shopify credentials are used or needed. ⚠️ **PRECISION, NOT RECALL — it can prove a template IS dangling and can never prove one is fine.** Verdicts are `dangling_proven` / `not_proven_dangling`; there is deliberately no `healthy` verdict, because ~4 of the census's 145 dangling templates carry another status and `Listed` templates have never been swept. A VERIFICATION tool, not a discovery tool: per-SKU scope, so discovery remains the catalogue sweep (`docs/dangling-templates-swh-shopify.md`). Variation-aware — a Shopify child holds rows but no template of its own, so it reports the parent's template rather than "no templates". Trusts `TemplatesInfo`, never `TotalEntries`. |
-| `delete_dangling_glt_template(sku, template_id, sub_source="SWH Shopify", channel="Shopify", allow_unproven_delete=False, confirmed_count, dry_run=True)` | `GenericListings/OpenTemplatesByInventory` (read) → `GenericListings/ProcessTemplates` Action=`Delete` (write) → read-back | 0 (stages every live run) | ⚠️ **PROVISIONAL AND EXPERIMENTAL — this tool exists to answer a question on ONE SKU, and two of its three plausible outcomes end with it being REMOVED from this server.** Deletes one named GLT template while leaving its siblings alone. Singular by construction: one SKU, one template id, no lists. **Two questions in sequence: (A) does `ProcessTemplates` Delete land at all on a template reading `Not deleted`** — unproven, and that status means Linnworks already tried and did not succeed, so re-firing one "returned a clean 2xx and changed nothing" (#36); **(B) if it lands, does it take the ITEM's channel-SKU rows and so the LIVE sibling's mapping with it** — the #36 read-back records that "the first successful delete empties that table for the whole item", and v1.50.0 declined to use `unpublish_channel_listing` on the Echo orphan for exactly this reason. B is reachable only if A is yes. Four gates, each refusing with no write sent: `template_not_on_item`, `dangling_not_proven`, `no_sibling_use_unpublish` (scope, not safety — use `unpublish_channel_listing`), `variation_child_live_siblings`. Captures channel-SKU rows before and after; outcomes are `orphan_removed_siblings_intact`, `orphan_removed_sibling_mapping_lost` (failure, loud warning — restore via the UI), `delete_refused_by_linnworks`, `unconfirmed`. **Do not batch it. Run it once, on one low-value SKU, and record the result.** |
-```
-
-Add to README's threshold table: `| `delete_dangling_glt_template` | 0 (every live run stages) |`
-
-- [ ] **Step 4: Add the CLAUDE.md release note**
+- [ ] **Step 3: Add the CLAUDE.md release note**
 
 Insert directly above the `v1.63.1` entry, matching house style:
 
@@ -1311,7 +1350,7 @@ Insert directly above the `v1.63.1` entry, matching house style:
 > **v1.64.0 (issue #115) — targeted dangling-GLT-template handling: a read-only reporter, and a PROVISIONAL delete whose likeliest outcome is its own removal (25 Sep 2026):** Two new tools (98 → 100); `unpublish_channel_listing` was deliberately NOT modified and a signature test pins that. **(1) `find_dangling_glt_templates` is read-only** and reports which of a SKU's templates are provably dangling, using `Info.Status == "Not deleted"` as the sole proof of death per the v1.63.1 SCOPE corollary — no Shopify credentials, none needed. ⚠️ **It can prove a template IS dangling and can NEVER prove one is fine**, so the verdicts are `dangling_proven` / `not_proven_dangling` with no `healthy` value anywhere: the detector is precise (141/141, then 42/42 across two independent sweeps) but not complete (~4 of 145 known dangling templates carry another status; `Listed` templates have never been swept). Its value is packaging and vocabulary rather than new capability — `refresh_channel_listing`'s dry run already exposed the same `status` field — and it is a VERIFICATION tool, not a discovery one. **(2) `delete_dangling_glt_template` is provisional and exists to settle an open question, not to clean up at scale.** Singular by construction, four refusal gates, a staging threshold of **0** so every live run stages a manifest and echoes `confirmed_count=1`. ⚠️ **THE NEAR-CIRCULARITY IS THE POINT AND IS RECORDED HONESTLY: the proof of death (`Not deleted`) is ALSO the signal of a prior delete failure**, so this tool is engineered to fire on templates that may well refuse to delete. Hence two questions in sequence — **(A)** does Delete land at all, **(B)** if it lands, does it take the item's channel-SKU rows and so the live sibling's Linnworks mapping (the #36 read-back records that "the first successful delete empties that table for the whole item", and v1.50.0 declined to use `unpublish_channel_listing` on the Echo orphan for precisely this reason). **B is reachable only if A is yes, and A = no is the likelier branch** — inconclusive about the danger, but decisive about the decision, since it would mean the GLT UI is the answer regardless. **Two of three plausible endings finish with this tool being deleted from the server.** ⚠️ **What fraction of dangling templates even sit on an item with a live sibling is UNKNOWN** — the 9 Sep census records 145 dangling templates across 145 distinct SKUs but not how many of those items hold a live template, and the 23 Sep Group 1/Group 2 sweep is not in this repo. If Group 2 dominates, this tool addresses a minority of cases. Design: `docs/superpowers/specs/2026-09-25-dangling-glt-template-handling-design.md`. 25 new tests, 1218 → 1243 total.
 ```
 
-- [ ] **Step 5: Record the threshold deviation in the spec**
+- [ ] **Step 4: Record the threshold deviation in the spec**
 
 In the spec's tool (b) section, replace `WRITE_THRESHOLDS["delete_dangling_glt_template"] = 1` with:
 
@@ -1323,12 +1362,12 @@ proceeds unstaged. `0` makes every live run stage a manifest and echo `confirmed
 which is the two-deliberate-acts behaviour this spec intended.
 ```
 
-- [ ] **Step 6: Run the whole suite**
+- [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/python -m pytest -q`
 Expected: PASS, 1243 passed
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add -A
