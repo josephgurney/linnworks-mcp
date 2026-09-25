@@ -22,6 +22,7 @@ import re
 import sys
 import tomllib
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -808,3 +809,114 @@ def test_no_doc_line_still_calls_the_remove_order_item_endpoint_unproven():
         "REMOVE_ORDER_ITEM_OBSERVATIONS records the endpoint proven, but these "
         "lines still call it unproven:\n  " + "\n  ".join(offenders)
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #88 — set_order_status: the parked question, and the stale blanket
+# "not yet live-fired" claims on ChangeStatus.
+# ---------------------------------------------------------------------------
+
+def _change_status_endpoint_row() -> str:
+    match = re.search(r"^\| `Orders/ChangeStatus` \|.*$", CLAUDE_MD, re.M)
+    assert match, "CLAUDE.md is missing the Orders/ChangeStatus confirmed-endpoints row"
+    return match.group(0)
+
+
+def _assert_unpaid_parking_docs_agree() -> None:
+    """The guard itself, factored out so a test can prove it actually bites
+    when the constant moves. AC9 asks for the demonstration, not the promise.
+    """
+    state = server.UNPAID_FLIP_PARKS_ORDER["state"]
+    rows = (
+        ("README.md", _readme_row("set_order_status")),
+        ("CLAUDE.md", _claude_md_tools_table_row("set_order_status")),
+    )
+    for doc_name, row in rows:
+        low = row.lower()
+        where = f"{doc_name}'s set_order_status row"
+        if state == "not_observed":
+            assert "not yet observed" in low, (
+                f"{where} must say the unpaid→parked question is not yet "
+                "observed, because UNPAID_FLIP_PARKS_ORDER says nobody has "
+                "looked")
+            for overclaim in ("unpaid parks the order", "does not park the order"):
+                assert overclaim not in low, (
+                    f"{where} answers the parking question ({overclaim!r}) "
+                    "while the code records no observation")
+        elif state == "parks":
+            assert "unpaid parks the order" in low, (
+                f"{where} does not record that an unpaid flip parks the "
+                "order, which the code now says it does")
+            assert "not yet observed" not in low, (
+                f"{where} still calls the parking question unobserved after "
+                "the code recorded an answer")
+        elif state == "does_not_park":
+            assert "does not park the order" in low, (
+                f"{where} does not record that an unpaid flip leaves the "
+                "order unparked, which the code now says")
+            assert "not yet observed" not in low, (
+                f"{where} still calls the parking question unobserved after "
+                "the code recorded an answer")
+        else:
+            raise AssertionError(f"unknown UNPAID_FLIP_PARKS_ORDER state {state!r}")
+
+
+def test_set_order_status_rows_agree_with_the_code_on_the_parking_answer():
+    _assert_unpaid_parking_docs_agree()
+
+
+@pytest.mark.parametrize("answered_state", ["parks", "does_not_park"])
+def test_the_parking_guard_bites_when_the_constant_moves(answered_state):
+    """Mutate the constant to each answered state and prove the guard fails
+    while the docs still say 'not yet observed'. A guard nobody has watched
+    fail is not a guard."""
+    assert server.UNPAID_FLIP_PARKS_ORDER["state"] == "not_observed", (
+        "this demonstration assumes the shipped state is unset")
+    with mock.patch.dict(server.UNPAID_FLIP_PARKS_ORDER,
+                         {"state": answered_state}, clear=False):
+        with pytest.raises(AssertionError):
+            _assert_unpaid_parking_docs_agree()
+
+
+def test_set_order_status_row_no_longer_blanket_claims_paid_unpaid_unfired():
+    """The row said 'paid/unpaid not yet live-fired' full stop. That is now
+    two claims wearing one coat: Orders/ChangeStatus HAS been fired live
+    (status 4, order 611397, 18 Sep 2026, via create_order's resend path),
+    while status 1/0 THROUGH THIS TOOL has not."""
+    row = _claude_md_tools_table_row("set_order_status")
+    assert "paid/unpaid not yet live-fired" not in row.lower(), (
+        "CLAUDE.md's set_order_status row still carries the blanket claim; it "
+        "must distinguish the endpoint (fired) from status 1/0 via this tool "
+        "(not fired)")
+    assert "611397" in row, (
+        "the row should cite the order that proves Orders/ChangeStatus itself "
+        "has been fired live")
+
+
+def test_change_status_endpoint_row_no_longer_says_the_write_is_unfired():
+    """Stale independently of #88: the v1.55.2 note has recorded
+    ChangeStatus(4) fired live since 18 Sep 2026, while this row went on
+    saying the write had never been fired."""
+    row = _change_status_endpoint_row()
+    assert "the ChangeStatus write not yet live-fired" not in row, (
+        "CLAUDE.md's Orders/ChangeStatus row still says the write has never "
+        "been fired, contradicting the v1.55.2 note")
+    assert "611397" in row, "the row must cite the order it was fired on"
+    assert "1/0" in row or "status 1" in row, (
+        "the row must still scope status 1/0 via set_order_status as unfired")
+
+
+def test_no_doc_claims_a_live_proof_of_the_unpaid_parking_question():
+    """The failure mode this whole issue exists to avoid: a confident doc
+    claim about a run nobody made."""
+    assert server.UNPAID_FLIP_PARKS_ORDER["state"] == "not_observed"
+    for doc_name, text in (("CLAUDE.md", CLAUDE_MD), ("README.md", README_MD)):
+        low = text.lower()
+        for overclaim in (
+            "unpaid flip parks the order (live",
+            "proven that an unpaid flip parks",
+            "live-proven: unpaid parks",
+        ):
+            assert overclaim not in low, (
+                f"{doc_name} claims a live proof of the parking question that "
+                f"has not been run: {overclaim!r}")

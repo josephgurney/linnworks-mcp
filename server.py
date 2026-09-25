@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.62.3"
+__version__ = "1.63.1"
 
 import json
 import os
@@ -104,6 +104,81 @@ _ORDER_STATUS_ACTIONS: dict[str, tuple[str, object]] = {
 # Park/unpark exist only as a RulesEngine action (ChangeOrderParkStatus) with no
 # standalone endpoint — GeneralInfo.IsParked is READ-only via the API.
 _UNSUPPORTED_STATUS_ACTIONS: set[str] = {"park", "unpark"}
+
+# ── Does flipping an EXISTING order to unpaid park it? NOT YET OBSERVED ──────
+#
+# One place, one answer, one accessor — the REFUND_PUSH_CHANNELS shape (see
+# the note there), because this repo has already had to consolidate two
+# competing spellings of "is this proven?" once (issue #47 adopting #45's
+# vocabulary), and a second name for one idea is how docs and code drift apart.
+#
+# What IS known, and why it does not answer this question: Linnworks
+# force-parks an order that is CREATED unpaid — proven live 18 Sep 2026 on
+# order 611398 (v1.55.2), and the ChannelOrder spec says so outright ("If
+# Unpaid ChannelOrderAdapter.Save() will ensure order is PARKED"). But that is
+# ChannelOrderAdapter.Save() on a NEW order. Nothing here has ever watched
+# Orders/ChangeStatus(0) land on an order that already exists, and the two are
+# different code paths on Linnworks' side. Assuming the create-time behaviour
+# carries over is exactly the generalisation-from-one-sample this repo has had
+# to retract twice already.
+#
+# Why it matters enough to track: a parked order is OUT OF THE DISPATCH QUEUE.
+# If an unpaid flip parks, then "mark this order unpaid" quietly pulls it from
+# fulfilment — a much larger effect than the action's name suggests. And the
+# asymmetric case nobody has asked about: if unpaid parks, does flipping back
+# to paid UNPARK? Checking only that the status reads 1 at the end would miss
+# an order silently left out of the queue.
+#
+# SHIPS UNSET, and must stay that way until someone fires the proof and records
+# it on the owner-run issue. Filling this in without a live run would be the
+# overstated doc claim the consistency guards exist to catch.
+#
+#   state:      "not_observed" | "parks" | "does_not_park"
+#   evidence:   the live reading, verbatim — order id, date, what was seen
+#   conditions: the one sample's circumstances, so nobody over-generalises it
+UNPAID_FLIP_PARKS_ORDER: dict[str, Optional[str]] = {
+    "state":      "not_observed",
+    "evidence":   None,
+    "conditions": None,
+}
+
+
+def _unpaid_parks_prediction() -> tuple[Optional[bool], str]:
+    """The one place the unpaid→parked prediction is derived from.
+
+    Returns (predicted_parked, reason). predicted_parked is None while the
+    answer is unobserved — which is not the same as False, and callers must
+    not collapse the two: None means "nobody has looked", False would mean
+    "somebody looked and it does not park".
+    """
+    state = UNPAID_FLIP_PARKS_ORDER["state"]
+    evidence = UNPAID_FLIP_PARKS_ORDER["evidence"]
+    conditions = UNPAID_FLIP_PARKS_ORDER["conditions"]
+
+    provenance = ""
+    if evidence:
+        provenance += f" Observed: {evidence}."
+    if conditions:
+        provenance += f" Conditions: {conditions}."
+
+    if state == "parks":
+        return True, (
+            "The order WILL BE PARKED and pulled out of the dispatch queue."
+            + provenance
+        )
+    if state == "does_not_park":
+        return False, (
+            "The order WILL NOT BE PARKED — it stays in the dispatch queue."
+            + provenance
+        )
+    return None, (
+        "⚠️ NOT YET OBSERVED whether flipping an existing order to unpaid parks "
+        "it. Linnworks force-parks an order CREATED unpaid (order 611398, 18 Sep "
+        "2026), but that is ChannelOrderAdapter.Save() on a new order, not "
+        "Orders/ChangeStatus(0) on an existing one — do not assume it carries "
+        "over. If it does park, this order leaves the dispatch queue. Check the "
+        "read-back's is_parked, and check the order in the Linnworks UI."
+    )
 
 # Matches GUID-style pkOrderID values returned by Linnworks order endpoints.
 _UUID_RE = re.compile(
@@ -5592,6 +5667,15 @@ def set_order_status(
     the padlock in the Linnworks UI. Paid/unpaid ARE read-back verified against
     GeneralInfo.Status.
 
+    ⚠️ Does marking an EXISTING order unpaid PARK it? NOT YET OBSERVED. An
+    order CREATED unpaid is force-parked by Linnworks (proven live on order
+    611398), but that is a different code path from Orders/ChangeStatus(0) on
+    an order that already exists, and nobody has watched this one. A parked
+    order is OUT of the dispatch queue, so this matters more than the action's
+    name suggests. The unpaid dry-run manifest says what is predicted and on
+    what basis (UNPAID_FLIP_PARKS_ORDER, which ships unset), and the live
+    read-back reports the flag rather than assuming it.
+
     Read-before-write: every order is resolved and its current status, parked
     flag, processed flag, customer and reference captured into a manifest. An
     order id that can't be resolved becomes a resolve_error row and never aborts
@@ -5612,7 +5696,16 @@ def set_order_status(
     Returns:
         A dict with dry_run, action, endpoint, order_count, resolved_count,
         the per-order manifest (dry run) or per-order read-back results (live),
-        and resolve_errors for any unresolved ids.
+        resolve_errors for any unresolved ids, and rate_limited for any id the
+        API throttled while resolving.
+
+        On a live paid/unpaid run each result row carries status_after,
+        status_after_label, changed, and — since v1.63.0 — parked_before,
+        is_parked and parked_changed, plus a warning if the observed parked
+        flag contradicts the manifest's prediction. A row whose read-back was
+        throttled is marked readback="rate_limited": the write HAD already been
+        sent, so treat it as unconfirmed rather than failed and check the order
+        in the Linnworks UI rather than re-running this tool.
     """
     action_norm = (action or "").strip().lower()
 
@@ -5650,11 +5743,23 @@ def set_order_status(
     resolved: list[tuple[str, dict]] = []   # (guid, manifest_row)
     manifest: list[dict] = []
     resolve_errors: list[dict] = []
+    rate_limited: list[dict] = []
     guid_list: list[str] = []
 
     for oid in order_ids:
         try:
             guid, raw = _resolve_order_guid(oid)
+        # RateLimitError FIRST: it deliberately does not subclass RuntimeError
+        # (v1.40.0, issue #37), so the handler below never caught it and a 429
+        # escaped the whole tool. It must also not land in resolve_errors —
+        # that bucket means "no such order", and telling a caller their order
+        # does not exist because we were throttled is worse than not answering.
+        except RateLimitError as exc:
+            rate_limited.append({"order_id_input": oid, "stage": "resolve",
+                                 "error": str(exc)})
+            manifest.append({"order_id_input": oid, "resolved": False,
+                             "rate_limited": True, "error": str(exc)})
+            continue
         except RuntimeError as exc:
             resolve_errors.append({"order_id_input": oid, "error": str(exc)})
             manifest.append({"order_id_input": oid, "resolved": False, "error": str(exc)})
@@ -5692,6 +5797,14 @@ def set_order_status(
             row["new_status"] = value
             row["new_status_label"] = _PAYMENT_STATUS_LABELS.get(value)
             row["intent"] = f"Set payment status → {_PAYMENT_STATUS_LABELS.get(value)}"
+            # Predict, never promise — and only for unpaid, which is the one
+            # action suspected of a side effect beyond the field it names.
+            # Marking an order PAID has never been suggested to move the
+            # parked flag, so claiming a prediction there would be noise.
+            if action_norm == "unpaid":
+                predicted_parked, predicted_parked_reason = _unpaid_parks_prediction()
+                row["predicted_parked"] = predicted_parked
+                row["predicted_parked_reason"] = predicted_parked_reason
 
         resolved.append((guid, row))
         guid_list.append(guid)
@@ -5706,6 +5819,7 @@ def set_order_status(
             "endpoint": f"Orders/{endpoint}",
             "manifest": manifest,
             "resolve_errors": resolve_errors,
+            "rate_limited": rate_limited,
         }
 
     if dry_run:
@@ -5717,6 +5831,7 @@ def set_order_status(
             "resolved_count": len(guid_list),
             "manifest": manifest,
             "resolve_errors": resolve_errors,
+            "rate_limited": rate_limited,
             "message": "Set dry_run=False to execute this status change.",
         }
 
@@ -5729,6 +5844,7 @@ def set_order_status(
             "resolved_count": 0,
             "results": [],
             "resolve_errors": resolve_errors,
+            "rate_limited": rate_limited,
             "message": "No resolvable orders to act on.",
         }
 
@@ -5756,6 +5872,36 @@ def set_order_status(
                 rb["status_after"] = new
                 rb["status_after_label"] = _PAYMENT_STATUS_LABELS.get(new, f"Unknown({new})")
                 rb["changed"] = (new == value)
+
+                # The parked flag, which this branch never reported before
+                # (#88). A paid/unpaid flip that silently parked an order was
+                # invisible here, and a parked order is OUT of the dispatch
+                # queue — the read-back has to say so rather than leave the
+                # caller to guess from the status alone.
+                parked_before = row.get("is_parked")
+                parked_after = fmt2.get("is_parked")
+                rb["parked_before"] = parked_before
+                rb["is_parked"] = parked_after
+                rb["parked_changed"] = (parked_after != parked_before)
+
+                # Warn in BOTH directions when reality disagrees with the
+                # prediction, mirroring create_order's read-back. Silent while
+                # the answer is unobserved (predicted is None): there is
+                # nothing to disagree with, and a warning on every call would
+                # train the caller to ignore the ones that mean something.
+                predicted = row.get("predicted_parked")
+                if predicted is True and parked_after is False:
+                    rb.setdefault("warnings", []).append(
+                        "The order was NOT parked, though an unpaid flip was expected to "
+                        "park it. It may be live in the dispatch queue — check it, and "
+                        "correct UNPAID_FLIP_PARKS_ORDER if this repeats."
+                    )
+                elif predicted is False and parked_after is True:
+                    rb.setdefault("warnings", []).append(
+                        "The order was PARKED, which is not what was predicted. It is NOT "
+                        "in the dispatch queue — check it, and correct "
+                        "UNPAID_FLIP_PARKS_ORDER if this repeats."
+                    )
             else:  # LockOrder — no readable lock field on the order model
                 rb["is_parked"] = fmt2.get("is_parked")
                 rb["lock_readback"] = "unavailable"
@@ -5764,6 +5910,19 @@ def set_order_status(
                     "cannot be verified by read-back — confirm the padlock in the "
                     "Linnworks UI."
                 )
+        # Again RateLimitError first. The distinction this draws matters more
+        # here than on resolve: the write has ALREADY GONE. Reporting a
+        # throttled read-back as an error, or leaving the row looking
+        # unchanged, would tell the caller the status change failed when it
+        # most likely landed.
+        except RateLimitError as exc:
+            rb["readback"] = "rate_limited"
+            rb["note"] = (
+                f"Rate limited reading this order back. The write was already sent and "
+                f"may well have succeeded — nothing here confirms it either way. Do NOT "
+                f"re-run this tool on the assumption it failed; check the order in the "
+                f"Linnworks UI. ({exc})"
+            )
         except RuntimeError as exc:
             rb["readback_error"] = str(exc)
         results.append(rb)
@@ -5777,6 +5936,7 @@ def set_order_status(
         "linnworks_response": write_resp,
         "results": results,
         "resolve_errors": resolve_errors,
+        "rate_limited": rate_limited,
     }
 
 
