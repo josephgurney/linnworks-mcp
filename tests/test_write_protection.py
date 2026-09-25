@@ -220,12 +220,16 @@ class TestWriteThresholds:
         assert price <= inventory, "Price threshold should be ≤ inventory threshold"
         assert inventory <= images, "Inventory threshold should be ≤ images threshold"
 
-    def test_all_thresholds_are_positive_integers(self):
+    def test_all_thresholds_are_positive_integers_except_the_one_documented_zero(self):
         # delete_dangling_glt_template is the deliberate exception: 0 is not a
         # typo. _write_guard proceeds unstaged when count <= threshold, and this
         # tool's plan is always a single item — a threshold of 1 would let every
         # live run through unstaged. 0 forces a staged manifest on EVERY run (#115).
+        # The membership assertion below is load-bearing: without it, a future
+        # task could quietly add a second name to `exempt` and pull another
+        # write tool's threshold out of this invariant unnoticed.
         exempt = {"delete_dangling_glt_template"}
+        assert exempt == {"delete_dangling_glt_template"}
         for op, val in server.WRITE_THRESHOLDS.items():
             if op in exempt:
                 assert isinstance(val, int) and val == 0, f"{op}: exempt threshold must be exactly 0"

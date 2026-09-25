@@ -16793,11 +16793,15 @@ def delete_dangling_glt_template(
     B is reachable only if A is yes, which is the less likely branch. Run this
     on ONE low-value SKU, read the result, and record it — do not batch it.
 
-    Gates (each refuses and sends no write):
+    Gates (each refuses and sends no write), evaluated in this order — safety
+    before scope, so a variation child is never misdirected to a tool that
+    refuses its exact shape:
       template_not_on_item          — id is not a template of this SKU on this store
       dangling_not_proven           — status is not exactly "Not deleted"
+      variation_child_live_siblings — the group's template serves live (or
+                                       unverifiable — see `unknown_siblings`)
+                                       members
       no_sibling_use_unpublish      — only one template; use unpublish_channel_listing
-      variation_child_live_siblings — the group's template serves live members
 
     Args:
         sku:                   ONE SKU. No lists — the signature is the safety limit.
@@ -16849,33 +16853,60 @@ def delete_dangling_glt_template(
                 "error": "item found but StockItemId was missing"}
 
     # ── Open the item's templates; fall back to the variation parent ───────────
+    # Every call site below catches RateLimitError explicitly rather than
+    # relying on it falling through an inner `except RuntimeError` to an outer
+    # handler — that propagation is correct (RateLimitError does not subclass
+    # RuntimeError) but sits on a class-hierarchy fact declared far away, and
+    # find_dangling_glt_templates already handles this identical block
+    # explicitly after that exact shape was a real bug once (#115 round 1).
     template_sid, via_parent, group = sid, False, None
     try:
         raw_templates = _open_item_templates(ch, channel_id, sid)
-        if not raw_templates:
-            try:
-                rel = _resolve_variation(sku, sid)
-            except RuntimeError:
-                rel = {}
-            if rel.get("role") == "child" and rel.get("parent_stock_item_id"):
-                group, via_parent = rel, True
-                template_sid = rel["parent_stock_item_id"]
-                raw_templates = _open_item_templates(ch, channel_id, template_sid)
     except RateLimitError as exc:
         return {**base, "blocked_reason": "rate_limited", "complete": False, "error": str(exc)}
     except RuntimeError as exc:
         return {**base, "blocked_reason": "channel_read_failed", "error": str(exc)}
 
+    if not raw_templates:
+        # A Shopify variation CHILD holds channel-SKU rows but no template of
+        # its own — the template hangs off the PARENT and serves every
+        # variant (#26).
+        try:
+            rel = _resolve_variation(sku, sid)
+        except RateLimitError as exc:
+            return {**base, "blocked_reason": "rate_limited", "complete": False, "error": str(exc)}
+        except RuntimeError:
+            rel = {}
+        if rel.get("role") == "child" and rel.get("parent_stock_item_id"):
+            group, via_parent = rel, True
+            template_sid = rel["parent_stock_item_id"]
+            try:
+                raw_templates = _open_item_templates(ch, channel_id, template_sid)
+            except RateLimitError as exc:
+                return {**base, "blocked_reason": "rate_limited", "complete": False, "error": str(exc)}
+            except RuntimeError as exc:
+                return {**base, "blocked_reason": "channel_read_failed", "error": str(exc)}
+
     rows = [_template_row(t) for t in raw_templates]
 
     # ── Gate 1: the id must be a template of THIS sku on THIS store ────────────
     # int(): MCP callers routinely stringify numbers, and refusing a template
-    # that is right there would send the caller hunting for a wrong id.
+    # that is right there would send the caller hunting for a wrong id. A
+    # non-numeric template_id must refuse OUTRIGHT here rather than fall
+    # through as `wanted = None` — a malformed row whose `Id` is missing
+    # (`_template_row` reports `None` there) would otherwise satisfy
+    # `None == None` and become the deletion target, with every real template
+    # scored as a harmless "sibling". Comparing via `int(...) == wanted`
+    # rather than `==` also means a template row whose `Id` arrives as a
+    # string still matches correctly (round 1, Critical finding 1).
     try:
         wanted = int(template_id)
     except (TypeError, ValueError):
-        wanted = None
-    target_row = next((r for r in rows if r["template_id"] == wanted), None)
+        return {**base, "blocked_reason": "template_not_on_item",
+                "error": f"template_id {template_id!r} is not a template id."}
+    target_row = next(
+        (r for r in rows
+         if r["template_id"] is not None and int(r["template_id"]) == wanted), None)
     if target_row is None:
         return {**base, "blocked_reason": "template_not_on_item",
                 "templates_on_item": [r["template_id"] for r in rows],
@@ -16899,27 +16930,51 @@ def delete_dangling_glt_template(
                    f"{target_row['status']!r}). If listing {target_row['active_listing_id']} "
                    "is still live on the channel, this will end it.")
 
-    # ── Gate 3: scope, not safety — nothing to protect means wrong tool ───────
-    if not siblings:
-        return {**base, "blocked_reason": "no_sibling_use_unpublish",
-                "error": ("this item has only one template, so there is no sibling for this "
-                          "tool to protect and its whole purpose does not apply. Use "
-                          "unpublish_channel_listing, which is live-proven for that shape.")}
-
-    # ── Gate 4: the variation whole-group gate (issue #35) ────────────────────
+    # ── Gate 3: the variation whole-group gate (issue #35) — SAFETY, evaluated
+    # BEFORE the scope gate below (round 1, Important finding 2). In the
+    # standard Shopify variation shape the child has no template of its own
+    # and the parent's ONE template serves every member, so `siblings`
+    # (template siblings, not variation siblings) comes back empty. If the
+    # scope gate ran first it would misfire `no_sibling_use_unpublish` and
+    # send the caller to unpublish_channel_listing — which refuses this exact
+    # shape with variation_child_live_siblings. A dead end with a confident
+    # label on it. Safety is evaluated before scope.
     if via_parent and group:
         members = [{"sku": group.get("parent_sku"), "stock_item_id": group.get("parent_stock_item_id")}]
         members += [{"sku": s.get("sku"), "stock_item_id": s.get("stock_item_id")}
                     for s in (group.get("siblings") or []) if s.get("sku")]
         outside = [m for m in members
                    if (m["sku"] or "").strip().lower() != (sku or "").strip().lower()]
+        ids = [m["stock_item_id"] for m in outside if m.get("stock_item_id")]
         try:
-            sib_map = _fetch_channel_skus_for_ids(
-                [m["stock_item_id"] for m in outside if m.get("stock_item_id")]) if outside else {}
+            sib_map = _fetch_channel_skus_for_ids(ids) if ids else {}
         except RateLimitError as exc:
             return {**base, "blocked_reason": "rate_limited", "complete": False, "error": str(exc)}
+        except RuntimeError as exc:
+            return {**base, "blocked_reason": "channel_read_failed", "error": str(exc)}
+
+        # A member with no stock_item_id, or one the batch fetch didn't return
+        # a row for, is UNREADABLE — not proven not-live. Folding "could not
+        # check" into "not live" resolves the ambiguity toward deleting, which
+        # is exactly backwards for a safety gate (round 1, Important finding 3).
+        unknown = [m["sku"] for m in outside if not m.get("stock_item_id")]
+        unknown += [m["sku"] for m in outside
+                    if m.get("stock_item_id")
+                    and (m["stock_item_id"] or "").lower() not in sib_map]
         live_outside = [m["sku"] for m in outside
-                        if _rows_on_store(sib_map.get((m.get("stock_item_id") or "").lower(), []))]
+                        if m.get("stock_item_id")
+                        and (m["stock_item_id"] or "").lower() in sib_map
+                        and _rows_on_store(sib_map[(m["stock_item_id"] or "").lower()])]
+        if unknown:
+            return {**base, "blocked_reason": "variation_child_live_siblings",
+                    "parent_sku": group.get("parent_sku"),
+                    "group_name": group.get("group_name"),
+                    "live_siblings": live_outside,
+                    "unknown_siblings": unknown,
+                    "error": ("this template hangs off the variation parent and serves every "
+                              f"member; the live status of {len(unknown)} other member(s) "
+                              f"({', '.join(unknown)}) could not be confirmed, so this refuses "
+                              "rather than assume an unreadable sibling is not live.")}
         if live_outside:
             return {**base, "blocked_reason": "variation_child_live_siblings",
                     "parent_sku": group.get("parent_sku"),
@@ -16929,12 +16984,21 @@ def delete_dangling_glt_template(
                               f"member; {len(live_outside)} other member(s) are still live on "
                               "this store, so deleting it would end their listing too.")}
 
+    # ── Gate 4: scope, not safety — nothing to protect means wrong tool ───────
+    if not siblings:
+        return {**base, "blocked_reason": "no_sibling_use_unpublish",
+                "error": ("this item has only one template, so there is no sibling for this "
+                          "tool to protect and its whole purpose does not apply. Use "
+                          "unpublish_channel_listing, which is live-proven for that shape.")}
+
     # ── Before snapshot (captured on dry runs too — it is the evidence) ───────
     try:
         before_rows = [_format_channel_sku_row(r) for r in
                        _rows_on_store(_fetch_channel_skus_for_ids([sid]).get(sid.lower(), []))]
     except RateLimitError as exc:
         return {**base, "blocked_reason": "rate_limited", "complete": False, "error": str(exc)}
+    except RuntimeError as exc:
+        return {**base, "blocked_reason": "channel_read_failed", "error": str(exc)}
 
     before = {
         "channel_sku_row_count": len(before_rows),
