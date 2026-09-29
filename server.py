@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.64.0"
+__version__ = "1.65.0"
 
 import json
 import os
@@ -5627,6 +5627,239 @@ def create_order(
         "with cancel_order()."
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Shipping quotes (ShippingService) — live-probed 29 Sep 2026
+# ---------------------------------------------------------------------------
+# ShippingService/GetShippingQuote is documented as a GET with query params
+# (request.pkOrderId / request.accounts). On this tenant that GET returns
+# HTTP 400 "Object reference not set to an instance of an object." whether or
+# not accounts are passed. What works is a POST with the WRAPPED body
+#   {"request": {"pkOrderId": <guid>, "Accounts": [ShippingQuoteAccounts]}}
+# and the Accounts list is required (omitting it gives the same 400).
+# Each account is {Vendor, AccountId, VendorFriendlyName}, taken straight from
+# ShippingService/GetIntegrations. Per-account failures come back in Errors[]
+# alongside successful Quotes[], never as an HTTP error for the whole call.
+# Live on order 612129 (Amazon, non-Prime): 19 Amazon Buy Shipping quotes;
+# InPost Lockers errored with a gateway 404 despite QuoteEnabled: true.
+# Quoting returns prices only: it buys no label and does not change the
+# order's shipping method (read back unchanged after the probe).
+
+_SHIPPING_QUOTE_PRIME_TAG = "AMAZON_PRIME"
+
+
+def _fetch_shipping_integrations() -> list[dict]:
+    """ShippingService/GetIntegrations (GET) — installed shipping integrations."""
+    resp = call_linnworks_get("ShippingService/GetIntegrations")
+    return resp if isinstance(resp, list) else []
+
+
+def _format_shipping_quote(q: dict) -> dict:
+    return {
+        "vendor": q.get("Vendor"),
+        "friendly_name": q.get("FriendlyName"),
+        "account_id": q.get("AccountId"),
+        "service_name": q.get("ServiceName"),
+        "service_code": q.get("ServiceCode"),
+        "service_id": q.get("ServiceId"),
+        "cost": q.get("Cost"),
+        "tax": q.get("Tax"),
+        "total_cost": q.get("TotalCost"),
+        "currency": q.get("Currency"),
+        "collection_date": q.get("CollectionDate"),
+        "estimated_delivery_date": q.get("EstimatedDeliveryDate"),
+        "properties": [
+            {"title": p.get("Title"), "value": p.get("Value")}
+            for p in (q.get("PropertyItem") or [])
+            if p.get("Title") or p.get("Value")
+        ],
+        "options": [
+            {"name": o.get("OptionName"), "value": o.get("OptionValue")}
+            for o in (q.get("Options") or [])
+        ],
+    }
+
+
+@mcp.tool()
+def get_shipping_quote(order_id: str, accounts: Optional[list[str]] = None) -> dict:
+    """
+    Get live shipping rate quotes for one order from its shipping integrations.
+
+    READ-ONLY. Quoting only asks the carriers for prices: it buys no label and
+    does not change the order's shipping method. Use it to compare services
+    (e.g. Amazon Buy Shipping vs other carriers) before choosing one.
+
+    By default every installed integration with quoting enabled is asked
+    (on this tenant: Amazon Buy Shipping and InPost Lockers). Pass `accounts`
+    to narrow it — each entry is matched case-insensitively against the
+    integration's vendor code, friendly name, account id, or config id
+    (e.g. "Amazon Buy Shipping", "AMAZONSHIPPING_V2", "9"). An integration
+    whose quoting is disabled can still be requested; it will usually come
+    back under `errors` rather than `quotes`.
+
+    Amazon Buy Shipping quotes Amazon orders only; on a Shopify/eBay/DIRECT
+    order expect an error for that account. The response reports whether the
+    order carries the AMAZON_PRIME tag. Whether a Prime order returns
+    different or Prime-specific services has NOT been verified — the only
+    live test (29 Sep 2026) was on a non-Prime Amazon order.
+
+    Args:
+        order_id: GUID pkOrderID or numeric order number.
+        accounts: optional list of integrations to quote against.
+
+    Returns:
+        A dict with order_id, num_order_id, source, sub_source, is_prime,
+        current_postal_service, accounts_quoted, quote_count, cheapest,
+        quotes (sorted by total_cost ascending), errors (per-account failures,
+        verbatim), and warnings.
+    """
+    try:
+        guid, order = _resolve_order_guid(str(order_id))
+    except RuntimeError as exc:
+        return {"error": str(exc), "order_id": order_id}
+
+    general = order.get("GeneralInfo") or {}
+    shipping = order.get("ShippingInfo") or {}
+    source = general.get("Source") or ""
+    tags = [
+        (i.get("Tag") or "").upper()
+        for i in (general.get("Identifiers") or [])
+        if isinstance(i, dict)
+    ]
+    is_prime = _SHIPPING_QUOTE_PRIME_TAG in tags
+
+    integrations = _fetch_shipping_integrations()
+    # pkShippingAPIConfigId -1 is Linnworks' built-in "Generic Shipping"
+    # pseudo-integration: it has no account and cannot quote.
+    real = [i for i in integrations if i.get("AccountId")]
+    warnings: list[str] = []
+
+    if accounts:
+        selected, unknown = [], []
+        for want in accounts:
+            w = str(want).strip().lower()
+            match = [
+                i for i in real
+                if w in {
+                    str(i.get("Vendor") or "").lower(),
+                    str(i.get("VendorFriendlyName") or "").lower(),
+                    str(i.get("AccountId") or "").lower(),
+                    str(i.get("pkShippingAPIConfigId")),
+                }
+            ]
+            if not match:
+                unknown.append(want)
+            for m in match:
+                if m not in selected:
+                    selected.append(m)
+        if unknown:
+            return {
+                "error": f"Unknown shipping account(s): {unknown}. Nothing was quoted.",
+                "order_id": guid,
+                "available_accounts": [
+                    {
+                        "config_id": i.get("pkShippingAPIConfigId"),
+                        "vendor": i.get("Vendor"),
+                        "friendly_name": i.get("VendorFriendlyName"),
+                        "account_id": i.get("AccountId"),
+                        "quote_enabled": bool(i.get("QuoteEnabled")),
+                    }
+                    for i in real
+                ],
+            }
+        for s in selected:
+            if not s.get("QuoteEnabled"):
+                warnings.append(
+                    f"Quoting is disabled on '{s.get('VendorFriendlyName')}' in Linnworks; "
+                    "it will probably return an error rather than a quote."
+                )
+    else:
+        selected = [i for i in real if i.get("QuoteEnabled")]
+        if not selected:
+            return {
+                "error": "No shipping integration on this account has quoting enabled.",
+                "order_id": guid,
+            }
+
+    if order.get("Processed"):
+        warnings.append("This order is already processed; carriers may refuse to quote it.")
+    if any(str(s.get("Vendor") or "").upper().startswith("AMAZONSHIPPING") for s in selected) \
+            and source.upper() != "AMAZON":
+        warnings.append(
+            f"Amazon Buy Shipping only quotes Amazon orders; this order's source is "
+            f"'{source or 'blank'}', so expect an error for that account."
+        )
+    address = ((order.get("CustomerInfo") or {}).get("Address")) or {}
+    country = str(address.get("Country") or "").strip()
+    if not country or country.upper() == "UNKNOWN":
+        warnings.append(
+            "The order has no delivery country yet (Linnworks shows "
+            f"'{country or 'blank'}'), so carriers cannot price it. Seen live on a fresh "
+            "Amazon order whose address had not arrived; retry once the address is present."
+        )
+    if is_prime:
+        warnings.append(
+            "This is a Prime order. Prime quotes have not been verified on this tenant — "
+            "check the services returned against what Seller Central offers."
+        )
+
+    payload_accounts = [
+        {
+            "Vendor": s.get("Vendor"),
+            "AccountId": s.get("AccountId"),
+            "VendorFriendlyName": s.get("VendorFriendlyName"),
+        }
+        for s in selected
+    ]
+    resp = call_linnworks(
+        "ShippingService/GetShippingQuote",
+        {"request": {"pkOrderId": guid, "Accounts": payload_accounts}},
+    )
+    resp = resp if isinstance(resp, dict) else {}
+
+    quotes = sorted(
+        (_format_shipping_quote(q) for q in (resp.get("Quotes") or [])),
+        key=lambda q: (q["total_cost"] is None, q["total_cost"] or 0),
+    )
+    errors = [
+        {
+            "vendor": e.get("Vendor"),
+            "friendly_name": e.get("FriendlyName") or next(
+                (a["VendorFriendlyName"] for a in payload_accounts
+                 if a["Vendor"] == e.get("Vendor") and a["AccountId"] == e.get("AccountId")),
+                None,
+            ),
+            "account_id": e.get("AccountId"),
+            "message": e.get("ErrorMessage"),
+        }
+        for e in (resp.get("Errors") or [])
+    ]
+
+    if not quotes and not errors:
+        # Live 29 Sep 2026: a processed order came back with empty Quotes AND
+        # empty Errors — silence, not a failure. Say so rather than look clean.
+        warnings.append(
+            "No quotes and no errors were returned — Linnworks gave no reason. "
+            "This happened live on an already-processed order."
+        )
+
+    return {
+        "order_id": guid,
+        "num_order_id": order.get("NumOrderId"),
+        "reference": general.get("ReferenceNum"),
+        "source": source,
+        "sub_source": general.get("SubSource"),
+        "is_prime": is_prime,
+        "current_postal_service": shipping.get("PostalServiceName"),
+        "accounts_quoted": [a["VendorFriendlyName"] or a["Vendor"] for a in payload_accounts],
+        "quote_count": len(quotes),
+        "cheapest": quotes[0] if quotes else None,
+        "quotes": quotes,
+        "errors": errors,
+        "warnings": warnings,
+        "note": "Quotes only — no label was bought and the order's shipping method is unchanged.",
+    }
 
 
 @mcp.tool()
