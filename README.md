@@ -1,7 +1,7 @@
 # Linnworks MCP Server
 
-![Version](https://img.shields.io/badge/version-1.64.0-blue)
-![Tools](https://img.shields.io/badge/tools-100-blue)
+![Version](https://img.shields.io/badge/version-1.65.0-blue)
+![Tools](https://img.shields.io/badge/tools-101-blue)
 
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
 
@@ -56,6 +56,7 @@ Once installed, Claude gets access to these tools:
 | `get_order_notes` | Fetch all notes on an order |
 | `find_open_orders_for_sku` | Find all open orders containing a specific SKU — customer name, email, dispatch deadline |
 | `find_orders_by_reference` | Look up orders by channel reference number (Shopify, Amazon, eBay) |
+| `get_shipping_quote` | Live carrier rate quotes for one order (e.g. Amazon Buy Shipping) — read-only, buys no label. Sorted cheapest first with delivery estimates; flags Prime orders (Prime quotes not yet verified) and orders carriers can't price (non-Amazon order on Amazon Buy Shipping, no delivery address, already processed) |
 | `find_unlinked_order_lines` | Report lines that have lost their channel-side reference (ItemNumber/ItemSource/ChannelSKU) — linked / unlinked / unknown / not_expected (composite child, manual order, or internal marker/service SKU such as Check-notes — counted in `internal_sku_suppressed`), across open orders and/or a processed-order date range. Read-only report; pair with `relink_order_line` to attempt a repair. Raw `added_date`/`is_unlinked` are exposed on every line from `get_processed_order_items` and its siblings (not `get_order`, which uses a different formatter) but are NOT used to classify: a live probe (issue #104) found they cannot distinguish a line deliberately added in Linnworks (order 611288's Jessup_11inch_35) from a genuinely orphaned re-add (order 607251's RS-85769) — both show the same "added days later, near processing" pattern, and `IsUnlinked` reads `false` on both. See CLAUDE.md's issue #104 note for the full probe data |
 
 **Orders (write — all default to dry_run=True)**
