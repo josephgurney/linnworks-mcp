@@ -132,10 +132,10 @@ def test_amazon_order_does_not_get_source_warning():
     assert not any("only quotes Amazon orders" in w for w in result["warnings"])
 
 
-def test_prime_tag_detected_and_flagged_unverified():
+def test_prime_tag_detected_and_flagged():
     result, _, _ = _run(order=_order(tags=("amazon_prime",)))
     assert result["is_prime"] is True
-    assert any("Prime quotes have not been verified" in w for w in result["warnings"])
+    assert any("Prime-compliant services" in w for w in result["warnings"])
 
 
 def test_non_prime_order():
