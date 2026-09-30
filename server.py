@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.65.0"
+__version__ = "1.66.0"
 
 import json
 import os
@@ -584,6 +584,7 @@ WRITE_THRESHOLDS: dict[str, int] = {
     "delete_empty_categories":        10,   # IRREVERSIBLE — bulk-deletes empty categories
     "archive_inventory_items":        25,   # hides items from channels; reversible via unarchive
     "unarchive_inventory_items":      25,   # restores items to active; reversible via archive
+    "accept_shipping_quote":          25,   # changes the dispatch service on live orders; no label bought
     "set_order_status":               25,   # lock/unlock/paid/unpaid — reversible order-state changes
     "create_order":                   10,   # CREATES a real, pickable, dispatchable customer order
     "generate_pick_waves":            25,   # creates live pickwaves the warehouse will pick from
@@ -5700,9 +5701,10 @@ def get_shipping_quote(order_id: str, accounts: Optional[list[str]] = None) -> d
 
     Amazon Buy Shipping quotes Amazon orders only; on a Shopify/eBay/DIRECT
     order expect an error for that account. The response reports whether the
-    order carries the AMAZON_PRIME tag. Whether a Prime order returns
-    different or Prime-specific services has NOT been verified — the only
-    live test (29 Sep 2026) was on a non-Prime Amazon order.
+    order carries the AMAZON_PRIME tag. On a Prime order Amazon returns only
+    Prime-compliant services (verified 30 Sep 2026 on order 612176: 3 next-day
+    services, against 19 on a non-Prime order). Amazon Buy Shipping takes
+    ~50 seconds per quote. To act on a quote, use accept_shipping_quote.
 
     Args:
         order_id: GUID pkOrderID or numeric order number.
@@ -5800,8 +5802,9 @@ def get_shipping_quote(order_id: str, accounts: Optional[list[str]] = None) -> d
         )
     if is_prime:
         warnings.append(
-            "This is a Prime order. Prime quotes have not been verified on this tenant — "
-            "check the services returned against what Seller Central offers."
+            "This is a Prime order. Amazon returns only Prime-compliant services for it "
+            "(verified 30 Sep 2026: 3 next-day services vs 19 on a non-Prime order), so "
+            "expect a short list."
         )
 
     payload_accounts = [
@@ -5860,6 +5863,251 @@ def get_shipping_quote(order_id: str, accounts: Optional[list[str]] = None) -> d
         "warnings": warnings,
         "note": "Quotes only — no label was bought and the order's shipping method is unchanged.",
     }
+
+
+# ---------------------------------------------------------------------------
+# Accepting a shipping quote — live-probed 30 Sep 2026
+# ---------------------------------------------------------------------------
+# There is NO "accept quote" endpoint. SetShippingMethodFromQuote is named in
+# the GetShippingQuote description but is not a path in any spec file.
+# What does exist is Orders/ChangeShippingMethod, which takes a postal service
+# NAME. The link between the two: a quote's ServiceId equals the
+# IntegratedServiceID of a Linnworks postal service (Orders/GetShippingMethods),
+# e.g. quote "Evri Next Day" (94199ac1…) → postal service "Evri Next Day AMZ".
+# So accepting = find the postal service whose IntegratedServiceID matches the
+# chosen quote, then set the order to that service by name.
+#
+# Accepting buys NOTHING. The label is bought when it is printed/processed,
+# at whatever the carrier charges then, which may differ from the quote.
+#
+# Prime (30 Sep 2026, order 612176): Amazon returned only 3 next-day services
+# for a Prime order against 19 for a non-Prime one, so it filters the quote
+# list to Prime-compliant services itself and "cheapest" stays within them.
+# Each Amazon Buy Shipping quote takes ~50s, so batches are slow.
+
+
+def _postal_services_by_integration() -> tuple[dict[str, list[dict]], dict[str, int]]:
+    """Map IntegratedServiceID → postal services, and count each service name."""
+    by_int: dict[str, list[dict]] = {}
+    name_counts: dict[str, int] = {}
+    for vendor in call_linnworks_get("Orders/GetShippingMethods") or []:
+        for ps in vendor.get("PostalServices") or []:
+            name = ps.get("PostalServiceName") or ""
+            if name:
+                key = name.strip().lower()
+                name_counts[key] = name_counts.get(key, 0) + 1
+            integ = (ps.get("IntegratedServiceID") or "").lower()
+            if integ:
+                by_int.setdefault(integ, []).append({
+                    "postal_service_id": ps.get("pkPostalServiceId"),
+                    "postal_service_name": name,
+                    "vendor": vendor.get("Vendor"),
+                })
+    return by_int, name_counts
+
+
+def _match_quote_service(quote: dict, want: str) -> bool:
+    w = want.strip().lower()
+    return w in {
+        str(quote.get("service_name") or "").lower(),
+        str(quote.get("service_code") or "").lower(),
+        str(quote.get("service_id") or "").lower(),
+    }
+
+
+@mcp.tool()
+def accept_shipping_quote(
+    order_ids: list[str],
+    service: Optional[str] = None,
+    accounts: Optional[list[str]] = None,
+    confirmed_count: Optional[int] = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Accept a shipping quote for one or more open orders by setting each order's
+    shipping service to the quoted service. Defaults to the CHEAPEST quote.
+
+    What "accept" means: the order's postal service is changed (via
+    Orders/ChangeShippingMethod) to the Linnworks postal service linked to the
+    quoted carrier service. NO LABEL IS BOUGHT HERE — Linnworks buys the label
+    when it is printed/processed, at the carrier's price at that time, which
+    can differ from the quote.
+
+    Each order is re-quoted fresh (see get_shipping_quote), so this is slow:
+    Amazon Buy Shipping takes ~50 seconds per order. Keep batches small.
+
+    Choosing the quote:
+      - service=None → the cheapest quote that maps to a Linnworks postal
+        service. A cheaper quote with no matching postal service is reported
+        under `cheaper_unmappable` and skipped, never guessed.
+      - service="..." → the quote whose service name, code or id matches.
+    On a Prime order Amazon only returns Prime-compliant services (verified
+    30 Sep 2026: 3 next-day services vs 19 on a non-Prime order), so the
+    cheapest Prime quote still keeps the Prime delivery promise.
+
+    Refused per order, before any write: unresolvable order, processed order,
+    a label already printed or a tracking number already present (changing
+    service would orphan a bought label), no quotes returned, no quote matching
+    `service`, no quote with a matching postal service, or a postal service
+    name shared by several services (the endpoint takes a NAME, so it would be
+    ambiguous). An order already on the chosen service is a no-op.
+
+    Args:
+        order_ids: GUIDs or numeric order numbers of OPEN orders.
+        service: optional quote to pick instead of the cheapest.
+        accounts: optional integrations to quote against (as get_shipping_quote).
+        confirmed_count: echo the order count to confirm a batch above the
+            staging threshold (25).
+        dry_run: default True — shows the plan and writes nothing.
+
+    Returns:
+        plan (per order: current service, chosen quote, target postal service,
+        action/blocked reason), and on a live run `results` with a fresh
+        read-back per order: outcome changed / not_changed / unconfirmed /
+        rate_limited / error.
+    """
+    if isinstance(order_ids, str):
+        order_ids = [order_ids]
+    if service is not None:
+        _check_injection("service", service)
+
+    try:
+        by_int, name_counts = _postal_services_by_integration()
+    except RateLimitError as exc:
+        return {"error": f"Rate-limited reading postal services; nothing was changed. {exc}",
+                "rate_limited": True}
+
+    plan: list[dict] = []
+    for oid in order_ids:
+        row: dict = {"input": oid, "blocked": True}
+        plan.append(row)
+        try:
+            guid, order = _resolve_order_guid(str(oid))
+        except RateLimitError as exc:
+            row.update(reason="rate_limited", detail=str(exc))
+            continue
+        except RuntimeError as exc:
+            row.update(reason="order_not_found", detail=str(exc))
+            continue
+        general = order.get("GeneralInfo") or {}
+        shipping = order.get("ShippingInfo") or {}
+        row.update(
+            order_id=guid,
+            num_order_id=order.get("NumOrderId"),
+            reference=general.get("ReferenceNum"),
+            source=general.get("Source"),
+            current_postal_service=shipping.get("PostalServiceName"),
+        )
+        if order.get("Processed"):
+            row["reason"] = "processed"
+            continue
+        if general.get("LabelPrinted") or (shipping.get("TrackingNumber") or "").strip():
+            row.update(reason="label_already_printed",
+                       detail="A label or tracking number already exists; changing the service would orphan it.")
+            continue
+        try:
+            quote = get_shipping_quote(guid, accounts=accounts)
+        except RateLimitError as exc:
+            row.update(reason="rate_limited", detail=str(exc))
+            continue
+        if quote.get("error"):
+            row.update(reason="quote_failed", detail=quote["error"])
+            continue
+        row["is_prime"] = quote.get("is_prime")
+        row["quote_errors"] = quote.get("errors")
+        quotes = quote.get("quotes") or []
+        if not quotes:
+            row.update(reason="no_quotes", detail="; ".join(quote.get("warnings") or []) or None)
+            continue
+
+        candidates = [q for q in quotes if _match_quote_service(q, service)] if service else quotes
+        if not candidates:
+            row.update(reason="service_not_quoted",
+                       available=[q["service_name"] for q in quotes])
+            continue
+
+        chosen, target, skipped = None, None, []
+        for q in candidates:  # already sorted cheapest first
+            matches = by_int.get(str(q.get("service_id") or "").lower()) or []
+            if len(matches) == 1:
+                chosen, target = q, matches[0]
+                break
+            skipped.append({
+                "service_name": q["service_name"], "total_cost": q["total_cost"],
+                "why": "no Linnworks postal service is linked to this quote" if not matches
+                       else f"{len(matches)} postal services are linked to this quote",
+            })
+        row["cheaper_unmappable"] = skipped
+        if chosen is None:
+            row["reason"] = "no_mappable_quote"
+            continue
+        if name_counts.get(target["postal_service_name"].strip().lower(), 0) > 1:
+            row.update(reason="ambiguous_postal_service_name",
+                       detail=f"'{target['postal_service_name']}' names more than one postal service.")
+            continue
+
+        row.update(
+            blocked=False,
+            chosen_quote={k: chosen[k] for k in ("service_name", "service_code", "total_cost",
+                                                  "currency", "estimated_delivery_date")},
+            target_postal_service=target["postal_service_name"],
+            target_postal_service_id=target["postal_service_id"],
+            reason=None,
+        )
+        same = (str(shipping.get("PostalServiceId") or "").lower()
+                == str(target["postal_service_id"] or "").lower())
+        row["action"] = "no_op" if same else "change"
+
+    to_change = [r for r in plan if not r["blocked"] and r["action"] == "change"]
+    summary = {
+        "order_count": len(order_ids),
+        "to_change": len(to_change),
+        "no_op": sum(1 for r in plan if not r["blocked"] and r["action"] == "no_op"),
+        "blocked": sum(1 for r in plan if r["blocked"]),
+        "note": "Setting the shipping service buys no label; the label is bought when "
+                "printed, at the carrier's price then.",
+    }
+
+    guard = _write_guard("accept_shipping_quote", to_change, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, **summary, "plan": plan}
+    if dry_run:
+        return {"dry_run": True, **summary, "plan": plan}
+
+    results = []
+    for r in to_change:
+        res = {"order_id": r["order_id"], "num_order_id": r["num_order_id"],
+               "target_postal_service": r["target_postal_service"]}
+        try:
+            resp = call_linnworks("Orders/ChangeShippingMethod", {
+                "orderIds": [r["order_id"]],
+                "shippingMethod": r["target_postal_service"],
+            })
+            res["response"] = resp or None
+        except RateLimitError as exc:
+            res.update(outcome="rate_limited", detail=f"Not sent: {exc}")
+            results.append(res)
+            continue
+        except RuntimeError as exc:
+            res.update(outcome="error", detail=str(exc))
+            results.append(res)
+            continue
+        try:
+            _, after = _resolve_order_guid(r["order_id"])
+            ship = after.get("ShippingInfo") or {}
+            res["postal_service_after"] = ship.get("PostalServiceName")
+            ok = (str(ship.get("PostalServiceId") or "").lower()
+                  == str(r["target_postal_service_id"] or "").lower())
+            res["outcome"] = "changed" if ok else "not_changed"
+        except RateLimitError:
+            res.update(outcome="rate_limited",
+                       detail="The change was sent and may have landed; the read-back was throttled. Do not re-run blindly.")
+        except RuntimeError as exc:
+            res.update(outcome="unconfirmed", detail=f"Change sent; read-back failed: {exc}")
+        results.append(res)
+
+    return {"dry_run": False, **summary, "plan": plan, "results": results,
+            "changed": sum(1 for x in results if x.get("outcome") == "changed")}
 
 
 @mcp.tool()
