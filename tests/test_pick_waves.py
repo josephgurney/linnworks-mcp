@@ -36,7 +36,7 @@ class TestRegistration:
 
     def test_total_tool_count(self):
         registered = asyncio.run(server.mcp.list_tools())
-        assert len(registered) == 102  # +1: find_dangling_glt_templates (#115) +1: delete_dangling_glt_template (#115) +1: get_shipping_quote +1: accept_shipping_quote
+        assert len(registered) == 103  # +1: find_dangling_glt_templates (#115) +1: delete_dangling_glt_template (#115) +1: get_shipping_quote +1: accept_shipping_quote +1: rename_inventory_item_sku
 
 
 # ── AC2: no write-tool machinery on any of the four ─────────────────────────

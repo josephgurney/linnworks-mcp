@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.66.0"
+__version__ = "1.67.0"
 
 import json
 import os
@@ -582,6 +582,7 @@ WRITE_THRESHOLDS: dict[str, int] = {
     "revise_ebay_listing_description": 10,  # WRITES to a live eBay listing; push is not yet live-proven
     "delete_categories":              10,   # IRREVERSIBLE — deletes categories (non-empty → items reassigned)
     "delete_empty_categories":        10,   # IRREVERSIBLE — bulk-deletes empty categories
+    "rename_inventory_item_sku":      10,   # channel listings keep the OLD SKU — orders may arrive unlinked
     "archive_inventory_items":        25,   # hides items from channels; reversible via unarchive
     "unarchive_inventory_items":      25,   # restores items to active; reversible via archive
     "accept_shipping_quote":          25,   # changes the dispatch service on live orders; no label bought
@@ -15800,6 +15801,332 @@ def delete_inventory_item(
             "Linnworks returned an error on DeleteInventoryItems (surfaced in "
             "delete_error). Per-item read-back results show what actually got deleted."
         )
+    return out
+
+
+# ---------- Rename an inventory item's SKU ----------
+#
+# create_or_update_inventory_item upserts BY SKU, so handing it a new SKU makes a
+# second item rather than renaming the first. The rename that works is the raw
+# call first fired live on 1 Oct 2026 (vnm-skull-black-FB → vnm-robodino-red-FB):
+# Inventory/UpdateInventoryItemField with fieldName "SKU" against the StockItemId.
+# The StockItemId survives, so everything keyed on it follows the rename.
+
+# Linnworks' own 400 for a SKU it cannot resolve — observed 1 Oct 2026. Archived
+# items return the SAME 400, so this proves "no ACTIVE item", never "free".
+_SKU_NOT_FOUND_MARKER = "could not determine inventory item id from sku"
+
+_RENAME_SKU_CHANNEL_WARNING = (
+    "Channel listings are NOT renamed. Shopify, Amazon, eBay and other channels still "
+    "carry the OLD SKU, and so do this item's Linnworks channel-SKU rows "
+    "(get_channel_listings). Linked listings may need relinking, and orders that link "
+    "by SKU may arrive unlinked — check find_unlinked_order_lines and fix with "
+    "relink_order_line."
+)
+
+
+def _sku_lookup(sku: str) -> tuple[str, dict | None, str | None]:
+    """
+    Look a SKU up with Inventory/GetInventoryItem and say what the answer PROVES.
+
+    Returns (state, item, error) where state is one of:
+      "found"         the active item holding this SKU (case-insensitive match)
+      "not_found"     Linnworks' own "could not determine" 400. No ACTIVE item
+                      holds the SKU — but archived items give the same 400, so
+                      this is NOT proof the SKU is free.
+      "failed"        any other error. Proves nothing either way.
+      "rate_limited"  a quota failure. Proves nothing either way (issue #34).
+    """
+    try:
+        item = call_linnworks("Inventory/GetInventoryItem", {"sku": sku})
+    except RateLimitError as exc:
+        return "rate_limited", None, str(exc)
+    except RuntimeError as exc:
+        if _SKU_NOT_FOUND_MARKER in str(exc).lower():
+            return "not_found", None, str(exc)
+        return "failed", None, str(exc)
+    if not (item or {}).get("StockItemId"):
+        return "failed", None, f"GetInventoryItem returned no StockItemId for '{sku}'."
+    return "found", item, None
+
+
+@mcp.tool()
+def rename_inventory_item_sku(
+    renames: list[dict],
+    confirmed_count: int | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Rename an inventory item's SKU, keeping it the SAME item.
+
+    Use this instead of create_or_update_inventory_item when a SKU needs to
+    change: that tool upserts by SKU, so a new SKU there creates a duplicate
+    item. This one changes the SKU on the existing record. The StockItemId is
+    kept, so purchase order lines, supplier links, the barcode, extended
+    properties, descriptions, images and stock levels all follow the rename.
+
+    ⚠️  Channel listings are NOT renamed. Shopify, Amazon, eBay and every other
+    channel still carry the OLD SKU, and so do the item's Linnworks
+    channel-SKU rows (see get_channel_listings). Linked listings may need
+    relinking or re-mapping in the channel's own admin, and new orders that
+    link by SKU may arrive unlinked — check find_unlinked_order_lines and fix
+    them with relink_order_line. Anything else that refers to the item by its
+    old SKU (supplier stock feeds, imports, spreadsheets) stops matching too.
+
+    Each row is checked before anything is written, and a row that fails a
+    check is refused on its own — the rest of the batch still goes ahead:
+      - old_sku must resolve to an active item (archived items cannot be
+        resolved by SKU, so they cannot be renamed here)
+      - new_sku must not already belong to another item, INCLUDING an archived
+        one (checked with a second lookup that can see archived items)
+      - a lookup that fails or is rate-limited is refused, never treated as
+        "the new SKU is free"
+      - two rows may not rename to the same new SKU, or rename the same old SKU
+        (Linnworks matches SKUs case-insensitively, so "ABC" and "abc" collide)
+      - renaming onto a SKU that another row in the same batch is renaming away
+        from is refused; run the two renames as separate calls instead
+    A change of letter case only ("abc" → "ABC") is allowed.
+
+    On a live run every item is read back by its StockItemId and the rename
+    only counts when the stored SKU now equals new_sku exactly.
+
+    Args:
+        renames: List of {"old_sku": str, "new_sku": str}. Surrounding
+            whitespace is stripped.
+        confirmed_count: For more than 10 rows, pass len(renames) after
+            reviewing the staged manifest.
+        dry_run: If True (default), preview only. Set False to rename.
+
+    Returns:
+        dict with:
+          - manifest: rows that will be (or were) renamed — old_sku, new_sku,
+            stock_item_id, title, case_only
+          - refused: rows not renamed, each with a `reason` (old_sku_not_found,
+            lookup_failed, new_sku_exists, new_sku_check_failed, rate_limited,
+            same_sku, duplicate_old_sku_in_batch, duplicate_new_sku_in_batch,
+            invalid_row) and the Linnworks error where there was one
+          - complete: False when any row was rate-limited (retry those later)
+          - warnings: the channel-listing warning above
+          - results (live run only): one row per rename with `outcome`
+            (renamed / not_renamed / unconfirmed / error / rate_limited) and
+            `read_back_sku`, the SKU Linnworks holds now
+    """
+    if not renames:
+        raise ValueError("renames must contain at least one {old_sku, new_sku} row.")
+
+    refused: list[dict] = []
+
+    def _refuse(row: dict, reason: str, error: str, **extra) -> None:
+        refused.append({"old_sku": row.get("old_sku"), "new_sku": row.get("new_sku"),
+                        "reason": reason, "error": error, **extra})
+
+    # ── 1. Validate every row; injection-check the value that gets written ────
+    rows: list[dict] = []
+    for raw in renames:
+        if not isinstance(raw, dict):
+            _refuse({}, "invalid_row",
+                    f"Each row must be a dict with old_sku and new_sku, got {raw!r}.")
+            continue
+        old = raw.get("old_sku")
+        new = raw.get("new_sku")
+        old = old.strip() if isinstance(old, str) else ""
+        new = new.strip() if isinstance(new, str) else ""
+        if not old or not new:
+            _refuse({"old_sku": old or None, "new_sku": new or None}, "invalid_row",
+                    "Both old_sku and new_sku are required as non-empty strings.")
+            continue
+        _check_injection("new_sku", new)
+        if new == old:
+            _refuse({"old_sku": old, "new_sku": new}, "same_sku",
+                    "new_sku is identical to old_sku — there is nothing to rename.")
+            continue
+        rows.append({"old_sku": old, "new_sku": new})
+
+    # ── 2. Collisions inside the batch (SKU matching is case-insensitive) ────
+    old_seen: dict[str, int] = {}
+    new_seen: dict[str, int] = {}
+    for r in rows:
+        old_seen[r["old_sku"].casefold()] = old_seen.get(r["old_sku"].casefold(), 0) + 1
+        new_seen[r["new_sku"].casefold()] = new_seen.get(r["new_sku"].casefold(), 0) + 1
+    candidates: list[dict] = []
+    for r in rows:
+        if old_seen[r["old_sku"].casefold()] > 1:
+            _refuse(r, "duplicate_old_sku_in_batch",
+                    f"'{r['old_sku']}' appears more than once as old_sku in this batch.")
+        elif new_seen[r["new_sku"].casefold()] > 1:
+            _refuse(r, "duplicate_new_sku_in_batch",
+                    f"More than one row renames to '{r['new_sku']}' (case-insensitive) — "
+                    "only one item can hold a SKU.")
+        else:
+            candidates.append(r)
+
+    # ── 3. Read before write: resolve old_sku, prove new_sku is free ──────────
+    manifest: list[dict] = []
+    for r in candidates:
+        state, item, err = _sku_lookup(r["old_sku"])
+        if state == "rate_limited":
+            _refuse(r, "rate_limited", f"{err} Not a missing SKU — retry later.")
+            continue
+        if state == "not_found":
+            _refuse(r, "old_sku_not_found",
+                    f"{err} Archived items cannot be resolved by SKU, so they cannot be "
+                    "renamed here.")
+            continue
+        if state != "found":
+            _refuse(r, "lookup_failed", err)
+            continue
+        sid = item["StockItemId"]
+
+        nstate, holder, nerr = _sku_lookup(r["new_sku"])
+        if nstate == "rate_limited":
+            _refuse(r, "rate_limited", f"{nerr} Not proof the new SKU is free — retry later.")
+            continue
+        if nstate == "failed":
+            _refuse(r, "new_sku_check_failed",
+                    f"Could not prove '{r['new_sku']}' is free: {nerr}")
+            continue
+
+        case_only = False
+        if nstate == "found":
+            if (holder["StockItemId"] or "").lower() != sid.lower():
+                _refuse(r, "new_sku_exists",
+                        f"'{r['new_sku']}' already belongs to another item "
+                        f"({holder.get('ItemNumber')}, {holder['StockItemId']}).",
+                        held_by_stock_item_id=holder["StockItemId"],
+                        held_by_sku=holder.get("ItemNumber"),
+                        held_by_title=holder.get("ItemTitle"))
+                continue
+            case_only = True   # the only active holder is this item itself
+        else:
+            # No ACTIVE item holds it — but GetInventoryItem cannot see archived
+            # items. CheckVariationParentSKUExists can (luma-harlyn-frosted,
+            # archived, reads "Exists" — live 1 Oct 2026), so ask it too.
+            try:
+                answer = call_linnworks_get(
+                    "Stock/CheckVariationParentSKUExists", {"parentSKU": r["new_sku"]})
+            except RateLimitError as exc:
+                _refuse(r, "rate_limited", f"{exc} Not proof the new SKU is free — retry later.")
+                continue
+            except RuntimeError as exc:
+                _refuse(r, "new_sku_check_failed",
+                        f"Could not prove '{r['new_sku']}' is free: {exc}")
+                continue
+            answer = str(answer).strip()
+            if answer in ("Exists", "AlreadyVariation"):
+                _refuse(r, "new_sku_exists",
+                        f"'{r['new_sku']}' already exists (CheckVariationParentSKUExists: "
+                        f"{answer}) on an item GetInventoryItem cannot see — most likely "
+                        "an archived item.")
+                continue
+            if answer != "NotExists":
+                _refuse(r, "new_sku_check_failed",
+                        f"Unexpected CheckVariationParentSKUExists answer {answer!r} for "
+                        f"'{r['new_sku']}' — cannot prove it is free.")
+                continue
+
+        manifest.append({
+            "old_sku":       r["old_sku"],
+            "new_sku":       r["new_sku"],
+            "stock_item_id": sid,
+            "title":         item.get("ItemTitle"),
+            "case_only":     case_only,
+        })
+
+    base_out = {
+        "item_count":    len(renames),
+        "manifest":      manifest,
+        "refused":       refused,
+        "ready_count":   len(manifest),
+        "refused_count": len(refused),
+        "complete":      not any(x["reason"] == "rate_limited" for x in refused),
+        "warnings":      [_RENAME_SKU_CHANNEL_WARNING],
+    }
+
+    guard = _write_guard("rename_inventory_item_sku", renames, confirmed_count, dry_run)
+    if guard is not None:
+        return {**guard, **base_out}
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            **base_out,
+            "message": (
+                f"Dry run — nothing renamed. {len(manifest)} item(s) would be renamed; "
+                f"{len(refused)} row(s) refused (see refused[].reason). Channel listings "
+                "keep the old SKU — see warnings. Set dry_run=False to rename."
+            ),
+        }
+
+    # ── 4. Write, then read each item back by its StockItemId ─────────────────
+    results: list[dict] = []
+    for m in manifest:
+        row = {"old_sku": m["old_sku"], "new_sku": m["new_sku"],
+               "stock_item_id": m["stock_item_id"]}
+        write_error = None
+        try:
+            call_linnworks_void("Inventory/UpdateInventoryItemField", {
+                "inventoryItemId": m["stock_item_id"],
+                "fieldName":       "SKU",
+                "fieldValue":      m["new_sku"],
+            })
+        except RateLimitError as exc:
+            results.append({**row, "outcome": "rate_limited", "error": str(exc)})
+            continue
+        except RuntimeError as exc:
+            write_error = str(exc)
+
+        # A 2xx alone proves nothing — read the stored SKU fresh.
+        try:
+            fresh = call_linnworks_get("Inventory/GetInventoryItemById",
+                                       {"id": m["stock_item_id"]})
+            readback = "ok" if fresh else "item_not_returned"
+        except RateLimitError:
+            fresh, readback = None, "rate_limited"
+        except Exception as exc:
+            fresh, readback = None, f"failed: {exc}"
+        got = (fresh or {}).get("ItemNumber") if isinstance(fresh, dict) else None
+        row["readback"] = readback
+        row["read_back_sku"] = got
+
+        if readback == "ok" and got == m["new_sku"]:
+            row["outcome"] = "renamed"
+            if write_error:
+                row["warning"] = ("The write reported an error but the read-back shows the "
+                                  f"new SKU: {write_error}")
+        elif write_error:
+            row["outcome"] = "error"
+            row["error"] = write_error
+        elif readback == "ok":
+            row["outcome"] = "not_renamed"
+        else:
+            row["outcome"] = "unconfirmed"
+        results.append(row)
+
+    counts: dict[str, int] = {}
+    for r in results:
+        counts[r["outcome"]] = counts.get(r["outcome"], 0) + 1
+
+    out = {
+        "dry_run":            False,
+        **base_out,
+        "results":            results,
+        "renamed_count":      counts.get("renamed", 0),
+        "not_renamed_count":  counts.get("not_renamed", 0),
+        "unconfirmed_count":  counts.get("unconfirmed", 0),
+        "error_count":        counts.get("error", 0),
+        "rate_limited_count": counts.get("rate_limited", 0),
+    }
+    if counts.get("rate_limited"):
+        out["complete"] = False
+    out["message"] = (
+        f"{out['renamed_count']}/{len(results)} rename(s) confirmed by read-back; "
+        f"{len(refused)} row(s) refused before writing. "
+        + (f"{out['not_renamed_count']} not renamed (the write returned OK but the SKU "
+           "did not change). " if out["not_renamed_count"] else "")
+        + (f"{out['unconfirmed_count']} unconfirmed (read-back failed — check with "
+           "find_inventory_item). " if out["unconfirmed_count"] else "")
+        + "Channel listings still carry the old SKUs — see warnings."
+    )
     return out
 
 
