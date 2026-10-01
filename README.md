@@ -1,7 +1,7 @@
 # Linnworks MCP Server
 
-![Version](https://img.shields.io/badge/version-1.66.0-blue)
-![Tools](https://img.shields.io/badge/tools-102-blue)
+![Version](https://img.shields.io/badge/version-1.67.0-blue)
+![Tools](https://img.shields.io/badge/tools-103-blue)
 
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
 
@@ -101,6 +101,7 @@ Once installed, Claude gets access to these tools:
 | Tool | What it does |
 |---|---|
 | `create_or_update_inventory_item` | Create a new item or update an existing one by SKU — title, barcode, prices, category, dimensions |
+| `rename_inventory_item_sku` | Rename an item's SKU, keeping the same item (POs, suppliers, barcode and properties follow). Refuses a new SKU already held by any item, archived ones included. Channel listings are NOT renamed — linked listings may need relinking |
 | `set_stock_levels` | Set absolute stock levels for one or more SKUs |
 | `set_inventory_item_prices` | Set or update channel prices per SKU — supports Source/SubSource per channel |
 | `set_inventory_item_titles` | Set or update channel-specific listing titles (override the base title per channel) |
@@ -361,6 +362,7 @@ All write tools default to `dry_run=True` — they will describe what they would
 | `create_order` | 10 lines |
 | `generate_pick_waves` | 25 orders |
 | `remove_orders_from_pick_waves` | 25 orders |
+| `rename_inventory_item_sku` | 10 renames |
 | `archive_inventory_items` | 25 items |
 | `unarchive_inventory_items` | 25 items |
 | `list_to_shopify` | 25 listings |
