@@ -10,7 +10,7 @@ See README.md for setup instructions.
 from __future__ import annotations
 
 # Keep in sync with pyproject.toml [project] version on every release.
-__version__ = "1.67.0"
+__version__ = "1.68.0"
 
 import json
 import os
@@ -230,7 +230,7 @@ def ensure_auth() -> tuple[str, str]:
     return _token, _server
 
 
-def call_linnworks_form(method_path: str, payload: dict) -> dict:
+def call_linnworks_form(method_path: str, payload: dict, retry_rate_limit: bool = False) -> dict:
     """
     POST a Linnworks API call with form-encoded data (application/x-www-form-urlencoded).
 
@@ -239,28 +239,46 @@ def call_linnworks_form(method_path: str, payload: dict) -> dict:
 
     method_path: e.g. "PurchaseOrder/Deliver_PurchaseItemAll"
     payload:     flat dict of form fields
+    retry_rate_limit: when True, a 429 / "quota exceeded" response is retried on the
+        shared 5/10/20/30s ladder and raises RateLimitError once spent. Default False
+        so the existing WRITE caller (Deliver_PurchaseItemAll) behaves exactly as
+        before — silently re-sending a write after a 429 is not something to change
+        as a side effect. Read-only callers (run_readonly_query) opt in.
     """
     global _token, _server
-    token, server = ensure_auth()
-    url = f"{server.rstrip('/')}/api/{method_path}"
-
-    response = _session.post(
-        url,
-        data=payload,
-        headers={"Authorization": token},
-        timeout=60,
-    )
-
-    if response.status_code == 401:
-        _token, _server = None, None
+    attempt = 0
+    while True:
         token, server = ensure_auth()
         url = f"{server.rstrip('/')}/api/{method_path}"
+
         response = _session.post(
             url,
             data=payload,
             headers={"Authorization": token},
             timeout=60,
         )
+
+        if response.status_code == 401:
+            _token, _server = None, None
+            token, server = ensure_auth()
+            url = f"{server.rstrip('/')}/api/{method_path}"
+            response = _session.post(
+                url,
+                data=payload,
+                headers={"Authorization": token},
+                timeout=60,
+            )
+
+        if retry_rate_limit and _is_rate_limited(response):
+            if _rate_limit_pause(method_path, response, attempt):
+                attempt += 1
+                continue
+            raise RateLimitError(
+                f"Linnworks {method_path} rate-limited: HTTP {response.status_code} — "
+                f"{response.text} (retried {len(_RATE_LIMIT_BACKOFF)}x). This is a quota "
+                "failure, NOT a query result — retry later."
+            )
+        break
 
     if not response.ok:
         raise RuntimeError(
@@ -12965,6 +12983,179 @@ def run_import(import_id: int, dry_run: bool = True) -> dict:
               "per how_to_verify. ⚠️ An import WRITES to your catalogue — confirm "
               "what it changed."
         ),
+    }
+
+
+# ---------- Read-only SQL query (issue #128) ----------
+#
+# Dashboards/ExecuteCustomScriptQuery runs arbitrary SQL against the tenant's
+# Linnworks database. Whether its connection is read-only is UNKNOWN (and must not
+# be probed with a write), so the client-side guard below is the only control we
+# know of. It is deliberately a blunt whole-text scan, NOT a SQL parser: a
+# hand-rolled tokenizer is where real bypasses come from. It over-rejects (words in
+# string literals, any comment) rather than under-rejects.
+
+_RO_QUERY_DEFAULT_MAX_ROWS = 5000
+
+_RO_QUERY_DENIED_WORDS = (
+    "INSERT", "UPDATE", "DELETE", "MERGE", "EXEC", "EXECUTE", "DROP", "ALTER",
+    "TRUNCATE", "CREATE", "GRANT", "REVOKE", "DENY", "INTO", "DECLARE", "WAITFOR",
+    "OPENROWSET", "OPENQUERY", "OPENDATASOURCE", "BULK", "SET", "USE",
+    # T-SQL needs no ';' between statements, so a second statement can follow a
+    # SELECT directly; these cover admin, transaction, Service Broker and cursor verbs.
+    "DISABLE", "ENABLE", "UPDATETEXT", "WRITETEXT", "SHUTDOWN", "DBCC", "BACKUP",
+    "RESTORE", "KILL", "RECONFIGURE", "CHECKPOINT", "BEGIN", "COMMIT", "ROLLBACK",
+    "SAVE", "SETUSER", "REVERT", "SEND", "RECEIVE", "MOVE", "OPEN", "CLOSE", "FETCH",
+    "DEALLOCATE",
+)
+_RO_QUERY_DENIED_RE = re.compile(
+    r"\b(" + "|".join(_RO_QUERY_DENIED_WORDS) + r")\b", re.IGNORECASE
+)
+# System / extended procedure prefixes: sp_executesql, xp_cmdshell, ...
+_RO_QUERY_PROC_RE = re.compile(r"\b(sp|xp)_\w*", re.IGNORECASE)
+_RO_QUERY_START_RE = re.compile(r"^\s*(SELECT|WITH)\b", re.IGNORECASE)
+
+
+def _validate_readonly_sql(sql) -> tuple[Optional[str], Optional[str]]:
+    """
+    Pure guard. Returns (clean_sql, None) when the text is acceptable, else
+    (None, reason). Makes no I/O.
+
+    Rules: a single SELECT/WITH statement; one trailing ';' is stripped; any other
+    ';' is refused; '--' and '/*' are refused outright (comments can hide a second
+    statement); a deny-list of whole words is applied to the WHOLE text, string
+    literals included.
+    """
+    if not isinstance(sql, str) or not sql.strip():
+        return None, "sql must be a non-empty string."
+    text = sql.strip()
+    if text.endswith(";"):
+        text = text[:-1].rstrip()
+    if not text:
+        return None, "sql must be a non-empty string."
+    if "--" in text or "/*" in text or "*/" in text:
+        return None, (
+            "SQL comments ('--', '/* */') are refused: a comment can hide a second "
+            "statement from the guard. Remove the comment."
+        )
+    if ";" in text:
+        return None, (
+            "Only a single statement is allowed: a ';' appears before the end of the "
+            "text (this also rejects a ';' inside a string literal)."
+        )
+    if not _RO_QUERY_START_RE.match(text):
+        return None, "Only a statement that starts with SELECT or WITH is allowed."
+    hit = _RO_QUERY_DENIED_RE.search(text)
+    if hit:
+        return None, (
+            f"The word '{hit.group(1).upper()}' is refused: this tool is read-only. "
+            "The whole text is scanned, string literals included, so a literal such "
+            "as LIKE '%update%' is refused too — rephrase it."
+        )
+    proc = _RO_QUERY_PROC_RE.search(text)
+    if proc:
+        return None, (
+            f"'{proc.group(0)}' is refused: sp_/xp_ procedures are not allowed."
+        )
+    return text, None
+
+
+@mcp.tool()
+def run_readonly_query(sql: str, max_rows: int = _RO_QUERY_DEFAULT_MAX_ROWS) -> dict:
+    """
+    Run ONE read-only SQL query against the Linnworks database (Query Data /
+    Dashboards/ExecuteCustomScriptQuery) to answer a catalogue-wide question in a
+    single call, e.g. "which items have Taxable = 'False'?".
+
+    READ-ONLY. There is no dry_run and no confirmation step. A strict CLIENT-SIDE
+    guard allows one SELECT or WITH statement and refuses the patterns listed below
+    before any request is sent. It is a best-effort guard (SELECT-first plus
+    whole-word scanning), NOT a proof of safety. (_check_injection is deliberately
+    not used: it targets free-text write fields, not SQL.) ⚠️ That guard is the only control known: whether the
+    endpoint itself uses a read-only connection is unknown, so do not rely on the
+    server to catch anything the guard lets through.
+
+    Guard rules: the text must start with SELECT or WITH; one trailing ';' is
+    stripped, any other ';' is refused; SQL comments ('--', '/* */') are refused;
+    these whole words are refused anywhere in the text: INSERT UPDATE DELETE MERGE
+    EXEC EXECUTE DROP ALTER TRUNCATE CREATE GRANT REVOKE DENY INTO DECLARE WAITFOR
+    OPENROWSET OPENQUERY OPENDATASOURCE BULK SET USE DISABLE ENABLE UPDATETEXT WRITETEXT SHUTDOWN DBCC BACKUP RESTORE KILL RECONFIGURE CHECKPOINT BEGIN COMMIT ROLLBACK SAVE SETUSER REVERT SEND RECEIVE MOVE OPEN CLOSE FETCH DEALLOCATE, plus sp_ / xp_ names.
+    NB: string literals are scanned too, so LIKE '%update%' is refused. Column names that merely
+    contain a word (LastUpdateDate, CreatedBy) are fine.
+
+    Known tables/columns (confirmed live): StockItem (ItemNumber, ItemTitle,
+    pkStockItemID, bLogicalDelete, ...), StockItem_ExtendedProperties
+    (fkStockItemId, ProperyName, ProperyValue, ProperyType), ProductCategories.
+    ⚠️ The extended-property columns carry Linnworks' own typo: ProperyName /
+    ProperyValue / ProperyType (one 't'), not Property*.
+
+    Example, items and their 'Taxable' extended property:
+      SELECT s.ItemNumber, e.ProperyValue, s.bLogicalDelete
+      FROM StockItem_ExtendedProperties e
+      JOIN StockItem s ON s.pkStockItemID = e.fkStockItemId
+      WHERE e.ProperyName = 'Taxable'
+
+    ⚠️ Default collation is case-INSENSITIVE, so 'FALSE' and 'False' group together
+    and an inconsistent-casing hunt under-counts. Use COLLATE Latin1_General_CS_AS in
+    BOTH the select list and the GROUP BY:
+      SELECT ProperyValue COLLATE Latin1_General_CS_AS AS v, COUNT(*) AS n
+      FROM StockItem_ExtendedProperties WHERE ProperyName = 'Taxable'
+      GROUP BY ProperyValue COLLATE Latin1_General_CS_AS
+
+    ⚠️ Rows with bLogicalDelete = 1 (deleted/archived items) ARE returned, but they
+    cannot be resolved by SKU (GetInventoryItem 400s on them) and cannot be targeted
+    by any write tool such as set_extended_properties or delete_extended_properties —
+    those will report per-item 'not found'. Select bLogicalDelete and filter on it.
+
+    max_rows (default 5000, must be a positive integer) caps the rows returned inline
+    to protect conversation context; lower it for wide rows.
+
+    Returns, on success: columns (names, in order), rows (list of dicts, at most
+    max_rows), total_results (Linnworks' TotalResults), row_count, truncated (True
+    when rows were cut to max_rows OR TotalResults exceeds the rows Linnworks
+    returned). A SQL error comes back as HTTP 200 with IsError and is returned as
+    {"error": <ErrorMessage verbatim>, "is_error": True} with NO rows key — never as
+    an empty result. A refused statement returns {"refused": True, "error": reason}
+    and makes no HTTP call. A quota failure (HTTP 429) is retried on the 5/10/20/30s
+    ladder and then raises RateLimitError — it is never reported as a SQL error or as
+    zero rows.
+    """
+    if isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows < 1:
+        return {
+            "refused": True,
+            "error": f"max_rows must be a positive integer, got {max_rows!r}.",
+        }
+
+    clean, reason = _validate_readonly_sql(sql)
+    if reason:
+        return {"refused": True, "error": reason}
+
+    response = call_linnworks_form(
+        "Dashboards/ExecuteCustomScriptQuery",
+        {"script": clean},
+        retry_rate_limit=True,
+    )
+
+    if not isinstance(response, dict):
+        return {
+            "is_error": True,
+            "error": f"Unexpected response shape from Linnworks: {type(response).__name__}",
+        }
+    if response.get("IsError"):
+        return {"is_error": True, "error": response.get("ErrorMessage")}
+
+    all_rows = response.get("Results") or []
+    columns = [c.get("Name") for c in (response.get("Columns") or [])]
+    rows = list(all_rows[:max_rows])
+    total = response.get("TotalResults")
+    cut = len(all_rows) > max_rows
+    short = isinstance(total, int) and total > len(all_rows)
+    return {
+        "columns": columns,
+        "rows": rows,
+        "total_results": total,
+        "row_count": len(rows),
+        "truncated": bool(cut or short),
     }
 
 
