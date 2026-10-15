@@ -1,7 +1,7 @@
 # Linnworks MCP Server
 
-![Version](https://img.shields.io/badge/version-1.67.0-blue)
-![Tools](https://img.shields.io/badge/tools-103-blue)
+![Version](https://img.shields.io/badge/version-1.68.0-blue)
+![Tools](https://img.shields.io/badge/tools-104-blue)
 
 A local [MCP](https://modelcontextprotocol.io/) server that connects Claude Desktop to your Linnworks account. Ask Claude natural-language questions about your orders, stock, and inventory — it calls the Linnworks API on your behalf.
 
@@ -170,6 +170,7 @@ Once installed, Claude gets access to these tools:
 | `get_top_skus` | Top-selling SKUs by revenue or units for a date range — optional supplier filter |
 | `get_category_report` | Revenue and units by product category for a date range |
 | `get_component_sales` | Explode composite/bundle sales to component (child) level — surfaces hidden component demand (units) |
+| `run_readonly_query` | Read-only SQL (Query Data, `Dashboards/ExecuteCustomScriptQuery`) for catalogue-wide questions in one call. A strict client-side guard allows a single SELECT/WITH only and refuses the patterns it knows before any request is sent (best-effort, not a proof of safety); that guard is the only control known (whether the endpoint's own connection is read-only is unknown). SQL errors (HTTP 200 + `IsError`) are returned as errors, never as empty results. Rows with `bLogicalDelete = 1` are returned but cannot be targeted by write tools |
 | `get_period_comparison` | Side-by-side revenue comparison between two date ranges (MoM, YoY, etc.) |
 | `get_sales_by_supplier` | Revenue, units, and order count aggregated by supplier for a date range |
 
